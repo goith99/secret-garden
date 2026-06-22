@@ -1,0 +1,21 @@
+[toolchain]
+package_manager = "yarn"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+secret_garden = "7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+# `arcium test` runs the live-cluster Stage 4B scoring suite (real MPC round-trips).
+# Stage 3B breeding runs live via `yarn test:breeding`; the Stage 1/2/3 bankrun
+# regression needs no cluster: `yarn test`.
+[scripts]
+test = "yarn typecheck && yarn test:scoring"
+
+[hooks]

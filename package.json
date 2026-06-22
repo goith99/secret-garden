@@ -1,0 +1,32 @@
+{
+  "name": "secret-garden",
+  "version": "0.1.0",
+  "description": "Secret Garden Protocol — Stage 1 on-chain foundation",
+  "license": "ISC",
+  "type": "module",
+  "packageManager": "yarn@4.15.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "mocha",
+    "test:breeding": "mocha --no-config --timeout 900000 tests/breeding.ts",
+    "test:scoring": "mocha --no-config --timeout 1800000 tests/scoring.ts",
+    "lint:fix": "prettier \"tests/**/*.ts\" -w",
+    "lint": "prettier \"tests/**/*.ts\" --check"
+  },
+  "dependencies": {
+    "@anchor-lang/core": "^1.0.2",
+    "@arcium-hq/client": "^0.10.4",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.0",
+    "@types/chai": "^4.3.0",
+    "@types/mocha": "^10.0.0",
+    "@types/node": "^22.0.0",
+    "chai": "^4.3.4",
+    "mocha": "^10.0.0",
+    "prettier": "^3.3.0",
+    "solana-bankrun": "^0.4.0",
+    "typescript": "^5.7.3"
+  }
+}

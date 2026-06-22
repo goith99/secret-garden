@@ -1,0 +1,39 @@
+[package]
+name = "secret-garden"
+version = "0.1.0"
+description = "Secret Garden Protocol — Stage 1 on-chain foundation"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "secret_garden"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "arcium-anchor/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+
+[dependencies]
+anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
+# SHA-256 over the offspring ciphertext for the genome commitment (BPF-compatible,
+# already in the lockfile transitively). anchor_lang::solana_program strips the hasher
+# modules, so depend on the hasher crate directly.
+solana-sha256-hasher = "3.1.0"
+arcium-client = { default-features = false, version = "=0.10.4" }
+arcium-macros = "=0.10.4"
+arcium-anchor = "=0.10.4"
+# pin so that we do not have 1.13.*
+unicode-segmentation = { version = "=1.12.0" }
+# pin so that we do not have edition = 2024
+hashbrown = { version = "=0.16.1" }
+indexmap = { version = "=2.13.1" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

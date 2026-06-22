@@ -1,0 +1,5 @@
+{
+  "spec": ["tests/secret-garden.ts", "tests/competition.ts", "tests/cancel.ts", "tests/hardening.ts", "tests/late-callback.ts"],
+  "timeout": 1000000,
+  "slow": 30000
+}
