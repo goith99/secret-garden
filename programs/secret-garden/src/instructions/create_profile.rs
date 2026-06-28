@@ -47,6 +47,9 @@ pub(crate) fn handler(ctx: Context<CreateProfile>) -> Result<()> {
         // Stage 3B: starters will occupy indices 0..=5 (set in claim_starters).
         next_flower_index: 0,
         bump: ctx.bumps.profile,
+        // Stage 5D: no breeds yet; the counter resets lazily on the first breed anyway.
+        breeds_this_round: 0,
+        last_breed_round: 0,
     });
     Ok(())
 }

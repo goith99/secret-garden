@@ -178,6 +178,13 @@ pub const BREEDING_STABILITY_PENALTY: u8 = 5;
 /// so a single sentinel is the most the callback can record.
 pub const BREED_ERROR_ABORTED: u16 = 1;
 
+// --- Stage 5D: per-round breeding limit ---
+
+/// Maximum number of `start_breeding` attempts a single wallet may make within one
+/// competition round (`GameConfig::current_round`). The counter resets lazily the first
+/// time a player breeds in a new round — see `PlayerProfile::register_breed_attempt`.
+pub const MAX_BREEDS_PER_ROUND: u8 = 5;
+
 // --- Stage 4A: scoring (target traits + match scoring) ---
 
 /// A public competition trait: a stable id + human-readable name (for the client/UI).

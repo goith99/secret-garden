@@ -56,6 +56,39 @@ pub struct PlayerProfile {
     pub next_flower_index: u32,
     /// PDA bump.
     pub bump: u8,
+
+    // --- Stage 5D: per-round breeding limit (appended; existing field offsets unchanged
+    //     so accounts created before this stage stay deserializable — see migration note) ---
+    /// `start_breeding` attempts used in the round identified by `last_breed_round`
+    /// (0..=`MAX_BREEDS_PER_ROUND`). Reset to 0 lazily on the first breed of a new round.
+    pub breeds_this_round: u8,
+    /// The `GameConfig::current_round` (truncated to `u32`) the player last bred in. When
+    /// this differs from the live `current_round`, `breeds_this_round` is stale and resets.
+    pub last_breed_round: u32,
+}
+
+impl PlayerProfile {
+    /// Enforce the per-round breeding limit and record this attempt. Pure (no Anchor
+    /// context), so it is unit-testable in isolation — the surrounding `start_breeding`
+    /// body that calls it is unreachable under bankrun (its Arcium accounts don't exist).
+    ///
+    /// `current_round` is `GameConfig::current_round` truncated to `u32`; round ids are
+    /// monotonic and tiny, so the truncation cannot collide in any realistic deployment.
+    ///
+    /// Lazy reset: the first breed in a round the player hasn't bred in this cycle zeroes
+    /// the counter, so no operator action is needed when a new round opens.
+    pub fn register_breed_attempt(&mut self, current_round: u32) -> Result<()> {
+        if self.last_breed_round != current_round {
+            self.breeds_this_round = 0;
+            self.last_breed_round = current_round;
+        }
+        require!(
+            self.breeds_this_round < crate::constants::MAX_BREEDS_PER_ROUND,
+            crate::error::SecretGardenError::BreedingLimitReached
+        );
+        self.breeds_this_round += 1;
+        Ok(())
+    }
 }
 
 /// One record per flower a wallet owns. PDA seeds: `[b"flower", owner, flower_index_le]`.
@@ -219,4 +252,66 @@ pub struct Experiment {
     pub callback_processed: bool,
     /// PDA bump.
     pub bump: u8,
+}
+
+#[cfg(test)]
+mod tests {
+    //! Stage 5D: per-round breeding limit. These exercise the decision logic directly —
+    //! the `start_breeding` body that wraps it cannot run under bankrun (its Arcium
+    //! accounts don't exist) and only fully runs against a live cluster.
+    use super::*;
+    use crate::constants::MAX_BREEDS_PER_ROUND;
+
+    fn blank_profile() -> PlayerProfile {
+        PlayerProfile {
+            owner: Pubkey::default(),
+            starter_claimed: false,
+            total_flowers: 0,
+            total_crosses: 0,
+            daily_attempts: 0,
+            final_submissions: 0,
+            created_at: 0,
+            active_experiment_count: 0,
+            total_experiments: 0,
+            next_flower_index: 0,
+            bump: 0,
+            breeds_this_round: 0,
+            last_breed_round: 0,
+        }
+    }
+
+    #[test]
+    fn allows_exactly_the_limit_then_blocks() {
+        let mut p = blank_profile();
+        for i in 1..=MAX_BREEDS_PER_ROUND {
+            assert!(p.register_breed_attempt(1).is_ok(), "breed {i} should pass");
+            assert_eq!(p.breeds_this_round, i);
+            assert_eq!(p.last_breed_round, 1);
+        }
+        // The (MAX+1)-th attempt in the same round is rejected and leaves the counter at MAX.
+        assert!(p.register_breed_attempt(1).is_err());
+        assert_eq!(p.breeds_this_round, MAX_BREEDS_PER_ROUND);
+    }
+
+    #[test]
+    fn resets_when_the_round_advances() {
+        let mut p = blank_profile();
+        for _ in 0..MAX_BREEDS_PER_ROUND {
+            p.register_breed_attempt(1).unwrap();
+        }
+        assert!(p.register_breed_attempt(1).is_err()); // round 1 exhausted
+
+        // Round advances -> the lazy reset zeroes the counter and breeding resumes.
+        assert!(p.register_breed_attempt(2).is_ok());
+        assert_eq!(p.breeds_this_round, 1);
+        assert_eq!(p.last_breed_round, 2);
+    }
+
+    #[test]
+    fn first_breed_in_a_round_stamps_the_round_marker() {
+        let mut p = blank_profile();
+        assert!(p.register_breed_attempt(7).is_ok());
+        assert_eq!(p.last_breed_round, 7);
+        assert_eq!(p.breeds_this_round, 1);
+    }
 }

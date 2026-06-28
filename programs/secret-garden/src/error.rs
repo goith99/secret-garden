@@ -105,4 +105,10 @@ pub enum SecretGardenError {
     /// owner (rent must return to the player who paid it).
     #[msg("The rent destination must be the flower owner")]
     InvalidRentDestination,
+
+    // --- Stage 5D: per-round breeding limit ---
+    /// `start_breeding` called after the wallet already used all `MAX_BREEDS_PER_ROUND`
+    /// attempts in the current round. Resets automatically when a new round opens.
+    #[msg("You have used all 5 breeding attempts for this round")]
+    BreedingLimitReached,
 }

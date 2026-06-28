@@ -9,7 +9,7 @@ skip-lint = false
 secret_garden = "7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo"
 
 [provider]
-cluster = "localnet"
+cluster = "https://solana-devnet.g.alchemy.com/v2/N6LfjT2e11XvboKbbSBFj"
 wallet = "~/.config/solana/id.json"
 
 # `arcium test` runs the live-cluster Stage 4B scoring suite (real MPC round-trips).

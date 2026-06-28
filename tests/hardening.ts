@@ -71,6 +71,16 @@ const ixCreateProfile = (h: Harness, owner: PK) =>
     })
     .instruction();
 
+const ixMigrateProfile = (h: Harness, owner: PK) =>
+  h.program.methods
+    .migrateProfile()
+    .accountsStrict({
+      owner,
+      profile: h.profilePda(owner),
+      systemProgram: h.systemProgram(),
+    })
+    .instruction();
+
 const ixClaimStarters = (h: Harness, owner: PK) => {
   const f = h.flowerPdas(owner);
   return h.program.methods
@@ -539,6 +549,174 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
         [caller2],
       );
       assert.isNotNull(r2.result, "double reclaim should fail");
+    });
+  });
+
+  describe("Stage 5D: per-round breeding limit (layout / serialization guard)", () => {
+    // The limit GATE (5 breeds, 6th rejected, reset on a new round) lives in the
+    // `start_breeding` BODY, which — like its pause gate — cannot be reached under bankrun:
+    // Anchor deserializes every account (mxe, mempool, cluster, …) before the body runs,
+    // and those Arcium accounts don't exist here. The gate's decision logic is covered by
+    // the pure Rust unit tests in `state.rs` (`cargo test`); the full on-chain gate is
+    // verified in the live breeding suite. What bankrun CAN (and must) guard is the account
+    // LAYOUT: the two appended fields must exist, default to 0, and round-trip — this is
+    // the migration-critical property (old accounts created without these fields).
+
+    it("create_profile zero-initializes breeds_this_round and last_breed_round", async () => {
+      const h = await Harness.create();
+      const authority = h.payer;
+      await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+      await h.send([await ixCreateProfile(h, authority.publicKey)], [authority]);
+
+      const profile = await h.program.account.playerProfile.fetch(
+        h.profilePda(authority.publicKey),
+      );
+      expect(profile.breedsThisRound).to.equal(0);
+      expect(profile.lastBreedRound).to.equal(0);
+    });
+
+    it("the appended fields round-trip through the account layout", async () => {
+      const h = await Harness.create();
+      const owner = h.fundedKeypair();
+
+      // Encode a profile carrying non-zero values in the NEW trailing fields and write it
+      // directly; a clean decode proves the fields sit at the expected appended offsets and
+      // that existing fields are unshifted.
+      const pda = h.profilePda(owner.publicKey);
+      const data = await h.program.coder.accounts.encode("playerProfile", {
+        owner: owner.publicKey,
+        starterClaimed: true,
+        totalFlowers: 6,
+        totalCrosses: 0,
+        dailyAttempts: 0,
+        finalSubmissions: 0,
+        createdAt: new BN(FIXED_UNIX_TS),
+        activeExperimentCount: 0,
+        totalExperiments: 0,
+        nextFlowerIndex: 6,
+        bump: 255,
+        breedsThisRound: 5,
+        lastBreedRound: 9,
+      });
+      setAccount(h, pda, Buffer.from(data));
+
+      const profile = await h.program.account.playerProfile.fetch(pda);
+      expect(profile.breedsThisRound).to.equal(5);
+      expect(profile.lastBreedRound).to.equal(9);
+      // Sanity: a field BEFORE the appended ones is still read correctly (no offset drift).
+      expect(profile.nextFlowerIndex).to.equal(6);
+      expect(profile.starterClaimed).to.equal(true);
+    });
+
+    it("MIGRATION: a pre-5D (5-bytes-short) profile fails to deserialize on-chain", async () => {
+      // Reproduce an account created by the OLD program: identical bytes, but physically 5
+      // bytes shorter (no breeds_this_round / last_breed_round trailing fields). This is
+      // exactly what an existing on-chain PlayerProfile looks like after the Stage 5D
+      // redeploy. Anchor 1.0.2 borsh-deserializes the FULL struct from the account's data
+      // slice; with 5 bytes missing it hits end-of-buffer and rejects the account.
+      const h = await Harness.create();
+      const authority = h.payer;
+      await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+
+      const owner = h.fundedKeypair();
+      const pda = h.profilePda(owner.publicKey);
+
+      // Encode the NEW (73-byte) layout, then drop the 5 trailing bytes to get the OLD
+      // (68-byte) on-chain layout. (8 discriminator + 60 old fields = 68.)
+      const full = await h.program.coder.accounts.encode("playerProfile", {
+        owner: owner.publicKey,
+        starterClaimed: false,
+        totalFlowers: 0,
+        totalCrosses: 0,
+        dailyAttempts: 0,
+        finalSubmissions: 0,
+        createdAt: new BN(FIXED_UNIX_TS),
+        activeExperimentCount: 0,
+        totalExperiments: 0,
+        nextFlowerIndex: 0,
+        bump: 255,
+        breedsThisRound: 0,
+        lastBreedRound: 0,
+      });
+      const oldLayout = Buffer.from(full).subarray(0, 68);
+      expect(oldLayout.length).to.equal(68); // 73 - 5
+      setAccount(h, pda, oldLayout);
+
+      // The Anchor client decoder (same borsh) rejects it...
+      let clientThrew = false;
+      try {
+        await h.program.account.playerProfile.fetch(pda);
+      } catch {
+        clientThrew = true;
+      }
+      expect(clientThrew, "client decode of a short profile should throw").to.equal(true);
+
+      // ...and so does the ON-CHAIN program: claim_starters loads it as Account<PlayerProfile>,
+      // whose deserialization fails with AccountDidNotDeserialize (3003 = 0xbbb) BEFORE any
+      // handler logic runs. This is the proof that existing profiles need migration.
+      const r = await h.send([await ixClaimStarters(h, owner.publicKey)], [owner]);
+      assert.isNotNull(r.result, "claim_starters on a pre-5D profile should fail");
+      expect(r.result).to.contain("0xbbb"); // AccountDidNotDeserialize (3003)
+    });
+
+    it("migrate_profile grows a pre-5D profile in place, preserving all state", async () => {
+      const h = await Harness.create();
+      const owner = h.fundedKeypair();
+      const pda = h.profilePda(owner.publicKey);
+
+      // Reproduce the real devnet profile: live state (28 flowers, starters claimed, 22
+      // experiments), in the OLD 68-byte layout (encode new layout, drop the 5 trailing
+      // bytes). Fund it with EXACTLY the 68-byte rent-exempt minimum so the migration's
+      // rent top-up path is exercised.
+      const RENT_68 = 1_364_160; // (68 + 128) * 6960, matches the on-chain account
+      const full = await h.program.coder.accounts.encode("playerProfile", {
+        owner: owner.publicKey,
+        starterClaimed: true,
+        totalFlowers: 28,
+        totalCrosses: 3,
+        dailyAttempts: 0,
+        finalSubmissions: 1,
+        createdAt: new BN(FIXED_UNIX_TS),
+        activeExperimentCount: 0,
+        totalExperiments: 22,
+        nextFlowerIndex: 28,
+        bump: 254,
+        breedsThisRound: 0,
+        lastBreedRound: 0,
+      });
+      const oldLayout = Buffer.from(full).subarray(0, 68);
+      h.context.setAccount(pda, {
+        lamports: RENT_68,
+        data: oldLayout,
+        owner: h.program.programId,
+        executable: false,
+        rentEpoch: 0,
+      });
+
+      const r = await h.send([await ixMigrateProfile(h, owner.publicKey)], [owner]);
+      assert.isNull(r.result, `migrate_profile should succeed: ${r.result}`);
+
+      // Now decodes cleanly, every prior field intact, the two new fields zeroed.
+      const p = await h.program.account.playerProfile.fetch(pda);
+      expect(p.owner.equals(owner.publicKey)).to.equal(true);
+      expect(p.starterClaimed).to.equal(true);
+      expect(p.totalFlowers).to.equal(28);
+      expect(p.totalCrosses).to.equal(3);
+      expect(p.finalSubmissions).to.equal(1);
+      expect(p.totalExperiments).to.equal(22);
+      expect(p.nextFlowerIndex).to.equal(28);
+      expect(p.bump).to.equal(254);
+      expect(p.breedsThisRound).to.equal(0);
+      expect(p.lastBreedRound).to.equal(0);
+
+      // The account is now rent-exempt at the larger size, and migration is idempotent.
+      const acc = await h.client.getAccount(pda);
+      expect(acc!.data.length).to.equal(73);
+      expect(acc!.lamports).to.be.at.least(1_398_960); // (73 + 128) * 6960
+
+      const again = await h.send([await ixMigrateProfile(h, owner.publicKey)], [owner]);
+      assert.isNull(again.result, `second migrate should be a no-op: ${again.result}`);
+      expect((await h.client.getAccount(pda))!.data.length).to.equal(73);
     });
   });
 

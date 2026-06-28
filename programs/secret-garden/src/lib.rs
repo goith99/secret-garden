@@ -84,6 +84,47 @@ pub mod secret_garden {
         Ok(())
     }
 
+    /// Stage 5D migration: grows a pre-5D `PlayerProfile` (created with the smaller layout,
+    /// before `breeds_this_round`/`last_breed_round` were appended) by 5 bytes so the
+    /// current program can read it. Unlike `realloc_flower_genome`, the profile here is
+    /// taken as a RAW account: the old layout is 5 bytes short of `PlayerProfile`, so loading
+    /// it as `Account<PlayerProfile>` would fail with `AccountDidNotDeserialize` BEFORE any
+    /// realloc constraint could run. We grow it in place, preserving the discriminator and
+    /// every existing field, and zero-fill the two appended fields. Idempotent (a profile
+    /// already at the new size is a no-op) and owner-only (the PDA seeds bind it to the
+    /// signer). Runs regardless of the pause kill-switch — it is a recovery/maintenance op.
+    pub fn migrate_profile(ctx: Context<MigrateProfile>) -> Result<()> {
+        let info = ctx.accounts.profile.to_account_info();
+        let new_len = 8 + PlayerProfile::INIT_SPACE;
+        let old_len = info.data_len();
+
+        // Already migrated (or larger): nothing to do.
+        if old_len >= new_len {
+            return Ok(());
+        }
+
+        // Top up rent so the larger account stays rent-exempt.
+        let required = Rent::get()?.minimum_balance(new_len);
+        let current = info.lamports();
+        if required > current {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.owner.to_account_info(),
+                        to: info.clone(),
+                    },
+                ),
+                required - current,
+            )?;
+        }
+
+        // Grow in place; `resize` zero-initializes the 5 appended bytes, so
+        // breeds_this_round = 0 and last_breed_round = 0 (the lazy reset does the rest).
+        info.resize(new_len)?;
+        Ok(())
+    }
+
     /// Registers the `breed` computation definition on-chain. Authority-only, once.
     pub fn init_breeding_comp_def(ctx: Context<InitBreedingCompDef>) -> Result<()> {
         init_computation_def(ctx.accounts, None)?;
@@ -108,6 +149,12 @@ pub mod secret_garden {
     ) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let player_key = ctx.accounts.player.key();
+
+        // Stage 5D: enforce the per-round breeding limit BEFORE queuing the computation or
+        // creating the experiment/offspring accounts (fail fast, no wasted rent or MPC).
+        // The counter resets lazily inside `register_breed_attempt` when the round changes.
+        let current_round = ctx.accounts.config.current_round as u32;
+        ctx.accounts.profile.register_breed_attempt(current_round)?;
 
         // Read both parents' public kind/species and their stored genome nonces.
         let flower_a_key = ctx.accounts.flower_a.key();
@@ -721,6 +768,26 @@ pub struct ReallocFlowerGenome<'info> {
         constraint = flower.owner == owner.key() @ SecretGardenError::FlowerNotOwned,
     )]
     pub flower: Box<Account<'info, FlowerRecord>>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Grows a pre-5D `PlayerProfile` by 5 bytes (see `migrate_profile`). The profile is taken
+/// as a raw account because the old (shorter) layout cannot be deserialized as
+/// `PlayerProfile`; the PDA seeds bind it to the signing owner, and the `owner` constraint
+/// ensures the account is actually one of this program's profiles.
+#[derive(Accounts)]
+pub struct MigrateProfile<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    /// CHECK: deserialized/realloc'd manually; the old layout is 5 bytes short of
+    /// `PlayerProfile`, so it cannot be loaded as a typed `Account`.
+    #[account(
+        mut,
+        seeds = [PROFILE_SEED, owner.key().as_ref()],
+        bump,
+        owner = crate::ID,
+    )]
+    pub profile: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
