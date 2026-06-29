@@ -852,14 +852,14 @@ pub struct StartBreeding<'info> {
     #[account(
         mut,
         constraint = flower_a.owner == player.key() @ SecretGardenError::FlowerNotOwned,
-        constraint = flower_a.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
+        constraint = flower_a.status != FLOWER_STATUS_LOCKED @ SecretGardenError::FlowerNotActive,
     )]
     pub flower_a: Box<Account<'info, FlowerRecord>>,
     #[account(
         mut,
         constraint = flower_b.key() != flower_a.key() @ SecretGardenError::ParentsMustBeDistinct,
         constraint = flower_b.owner == player.key() @ SecretGardenError::FlowerNotOwned,
-        constraint = flower_b.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
+        constraint = flower_b.status != FLOWER_STATUS_LOCKED @ SecretGardenError::FlowerNotActive,
     )]
     pub flower_b: Box<Account<'info, FlowerRecord>>,
     #[account(
