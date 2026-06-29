@@ -1,0 +1,328 @@
+/**
+ * Secret Garden — DEVNET operator tool (cluster 456).
+ *
+ * A permanent, daily-use CLI for running competition rounds against the LIVE
+ * deployment, driven by the COMMAND env var. It uses the operator's local
+ * keypair directly (NO browser wallet popup) and the reliable Helius RPC with
+ * HTTP send/confirm + HTTP polling — the exact proven patterns from
+ * tests/breeding.devnet.ts and tests/scoring.devnet.ts. No new patterns.
+ *
+ * COMMANDS (set via COMMAND=...):
+ *   status  — print GameConfig + current round info (no transaction)
+ *   open    — open_round; print round number + randomly-assigned target traits
+ *   close   — close_round; print "Round N closed. X entries received."
+ *   score   — auto-score every unscored CompetitionEntry of the current round
+ *             (queue_score_entry per entry, no wallet popup)
+ *   reveal  — queue_reveal_top3; wait for MPC; print the top-3 winner wallets
+ *   finalize— finalize_round; required terminal step before the next open_round
+ *
+ * Run (always `source .env` first so HELIUS_RPC_URL is set):
+ *   source .env && ANCHOR_PROVIDER_URL=$HELIUS_RPC_URL \
+ *     ANCHOR_WALLET=$HOME/.config/solana/id.json \
+ *     ARCIUM_CLUSTER_OFFSET=456 \
+ *     COMMAND=status \
+ *     npx mocha --no-config --timeout 300000 scripts/operator.ts
+ */
+import * as anchor from "@anchor-lang/core";
+import BN from "bn.js";
+import * as arcium from "@arcium-hq/client";
+import { randomBytes } from "crypto";
+import * as fs from "fs";
+import * as os from "os";
+import type { SecretGarden } from "../target/types/secret_garden";
+
+const { PublicKey, Keypair } = anchor.web3;
+type PK = anchor.web3.PublicKey;
+type KP = anchor.web3.Keypair;
+
+// --- on-chain constants (programs/secret-garden/src/constants.rs) ---
+const ROUND_STATUS_OPEN = 0;
+const ROUND_STATUS_CLOSED = 1;
+const ROUND_STATUS_FINALIZED = 2;
+const ROUND_STATUS_NAME = ["OPEN", "CLOSED", "FINALIZED"];
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const u64le = (n: number | bigint) => {
+  const b = Buffer.alloc(8);
+  b.writeBigUInt64LE(BigInt(n));
+  return b;
+};
+function readKpJson(p: string): KP {
+  return Keypair.fromSecretKey(new Uint8Array(JSON.parse(fs.readFileSync(p).toString())));
+}
+const short = (pk: PK | string) => {
+  const s = typeof pk === "string" ? pk : pk.toBase58();
+  return `${s.slice(0, 4)}...${s.slice(-4)}`;
+};
+
+const COMMAND = (process.env.COMMAND || "status").trim().toLowerCase();
+
+describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
+  anchor.setProvider(anchor.AnchorProvider.env());
+  const provider = anchor.getProvider() as anchor.AnchorProvider;
+  const conn = provider.connection;
+  const program = anchor.workspace.SecretGarden as anchor.Program<SecretGarden>;
+  const authority = readKpJson(`${os.homedir()}/.config/solana/id.json`);
+
+  const arciumEnv = arcium.getArciumEnv();
+  const clusterAccount = arcium.getClusterAccAddress(arciumEnv.arciumClusterOffset);
+  const mxeAccount = arcium.getMXEAccAddress(program.programId);
+
+  const configPda = PublicKey.findProgramAddressSync(
+    [Buffer.from("config")], program.programId)[0];
+  const roundPda = (id: number) => PublicKey.findProgramAddressSync(
+    [Buffer.from("round"), u64le(id)], program.programId)[0];
+  const entryPda = (round: PK, player: PK) => PublicKey.findProgramAddressSync(
+    [Buffer.from("entry"), round.toBuffer(), player.toBuffer()], program.programId)[0];
+
+  const freshOffset = () => new BN(randomBytes(8), "hex");
+  const compDefAccOf = (circuit: string) => arcium.getCompDefAccAddress(
+    program.programId, Buffer.from(arcium.getCompDefAccOffset(circuit)).readUInt32LE());
+  const queueAccsFor = (circuit: string, offset: BN) => ({
+    computationAccount: arcium.getComputationAccAddress(arciumEnv.arciumClusterOffset, offset),
+    clusterAccount,
+    mxeAccount,
+    mempoolAccount: arcium.getMempoolAccAddress(arciumEnv.arciumClusterOffset),
+    executingPool: arcium.getExecutingPoolAccAddress(arciumEnv.arciumClusterOffset),
+    compDefAccount: compDefAccOf(circuit),
+  });
+
+  // ---- HTTP-only send + confirm (no WebSocket on this Helius endpoint) ----
+  async function sendTxHttp(tx: anchor.web3.Transaction, label: string): Promise<string> {
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      const bh = await conn.getLatestBlockhash({ commitment: "confirmed" });
+      tx.recentBlockhash = bh.blockhash;
+      tx.lastValidBlockHeight = bh.lastValidBlockHeight;
+      tx.feePayer = authority.publicKey;
+      tx.signatures = [];
+      tx.sign(authority);
+      let sig: string;
+      try {
+        sig = await conn.sendRawTransaction(tx.serialize(), {
+          skipPreflight: true, maxRetries: 0, preflightCommitment: "confirmed",
+        });
+      } catch (e) {
+        console.log(`    ${label} send err (attempt ${attempt}): ${(e as Error).message.slice(0, 90)}`);
+        await sleep(Math.min(6000, 500 * 2 ** (attempt - 1)));
+        continue;
+      }
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        const st = (await conn.getSignatureStatuses([sig])).value[0];
+        if (st) {
+          if (st.err) throw new Error(`${label} tx FAILED: ${JSON.stringify(st.err)} (sig ${sig})`);
+          if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") return sig;
+        }
+        const h = await conn.getBlockHeight({ commitment: "confirmed" });
+        if (h > bh.lastValidBlockHeight) break;
+        await sleep(800);
+      }
+      console.log(`    ${label} not confirmed (attempt ${attempt}); retrying`);
+    }
+    throw new Error(`${label} failed to confirm after retries`);
+  }
+
+  // Enumerate every CompetitionEntry of a round (first field `round: pubkey`
+  // sits at offset 8, right after the 8-byte account discriminator).
+  async function entriesForRound(round: PK): Promise<any[]> {
+    const all = await program.account.competitionEntry.all([
+      { memcmp: { offset: 8, bytes: round.toBase58() } },
+    ]);
+    return all.map((a) => ({ pubkey: a.publicKey as PK, ...(a.account as any) }));
+  }
+
+  it(`run COMMAND=${COMMAND}`, async function () {
+    this.timeout(900_000);
+
+    const cfg: any = await program.account.gameConfig.fetch(configPda);
+    if (!cfg.authority.equals(authority.publicKey)) {
+      throw new Error(
+        `operator keypair (${short(authority.publicKey)}) is NOT the config authority (${short(cfg.authority)})`);
+    }
+    const current = cfg.currentRound.toNumber();
+
+    // ----------------------------------------------------------------- STATUS
+    if (COMMAND === "status") {
+      console.log(`\n=== Secret Garden — STATUS ===`);
+      console.log(`  operator   : ${authority.publicKey.toBase58()}`);
+      console.log(`  paused     : ${cfg.paused}`);
+      console.log(`  currentRound: ${current}`);
+      if (current === 0) {
+        console.log(`  (no round opened yet — run COMMAND=open)`);
+        return;
+      }
+      const round: any = await program.account.competitionRound.fetch(roundPda(current));
+      const statusName = ROUND_STATUS_NAME[round.status] ?? `?(${round.status})`;
+      console.log(`\n  Round #${round.roundId.toString()}`);
+      console.log(`    status        : ${statusName}`);
+      console.log(`    entries       : ${round.participantCount} / max ${round.maxParticipants}`);
+      console.log(`    scored        : ${round.scoredCount} / ${round.participantCount}`);
+      console.log(`    targetTraits  : [${Array.from(round.targetTraits).slice(0, round.targetTraitCount)}]`
+        + ` (count ${round.targetTraitCount})`);
+      console.log(`    top3 revealed : ${round.scoringRevealed}`);
+      if (round.scoringRevealed) {
+        console.log(`      1st: ${round.top1.toBase58()}`);
+        console.log(`      2nd: ${round.top2.toBase58()}`);
+        console.log(`      3rd: ${round.top3.toBase58()}`);
+      }
+      return;
+    }
+
+    // ------------------------------------------------------------------- OPEN
+    if (COMMAND === "open") {
+      const tx = await program.methods.openRound()
+        .accountsPartial({
+          authority: authority.publicKey,
+          config: configPda,
+          previousRound: current > 0 ? roundPda(current) : null,
+          round: roundPda(current + 1),
+        }).transaction();
+      await sendTxHttp(tx, `openRound(${current + 1})`);
+      const round: any = await program.account.competitionRound.fetch(roundPda(current + 1));
+      console.log(`\nRound ${current + 1} opened successfully`);
+      console.log(`  target traits: [${Array.from(round.targetTraits).slice(0, round.targetTraitCount)}]`
+        + ` (count ${round.targetTraitCount})`);
+      return;
+    }
+
+    // ------------------------------------------------------------------ CLOSE
+    if (COMMAND === "close") {
+      if (current === 0) throw new Error("no round to close");
+      const round = roundPda(current);
+      const tx = await program.methods.closeRound()
+        .accountsPartial({ authority: authority.publicKey, round }).transaction();
+      await sendTxHttp(tx, `closeRound(${current})`);
+      const r: any = await program.account.competitionRound.fetch(round);
+      console.log(`\nRound ${current} closed. ${r.participantCount} entries received.`);
+      return;
+    }
+
+    // ------------------------------------------------------------------ SCORE
+    if (COMMAND === "score") {
+      if (current === 0) throw new Error("no round to score");
+      const round = roundPda(current);
+      const r: any = await program.account.competitionRound.fetch(round);
+      if (r.status !== ROUND_STATUS_CLOSED) {
+        throw new Error(`round ${current} must be CLOSED to score (status=${ROUND_STATUS_NAME[r.status]})`);
+      }
+      const entries = await entriesForRound(round);
+      const unscored = entries.filter((e) => !e.scored);
+      console.log(`\nRound ${current}: ${entries.length} entries, ${unscored.length} unscored.`);
+      if (unscored.length === 0) {
+        console.log(`All entries already scored. Nothing to do.`);
+        return;
+      }
+
+      let done = 0;
+      for (let i = 0; i < unscored.length; i++) {
+        const e = unscored[i];
+        const entry = entryPda(round, e.player as PK);
+        console.log(`Scoring entry ${i + 1} of ${unscored.length} (wallet: ${short(e.player as PK)})`);
+        const offset = freshOffset();
+        const tx = await program.methods.queueScoreEntry(offset)
+          .accountsPartial({
+            authority: authority.publicKey,
+            round,
+            entry,
+            flowerRecord: e.flowerRecord as PK,
+            ...queueAccsFor("score_entry", offset),
+          }).transaction();
+        await sendTxHttp(tx, `queueScoreEntry[${i + 1}]`);
+        await arcium.awaitComputationFinalization(
+          provider, offset, program.programId, "confirmed", 360000);
+
+        // Confirm the callback persisted `scored` before moving on.
+        let scored = false;
+        for (let k = 0; k < 120; k++) {
+          if ((await program.account.competitionEntry.fetch(entry)).scored) { scored = true; break; }
+          await sleep(1000);
+        }
+        if (!scored) throw new Error(`entry ${short(e.player as PK)} did not reach scored=true after MPC`);
+        done++;
+        console.log(`  ✓ entry ${i + 1} scored`);
+      }
+      const after: any = await program.account.competitionRound.fetch(round);
+      console.log(`\nAll ${done} entries scored successfully (round.scoredCount=${after.scoredCount}).`);
+      return;
+    }
+
+    // ----------------------------------------------------------------- REVEAL
+    if (COMMAND === "reveal") {
+      if (current === 0) throw new Error("no round to reveal");
+      const round = roundPda(current);
+      const r: any = await program.account.competitionRound.fetch(round);
+      if (r.scoringRevealed) {
+        console.log(`\nRound ${current} already revealed.`);
+        console.log(`  1st: ${r.top1.toBase58()}`);
+        console.log(`  2nd: ${r.top2.toBase58()}`);
+        console.log(`  3rd: ${r.top3.toBase58()}`);
+        return;
+      }
+      if (r.scoredCount !== r.participantCount) {
+        throw new Error(`scoring incomplete: ${r.scoredCount}/${r.participantCount} scored (run COMMAND=score)`);
+      }
+
+      // The circuit reads each entry's stored score by reference; the entries
+      // must be passed as remaining_accounts in slot order (exactly
+      // participant_count of them).
+      const entries = await entriesForRound(round);
+      const scored = entries.filter((e) => e.scored);
+      if (scored.length !== r.participantCount) {
+        throw new Error(`found ${scored.length} scored entries but participantCount=${r.participantCount}`);
+      }
+      const remaining = scored.map((e) => ({
+        pubkey: e.pubkey as PK, isWritable: false, isSigner: false,
+      }));
+
+      const offset = freshOffset();
+      const tx = await program.methods.queueRevealTop3(offset)
+        .accountsPartial({ authority: authority.publicKey, round, ...queueAccsFor("reveal_top3", offset) })
+        .remainingAccounts(remaining)
+        .transaction();
+      await sendTxHttp(tx, "queueRevealTop3");
+      console.log(`\n[reveal_top3] queued; awaiting MPC finalization...`);
+      await arcium.awaitComputationFinalization(
+        provider, offset, program.programId, "confirmed", 360000);
+
+      // Poll the round until the callback flips scoringRevealed and writes top1..3.
+      let revealed = false;
+      let rr: any;
+      for (let k = 0; k < 180; k++) {
+        rr = await program.account.competitionRound.fetch(round);
+        if (rr.scoringRevealed) { revealed = true; break; }
+        await sleep(1000);
+      }
+      if (!revealed) throw new Error("reveal MPC finalized but round.scoringRevealed never flipped");
+
+      // Map winning entry pubkeys back to the player wallet that submitted them.
+      const byEntry = new Map(scored.map((e) => [(e.pubkey as PK).toBase58(), e.player as PK]));
+      const winner = (entry: PK) => {
+        const p = byEntry.get(entry.toBase58());
+        return p ? p.toBase58() : `(entry ${entry.toBase58()})`;
+      };
+      console.log(`\nWinners revealed! Top 3:`);
+      console.log(`  1st: ${winner(rr.top1)}`);
+      console.log(`  2nd: ${winner(rr.top2)}`);
+      console.log(`  3rd: ${winner(rr.top3)}`);
+      return;
+    }
+
+    // ---------------------------------------------------------------- FINALIZE
+    if (COMMAND === "finalize") {
+      if (current === 0) throw new Error("no round to finalize");
+      const round = roundPda(current);
+      const r: any = await program.account.competitionRound.fetch(round);
+      if (r.status === ROUND_STATUS_FINALIZED) {
+        console.log(`\nRound ${current} already FINALIZED.`);
+        return;
+      }
+      const tx = await program.methods.finalizeRound()
+        .accountsPartial({ authority: authority.publicKey, round }).transaction();
+      await sendTxHttp(tx, `finalizeRound(${current})`);
+      console.log(`\nRound ${current} finalized. Ready to open the next round.`);
+      return;
+    }
+
+    throw new Error(`unknown COMMAND="${COMMAND}" (use status|open|close|score|reveal|finalize)`);
+  });
+});
