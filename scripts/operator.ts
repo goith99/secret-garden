@@ -131,6 +131,74 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
     return all.map((a) => ({ pubkey: a.publicKey as PK, ...(a.account as any) }));
   }
 
+  // Player-facing flower name for a winner (matches the frontend's species map).
+  const SPECIES_NAMES = [
+    "Sunpetal Marigold", "Tideglass Bluebell", "Duskwisp Lavender",
+    "Emberfern Rose", "Mossheart Mint", "Moonsilk Lily",
+  ];
+  const flowerName = (visualSpeciesId: number, flowerIndex: number) =>
+    visualSpeciesId === 255
+      ? `Hybrid #${flowerIndex}`
+      : (SPECIES_NAMES[visualSpeciesId] ?? `Flower #${flowerIndex}`);
+
+  interface WinnerRow {
+    round_number: number;
+    rank: number;
+    wallet_address: string;
+    flower_name: string;
+    generation: number;
+  }
+
+  // Persist a finished round's results to Supabase so the frontend Daily Winners panel can show
+  // them. Server-side write with the SERVICE key (bypasses RLS). Skipped silently when
+  // SUPABASE_URL/SERVICE_KEY aren't configured, and never fatal to the reveal itself.
+  async function saveResultsToSupabase(roundNumber: number, round: any, scored: any[]) {
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_KEY;
+    if (!url || !key) return; // not configured — skip silently
+
+    const { createClient } = await import("@supabase/supabase-js");
+    const supabase = createClient(url, key);
+
+    const targetTraits: number[] = (round.targetTraits as number[]).slice(0, round.targetTraitCount);
+
+    // round_results — one summary row for the round.
+    const resultsErr = (
+      await supabase.from("round_results").insert({
+        round_number: roundNumber,
+        target_traits: JSON.stringify(targetTraits),
+        total_entrants: round.participantCount,
+        completed_at: new Date().toISOString(),
+      })
+    ).error;
+
+    // round_winners — one row per top-3 winner, with the flower's player-facing name + gen.
+    const byEntry = new Map<string, any>(scored.map((e) => [(e.pubkey as PK).toBase58(), e]));
+    const top: PK[] = [round.top1, round.top2, round.top3];
+    const winnerRows: WinnerRow[] = [];
+    for (let i = 0; i < top.length; i++) {
+      const entry = byEntry.get(top[i].toBase58());
+      if (!entry) continue;
+      const flower: any = await program.account.flowerRecord.fetch(entry.flowerRecord);
+      winnerRows.push({
+        round_number: roundNumber,
+        rank: i + 1,
+        wallet_address: (entry.player as PK).toBase58(),
+        flower_name: flowerName(flower.visualSpeciesId, flower.flowerIndex),
+        generation: flower.generation,
+      });
+    }
+    const winnersErr = winnerRows.length
+      ? (await supabase.from("round_winners").insert(winnerRows)).error
+      : null;
+
+    if (resultsErr || winnersErr) {
+      console.log(`  (Supabase write error: ${(resultsErr ?? winnersErr)!.message})`);
+      return;
+    }
+    console.log(`Results saved to Supabase`);
+  }
+
   it(`run COMMAND=${COMMAND}`, async function () {
     this.timeout(900_000);
 
@@ -304,6 +372,9 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
       console.log(`  1st: ${winner(rr.top1)}`);
       console.log(`  2nd: ${winner(rr.top2)}`);
       console.log(`  3rd: ${winner(rr.top3)}`);
+
+      // Persist to Supabase for the frontend Daily Winners panel (skipped if not configured).
+      await saveResultsToSupabase(current, rr, scored);
       return;
     }
 
