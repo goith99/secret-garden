@@ -2,6 +2,9 @@
   "name": "secret-garden",
   "version": "0.1.0",
   "description": "Secret Garden Protocol — Stage 1 on-chain foundation",
+  "engines": {
+    "node": "22.x"
+  },
   "license": "ISC",
   "type": "module",
   "packageManager": "yarn@4.15.0",
