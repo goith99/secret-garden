@@ -7,6 +7,7 @@
   "packageManager": "yarn@4.15.0",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "auto-cycle": "node scripts/auto-cycle.ts",
     "test": "mocha",
     "test:breeding": "mocha --no-config --timeout 900000 tests/breeding.ts",
     "test:scoring": "mocha --no-config --timeout 1800000 tests/scoring.ts",
