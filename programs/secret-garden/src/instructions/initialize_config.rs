@@ -31,6 +31,8 @@ pub(crate) fn handler(ctx: Context<InitializeConfig>) -> Result<()> {
         starter_count: STARTER_COUNT,
         version: PROGRAM_VERSION,
         bump: ctx.bumps.config,
+        operators: [Pubkey::default(); 3],
+        operator_count: 0,
     });
     Ok(())
 }

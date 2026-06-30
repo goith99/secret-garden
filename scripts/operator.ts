@@ -16,6 +16,14 @@
  *   reveal  — queue_reveal_top3; wait for MPC; print the top-3 winner wallets
  *   finalize— finalize_round; required terminal step before the next open_round
  *
+ *   Round-running commands (open/close/score/reveal/finalize) accept the config
+ *   AUTHORITY or any registered OPERATOR. Operator administration is authority-only:
+ *   migrate-config — one-time: grow GameConfig to the multi-operator layout (run once
+ *                    immediately after the redeploy that added operators)
+ *   add-operator    OPERATOR=<pubkey> — register an operator wallet (max 3)
+ *   remove-operator OPERATOR=<pubkey> — unregister an operator wallet
+ *   list-operators  — print the authority + the registered operators
+ *
  * Run (always `source .env` first so HELIUS_RPC_URL is set):
  *   source .env && ANCHOR_PROVIDER_URL=$HELIUS_RPC_URL \
  *     ANCHOR_WALLET=$HOME/.config/solana/id.json \
@@ -61,6 +69,12 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
   anchor.setProvider(anchor.AnchorProvider.env());
   const provider = anchor.getProvider() as anchor.AnchorProvider;
   const conn = provider.connection;
+  // Public RPC fallback — Helius Free tier blocks getProgramAccounts (used by
+  // program.account.X.all()). Transactions still go through Helius via `conn`.
+  const publicConn = new anchor.web3.Connection(
+    "https://api.devnet.solana.com",
+    "confirmed"
+  );
   const program = anchor.workspace.SecretGarden as anchor.Program<SecretGarden>;
   const authority = readKpJson(`${os.homedir()}/.config/solana/id.json`);
 
@@ -125,10 +139,13 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
   // Enumerate every CompetitionEntry of a round (first field `round: pubkey`
   // sits at offset 8, right after the 8-byte account discriminator).
   async function entriesForRound(round: PK): Promise<any[]> {
-    const all = await program.account.competitionEntry.all([
-      { memcmp: { offset: 8, bytes: round.toBase58() } },
-    ]);
-    return all.map((a) => ({ pubkey: a.publicKey as PK, ...(a.account as any) }));
+    const accounts = await publicConn.getProgramAccounts(program.programId, {
+      filters: [{ memcmp: { offset: 8, bytes: round.toBase58() } }],
+    });
+    return accounts.map((a) => ({
+      pubkey: a.pubkey as PK,
+      ...(program.coder.accounts.decode("competitionEntry", a.account.data) as any),
+    }));
   }
 
   // Player-facing flower name for a winner (matches the frontend's species map).
@@ -199,13 +216,48 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
     console.log(`Results saved to Supabase`);
   }
 
+  // Commands that ONLY the config authority may run (operators are barred).
+  const AUTHORITY_ONLY = new Set(["migrate-config", "add-operator", "remove-operator"]);
+
   it(`run COMMAND=${COMMAND}`, async function () {
     this.timeout(900_000);
 
+    // ---------------------------------------------------------- MIGRATE-CONFIG
+    // Must run BEFORE the typed gameConfig.fetch: a pre-operator config is shorter
+    // than the current layout and the typed decoder cannot deserialize it. Read the
+    // account raw and parse the stored authority from bytes [8..40] for a local guard.
+    if (COMMAND === "migrate-config") {
+      const info = await conn.getAccountInfo(configPda, "confirmed");
+      if (!info) throw new Error("config account not found");
+      const storedAuthority = new PublicKey(info.data.subarray(8, 40));
+      if (!storedAuthority.equals(authority.publicKey)) {
+        throw new Error(
+          `migrate-config requires the AUTHORITY (${short(storedAuthority)}), not ${short(authority.publicKey)}`);
+      }
+      const tx = await program.methods.migrateConfig()
+        .accountsPartial({ authority: authority.publicKey, config: configPda })
+        .transaction();
+      await sendTxHttp(tx, "migrateConfig");
+      const cfgAfter: any = await program.account.gameConfig.fetch(configPda);
+      console.log(`\nConfig migrated. operatorCount=${cfgAfter.operatorCount}`);
+      return;
+    }
+
     const cfg: any = await program.account.gameConfig.fetch(configPda);
-    if (!cfg.authority.equals(authority.publicKey)) {
+    const isAuthority = cfg.authority.equals(authority.publicKey);
+    const operators: PK[] = (cfg.operators as PK[]).slice(0, cfg.operatorCount);
+    const isOperator = operators.some((op) => op.equals(authority.publicKey));
+
+    // Authorization gate. Admin commands are authority-only; round-running commands
+    // (open/close/score/reveal/finalize) accept the authority OR any registered operator.
+    if (AUTHORITY_ONLY.has(COMMAND)) {
+      if (!isAuthority) {
+        throw new Error(
+          `COMMAND=${COMMAND} requires the config AUTHORITY (${short(cfg.authority)}), not ${short(authority.publicKey)}`);
+      }
+    } else if (!isAuthority && !isOperator) {
       throw new Error(
-        `operator keypair (${short(authority.publicKey)}) is NOT the config authority (${short(cfg.authority)})`);
+        `keypair (${short(authority.publicKey)}) is neither the authority nor a registered operator`);
     }
     const current = cfg.currentRound.toNumber();
 
@@ -258,7 +310,7 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
       if (current === 0) throw new Error("no round to close");
       const round = roundPda(current);
       const tx = await program.methods.closeRound()
-        .accountsPartial({ authority: authority.publicKey, round }).transaction();
+        .accountsPartial({ authority: authority.publicKey, config: configPda, round }).transaction();
       await sendTxHttp(tx, `closeRound(${current})`);
       const r: any = await program.account.competitionRound.fetch(round);
       console.log(`\nRound ${current} closed. ${r.participantCount} entries received.`);
@@ -388,12 +440,49 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
         return;
       }
       const tx = await program.methods.finalizeRound()
-        .accountsPartial({ authority: authority.publicKey, round }).transaction();
+        .accountsPartial({ authority: authority.publicKey, config: configPda, round }).transaction();
       await sendTxHttp(tx, `finalizeRound(${current})`);
       console.log(`\nRound ${current} finalized. Ready to open the next round.`);
       return;
     }
 
-    throw new Error(`unknown COMMAND="${COMMAND}" (use status|open|close|score|reveal|finalize)`);
+    // ------------------------------------------------------------ LIST-OPERATORS
+    if (COMMAND === "list-operators") {
+      console.log(`\n=== Operators ===`);
+      console.log(`Authority : ${cfg.authority.toBase58()}`);
+      if (operators.length === 0) {
+        console.log(`(no operators registered)`);
+      } else {
+        operators.forEach((op, i) => console.log(`Operator ${i + 1}: ${op.toBase58()}`));
+      }
+      return;
+    }
+
+    // -------------------------------------------------------------- ADD-OPERATOR
+    if (COMMAND === "add-operator") {
+      const opStr = process.env.OPERATOR;
+      if (!opStr) throw new Error("set OPERATOR=<pubkey> to add an operator");
+      const newOp = new PublicKey(opStr.trim());
+      const tx = await program.methods.addOperator(newOp)
+        .accountsPartial({ authority: authority.publicKey, config: configPda }).transaction();
+      await sendTxHttp(tx, "addOperator");
+      console.log(`\nOperator added: ${newOp.toBase58()}`);
+      return;
+    }
+
+    // ----------------------------------------------------------- REMOVE-OPERATOR
+    if (COMMAND === "remove-operator") {
+      const opStr = process.env.OPERATOR;
+      if (!opStr) throw new Error("set OPERATOR=<pubkey> to remove an operator");
+      const op = new PublicKey(opStr.trim());
+      const tx = await program.methods.removeOperator(op)
+        .accountsPartial({ authority: authority.publicKey, config: configPda }).transaction();
+      await sendTxHttp(tx, "removeOperator");
+      console.log(`\nOperator removed: ${op.toBase58()}`);
+      return;
+    }
+
+    throw new Error(`unknown COMMAND="${COMMAND}" (use status|open|close|score|reveal|finalize`
+      + `|migrate-config|add-operator|remove-operator|list-operators)`);
   });
 });

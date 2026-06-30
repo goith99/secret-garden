@@ -21,6 +21,28 @@ pub struct GameConfig {
     pub version: u8,
     /// PDA bump.
     pub bump: u8,
+
+    // --- Multi-operator support (appended; existing field offsets unchanged so configs
+    //     created before this change stay deserializable — see `migrate_config`) ---
+    /// Up to three additional operator wallets allowed to run rounds (open/close/score/
+    /// reveal/finalize). Only the first `operator_count` slots are active; the rest are
+    /// `Pubkey::default()`. Operators CANNOT add/remove operators, pause, or upgrade.
+    pub operators: [Pubkey; 3],
+    /// Number of active entries in `operators` (0..=3).
+    pub operator_count: u8,
+}
+
+/// True if `signer` is the config authority or one of the active operators. Authority has
+/// every permission; operators are limited to the round-running instructions that call this.
+/// Authority-only instructions (set_paused, migrate_config, add/remove_operator) must NOT
+/// use this — they check `config.authority` directly (via `has_one`).
+pub fn is_operator_or_authority(config: &GameConfig, signer: &Pubkey) -> bool {
+    if *signer == config.authority {
+        return true;
+    }
+    config.operators[..config.operator_count as usize]
+        .iter()
+        .any(|op| op == signer)
 }
 
 /// Per-wallet player profile. PDA seeds: `[b"profile", owner]`.

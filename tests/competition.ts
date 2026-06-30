@@ -128,13 +128,21 @@ const ixSubmit = (
 const ixClose = (h: Harness, authority: PK, roundId: number) =>
   h.program.methods
     .closeRound()
-    .accountsStrict({ authority, round: h.roundPda(roundId) })
+    .accountsStrict({
+      authority,
+      config: h.configPda(),
+      round: h.roundPda(roundId),
+    })
     .instruction();
 
 const ixFinalize = (h: Harness, authority: PK, roundId: number) =>
   h.program.methods
     .finalizeRound()
-    .accountsStrict({ authority, round: h.roundPda(roundId) })
+    .accountsStrict({
+      authority,
+      config: h.configPda(),
+      round: h.roundPda(roundId),
+    })
     .instruction();
 
 // --- setup helpers -----------------------------------------------------------

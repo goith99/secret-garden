@@ -2,25 +2,24 @@ use anchor_lang::prelude::*;
 
 use crate::constants::*;
 use crate::error::SecretGardenError;
-use crate::state::{CompetitionRound, GameConfig};
+use crate::state::{is_operator_or_authority, CompetitionRound, GameConfig};
 
-/// Opens the next competition round. Only the configured authority may call this, and
-/// only once the previous round (if any) has been finalized.
+/// Opens the next competition round. Callable by the authority or any registered operator,
+/// and only once the previous round (if any) has been finalized.
 #[derive(Accounts)]
 pub struct OpenRound<'info> {
-    /// Configured game authority; funds the new round account.
+    /// Authority or operator running the round; funds the new round account.
     #[account(mut)]
     pub authority: Signer<'info>,
 
     // Stage 5A patch: open_round starts NEW game progression (a fresh competition round),
     // so it respects the pause kill-switch — unlike close_round/finalize_round, which must
-    // still wind down in-flight rounds while paused. `config` already exists here (read for
-    // `current_round`), so this only adds the constraint; open_round's logic is unchanged.
+    // still wind down in-flight rounds while paused. The signer authorization is checked at
+    // runtime (authority OR operator) in the handler, so the `has_one` is dropped here.
     #[account(
         mut,
         seeds = [CONFIG_SEED],
         bump = config.bump,
-        has_one = authority @ SecretGardenError::NotAuthority,
         constraint = !config.paused @ SecretGardenError::GamePaused,
     )]
     pub config: Account<'info, GameConfig>,
@@ -42,6 +41,11 @@ pub struct OpenRound<'info> {
 }
 
 pub(crate) fn handler(ctx: Context<OpenRound>) -> Result<()> {
+    require!(
+        is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+        SecretGardenError::NotAuthority
+    );
+
     let current = ctx.accounts.config.current_round;
 
     if current > 0 {
