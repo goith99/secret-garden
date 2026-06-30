@@ -111,4 +111,22 @@ pub enum SecretGardenError {
     /// attempts in the current round. Resets automatically when a new round opens.
     #[msg("You have used all 5 breeding attempts for this round")]
     BreedingLimitReached,
+
+    // --- Multi-operator support ---
+    /// `add_operator` called when all three operator slots are already filled.
+    #[msg("All operator slots are full (max 3)")]
+    OperatorSlotsFull,
+    /// `add_operator` called with a pubkey that is already an operator.
+    #[msg("That operator is already registered")]
+    OperatorAlreadyExists,
+    /// `remove_operator` called with a pubkey that is not currently an operator.
+    #[msg("That operator was not found")]
+    OperatorNotFound,
+    /// `add_operator` called with `Pubkey::default()` or the authority itself.
+    #[msg("Invalid operator pubkey")]
+    InvalidOperator,
+    /// An operator (non-authority) tried to close a round that has been open for less than
+    /// the minimum delay. The authority may close at any time.
+    #[msg("The round has been open too briefly for an operator to close it")]
+    RoundTooRecentToClose,
 }

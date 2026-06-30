@@ -52,6 +52,11 @@ pub const ROUND_DURATION_SECONDS: i64 = 86_400;
 /// Maximum number of entries (participants) allowed per competition round.
 pub const MAX_PARTICIPANTS: u16 = 16;
 
+/// Minimum time (seconds) a round must have been open before a non-authority OPERATOR may
+/// close it. The authority can always close manually with no delay. 1 hour. Stops a leaked
+/// operator key from instantly closing a freshly-opened round.
+pub const MIN_OPERATOR_CLOSE_DELAY_SECONDS: i64 = 3_600;
+
 /// Rarity tiers written to `FlowerRecord::rarity` (1 = most common .. 5 = rarest).
 pub const RARITY_COMMON: u8 = 1;
 pub const RARITY_UNCOMMON: u8 = 2;

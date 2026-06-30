@@ -52,6 +52,109 @@ pub mod secret_garden {
         instructions::set_paused::handler(ctx, new_value)
     }
 
+    // --- Multi-operator support (authority-only administration) ---
+
+    /// Grows the singleton `GameConfig` to the multi-operator layout (appends `operators`
+    /// and `operator_count`) and zero-initializes the new fields. Authority-only.
+    ///
+    /// Like `migrate_profile`, the config is taken as a RAW account: a pre-operator config
+    /// is shorter than the current `GameConfig`, so loading it as `Account<GameConfig>` would
+    /// fail with `AccountDidNotDeserialize` BEFORE any realloc constraint could run. We grow
+    /// it in place, preserving the discriminator and every existing field; `resize`
+    /// zero-fills the appended bytes, so `operators = [Pubkey::default(); 3]` and
+    /// `operator_count = 0`. Idempotent: a config already at (or above) the new size is a
+    /// no-op. Authority is verified by reading the stored authority pubkey directly, since
+    /// the raw account cannot be `has_one`-checked. Runs regardless of the pause kill-switch.
+    pub fn migrate_config(ctx: Context<MigrateConfig>) -> Result<()> {
+        let info = ctx.accounts.config.to_account_info();
+
+        // Verify the signer is the stored authority. Layout: 8-byte discriminator, then the
+        // `authority` Pubkey at bytes [8..40] (the very first field, unchanged by this append).
+        {
+            let data = info.try_borrow_data()?;
+            require!(data.len() >= 40, SecretGardenError::NotAuthority);
+            let stored_authority = Pubkey::try_from(&data[8..40])
+                .map_err(|_| error!(SecretGardenError::NotAuthority))?;
+            require_keys_eq!(
+                stored_authority,
+                ctx.accounts.authority.key(),
+                SecretGardenError::NotAuthority
+            );
+        }
+
+        let new_len = 8 + GameConfig::INIT_SPACE;
+        let old_len = info.data_len();
+
+        // Already migrated (or larger): nothing to do.
+        if old_len >= new_len {
+            return Ok(());
+        }
+
+        // Top up rent so the larger account stays rent-exempt.
+        let required = Rent::get()?.minimum_balance(new_len);
+        let current = info.lamports();
+        if required > current {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.authority.to_account_info(),
+                        to: info.clone(),
+                    },
+                ),
+                required - current,
+            )?;
+        }
+
+        // Grow in place; `resize` zero-initializes the appended bytes, so
+        // operators = [Pubkey::default(); 3] and operator_count = 0.
+        info.resize(new_len)?;
+        Ok(())
+    }
+
+    /// Registers an additional operator wallet. Authority-only (enforced by `has_one`).
+    /// Operators may run rounds (open/close/score/reveal/finalize) but cannot administer.
+    pub fn add_operator(ctx: Context<ManageOperator>, new_operator: Pubkey) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require!(
+            new_operator != Pubkey::default(),
+            SecretGardenError::InvalidOperator
+        );
+        // No point adding the authority — it already has every permission.
+        require!(
+            new_operator != config.authority,
+            SecretGardenError::InvalidOperator
+        );
+        let count = config.operator_count as usize;
+        require!(count < 3, SecretGardenError::OperatorSlotsFull);
+        require!(
+            !config.operators[..count].iter().any(|op| *op == new_operator),
+            SecretGardenError::OperatorAlreadyExists
+        );
+        config.operators[count] = new_operator;
+        config.operator_count += 1;
+        Ok(())
+    }
+
+    /// Removes a registered operator by pubkey, shifting the array left to keep the active
+    /// slots contiguous. Authority-only (`has_one`) — operators cannot remove themselves or
+    /// each other, so a leaked operator key cannot clean up its own tracks.
+    pub fn remove_operator(ctx: Context<ManageOperator>, operator: Pubkey) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        let count = config.operator_count as usize;
+        let pos = config.operators[..count]
+            .iter()
+            .position(|op| *op == operator)
+            .ok_or(SecretGardenError::OperatorNotFound)?;
+        // Shift everything after `pos` left by one, then clear the vacated tail slot.
+        for i in pos..count - 1 {
+            config.operators[i] = config.operators[i + 1];
+        }
+        config.operators[count - 1] = Pubkey::default();
+        config.operator_count -= 1;
+        Ok(())
+    }
+
     // --- Stage 2: competition rounds ---
 
     /// Opens the next competition round (authority only; previous round must be final).
@@ -456,6 +559,10 @@ pub mod secret_garden {
     /// authority signs. The genome is read in-place from the flower account.
     pub fn queue_score_entry(ctx: Context<QueueScoreEntry>, computation_offset: u64) -> Result<()> {
         require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        require!(
             ctx.accounts.round.status == ROUND_STATUS_CLOSED,
             SecretGardenError::RoundNotClosed
         );
@@ -532,6 +639,10 @@ pub mod secret_garden {
     /// are padded with the first entry's (real, MAC-valid) score, which the circuit masks
     /// to 0 — so a caller can never substitute arbitrary score data.
     pub fn queue_reveal_top3(ctx: Context<QueueRevealTop3>, computation_offset: u64) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
         let round_key = ctx.accounts.round.key();
         require!(
             ctx.accounts.round.status == ROUND_STATUS_CLOSED,
@@ -789,6 +900,42 @@ pub struct MigrateProfile<'info> {
     )]
     pub profile: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
+}
+
+/// Grows the singleton `GameConfig` to the multi-operator layout (see `migrate_config`).
+/// The config is taken as a raw account because a pre-operator config is shorter than the
+/// current `GameConfig` and cannot be loaded as a typed `Account`. The `config` PDA seeds
+/// bind it to this program; the authority is verified inside the handler against the stored
+/// authority pubkey (a raw account cannot be `has_one`-checked).
+#[derive(Accounts)]
+pub struct MigrateConfig<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    /// CHECK: deserialized/realloc'd manually; a pre-operator config is shorter than
+    /// `GameConfig`, so it cannot be loaded as a typed `Account`.
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump,
+        owner = crate::ID,
+    )]
+    pub config: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Authority-only operator administration (`add_operator` / `remove_operator`). Runs after
+/// `migrate_config`, so the config is at the full layout and loads as a typed account; the
+/// `has_one` is what makes these instructions authority-only (operators cannot self-manage).
+#[derive(Accounts)]
+pub struct ManageOperator<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        has_one = authority @ SecretGardenError::NotAuthority,
+    )]
+    pub config: Account<'info, GameConfig>,
 }
 
 /// Registers the `breed` computation definition. Restricted to `config.authority`.
@@ -1123,10 +1270,11 @@ pub struct QueueScoreEntry<'info> {
 
     // --- game state (the score is persisted by Stage 4B's callback; Stage 5A stamps the
     //     entry's queued state here, so `entry` is now `mut`) ---
+    // Authorization is the runtime operator-or-authority check in `queue_score_entry`
+    // (against `config`), so the round no longer pins a single `authority`.
     #[account(
         seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
         bump = round.bump,
-        has_one = authority @ SecretGardenError::NotAuthority,
     )]
     pub round: Box<Account<'info, CompetitionRound>>,
     #[account(
@@ -1194,10 +1342,11 @@ pub struct QueueRevealTop3<'info> {
     )]
     pub config: Box<Account<'info, GameConfig>>,
 
+    // Authorization is the runtime operator-or-authority check in `queue_reveal_top3`
+    // (against `config`), so the round no longer pins a single `authority`.
     #[account(
         seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
         bump = round.bump,
-        has_one = authority @ SecretGardenError::NotAuthority,
     )]
     pub round: Box<Account<'info, CompetitionRound>>,
 
