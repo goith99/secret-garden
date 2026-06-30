@@ -2,12 +2,15 @@
   "name": "secret-garden",
   "version": "0.1.0",
   "description": "Secret Garden Protocol — Stage 1 on-chain foundation",
+  "engines": {
+    "node": "22.x"
+  },
   "license": "ISC",
   "type": "module",
   "packageManager": "yarn@4.15.0",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "auto-cycle": "node scripts/auto-cycle.ts",
+    "auto-cycle": "node --experimental-strip-types scripts/auto-cycle.ts",
     "test": "mocha",
     "test:breeding": "mocha --no-config --timeout 900000 tests/breeding.ts",
     "test:scoring": "mocha --no-config --timeout 1800000 tests/scoring.ts",
