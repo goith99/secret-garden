@@ -157,6 +157,10 @@ pub const ENCRYPTED_GENOME_LEN: usize = 320;
 /// Encryption metadata: the MXE nonce, a little-endian u128 = 16 bytes.
 pub const ENCRYPTION_METADATA_LEN: usize = 16;
 
+/// Account size of the Arcium sign-PDA (`ArciumSignerAccount`): 8-byte Anchor discriminator
+/// + 1-byte bump. Used as the `space =` for the `sign_pda_account` in every queue context.
+pub const SIGN_PDA_ACCOUNT_LEN: usize = 9;
+
 /// Byte offset of `FlowerRecord::encrypted_genome` within the account data, used by the
 /// breeding ArgBuilder's `.account()` reference. The genome fields are appended after the
 /// original Stage 1/2 layout: 8 (discriminator) + 152 (original fields) + 32

@@ -340,6 +340,10 @@ mod circuits {
     /// the on-chain callback maps each slot back to its entry pubkey (and drops slots
     /// beyond `participant_count`). Only the three winners' slots+scores are revealed —
     /// every other score stays encrypted forever.
+    // The 16 score parameters cannot be grouped into a struct/array: each is read in-place
+    // from its own CompetitionEntry account (GAP 2, via ArgBuilder::account()), which requires
+    // a distinct `Enc<Mxe, u8>` input per entry — Arcis has no way to express a per-element
+    // account-backed array here, so the flat parameter list is unavoidable.
     #[allow(clippy::too_many_arguments)]
     #[instruction]
     pub fn reveal_top3(

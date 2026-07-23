@@ -24,3 +24,6 @@ encrypted-ixs/src/main.rs
 id.json
 keypairs/
 wallets/
+
+# Local AI tool config (never commit)
+.claude/

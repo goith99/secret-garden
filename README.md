@@ -1,6 +1,6 @@
 # Secret Garden Protocol
 
-On-chain foundation for a Web3 browser game, built with Anchor. **Stages 1–4B of 5.**
+On-chain foundation for a Web3 browser game, built with Anchor. **Stages 1–5.**
 
 - **Stage 1** — game config, player profiles, starter-flower claiming.
 - **Stage 2** — flower ownership status (`Active` → `Submitted`) and the daily
@@ -10,8 +10,9 @@ On-chain foundation for a Web3 browser game, built with Anchor. **Stages 1–4B 
 - **Stage 4A/4B** — public round **target traits** and two encrypted **scoring** circuits
   (`score_entry`, `reveal_top3`); 4B closes three integrity gaps and ships the real
   callbacks that persist per-entry scores and finalize the top-3 winners.
-
-Stage 5 features are **not** present here.
+- **Stage 5** — operational hardening: multi-operator administration, in-place account
+  migrations (`migrate_config` / `migrate_profile`), a per-round breeding limit
+  (5 breeds/wallet/round), and permissionless recovery for stuck offspring and scoring.
 
 ## Toolchain
 
@@ -31,9 +32,9 @@ project; keypair lives in `target/deploy/secret_garden-keypair.json`, which is
 git-ignored).
 
 > Note: this ID changed once pre-deployment. The original git-ignored keypair was
-> wiped by `arcium clean` and a subsequent build silently regenerated a new one. The
-> program was never deployed to any cluster under either ID, so the change has zero
-> on-chain impact.
+> wiped by `arcium clean` and a subsequent build silently regenerated a new one. Nothing
+> was ever deployed under the original ID, so that change had zero on-chain impact. The
+> program is now **live on Solana Devnet (Arcium cluster 456)** under the current ID above.
 
 ## Program surface
 
@@ -70,9 +71,9 @@ Accounts:
 
 Instructions:
 
-- **open_round** — authority only; opens round `current_round + 1`. Requires the
-  previous round (if any) to be `Finalized`. `end_time = start_time + 24h`,
-  `max_participants = 16`.
+- **open_round** — authority or a registered operator (see Stage 5); opens round
+  `current_round + 1`. Requires the previous round (if any) to be `Finalized`.
+  `end_time = start_time + 24h`, `max_participants = 16`.
 - **submit_entry** — player submits one owned `Active` flower into an `Open` round
   before `end_time` while `participant_count < max_participants`; the flower becomes
   `Submitted` and the counters advance.
@@ -175,6 +176,55 @@ Stage 2 offsets unchanged).
   them to entry pubkeys, and unfilled slots stay `Pubkey::default()`. The callback is
   idempotent on `scoring_revealed`.
 
+### Stage 5 — operations, migrations & recovery
+
+**Multi-operator administration.** `GameConfig` gains `operators [Pubkey; 3]` and
+`operator_count` (appended; earlier offsets unchanged). The `is_operator_or_authority`
+helper (`state.rs`) gates the round-running instructions — `open_round`, `close_round`,
+`finalize_round`, `queue_score_entry`, `queue_reveal_top3` — so day-to-day operation can
+run from a low-privilege operator key while the authority keeps every permission.
+Operators **cannot** administer (add/remove operators, pause, or migrate).
+
+- **add_operator(new_operator)** — authority only (`has_one`); registers an operator in
+  the next free slot (max 3). Rejects the zero key, the authority itself, and duplicates.
+- **remove_operator(operator)** — authority only; removes a registered operator and
+  shifts the array left to keep active slots contiguous. Operators cannot remove
+  themselves or each other, so a leaked operator key cannot cover its tracks.
+
+**In-place migrations.** Both take the target as a **raw** account and grow it in place,
+because a pre-migration account is shorter than the current layout and would fail
+`AccountDidNotDeserialize` if loaded as a typed `Account<…>` before any realloc constraint
+could run. Both are idempotent (an already-migrated account is a no-op), top up rent to
+stay rent-exempt, and run **regardless of the pause kill-switch** (they are maintenance).
+
+- **migrate_config** — authority only; appends the multi-operator fields (`operators`,
+  `operator_count`) to a pre-multi-operator `GameConfig` and zero-initializes them.
+  Authority is verified by reading the stored authority pubkey directly (a raw account
+  can't be `has_one`-checked). Run once after deploying the multi-operator program.
+- **migrate_profile** — owner only (PDA seeds bind it to the signer); grows a pre-Stage-5D
+  `PlayerProfile` by 5 bytes so the current program can read it, zero-filling the two
+  appended breeding-limit fields. Needed for any profile created before Stage 5D.
+
+**Per-round breeding limit (Stage 5D).** `PlayerProfile` gains `breeds_this_round` and
+`last_breed_round` (appended). `start_breeding` calls `register_breed_attempt(current_round)`
+**before** creating any account or queuing MPC (fail-fast, no wasted rent): the counter
+resets lazily to 0 when the round changes, then must be `< MAX_BREEDS_PER_ROUND` (**5**) or
+the call reverts with `BreedingLimitReached`. So each wallet may breed at most 5 times per
+competition round.
+
+**Permissionless recovery.** These let anyone unstick a resource without gaining anything
+(destinations/state transitions are fixed by account constraints); they work while paused.
+
+- **cancel_expired_experiment** — after `EXPERIMENT_TIMEOUT_SECONDS` (600), expires a stuck
+  `Queued`/`Processing` experiment: unlocks both parents and sets `callback_processed`
+  (already covered under Stage 3B).
+- **reclaim_dead_offspring** — closes the pre-created offspring of a `Failed`/`Expired`
+  breeding and returns its rent to the original player (rent destination is fixed to the
+  flower's owner, so the caller gains nothing).
+- **cancel_stuck_score** — after `SCORE_TIMEOUT_SECONDS`, clears the in-flight
+  `score_queued` flag on an entry whose scoring computation never called back, making it
+  re-queueable. Refuses already-scored entries; `scored_count` is left untouched.
+
 ## Build & test
 
 ```bash
@@ -200,7 +250,8 @@ clock.
 
 > The breeding flow (`start_breeding` + callback) needs a running Arcium cluster and is
 > exercised in **Stage 3B** via `arcium test`; Stage 3A is a build-only milestone.
-> This project does **not** deploy anywhere. Do not run any devnet deploy command.
+> The program is deployed to **Solana Devnet (Arcium cluster 456)** — devnet only. It is
+> **not** on mainnet and is not production-ready; do not run any mainnet deploy command.
 
 ## Design notes
 

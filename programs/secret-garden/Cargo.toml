@@ -3,6 +3,7 @@ name = "secret-garden"
 version = "0.1.0"
 description = "Secret Garden Protocol — Stage 1 on-chain foundation"
 edition = "2021"
+license = "ISC"
 
 [lib]
 crate-type = ["cdylib", "lib"]

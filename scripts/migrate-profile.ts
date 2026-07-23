@@ -1,5 +1,6 @@
 /**
- * One-off Stage 5D migration tool (DO NOT COMMIT).
+ * One-off tool: kept for any profile still on the pre-Stage-5D 68-byte layout. Safe to
+ * delete once all active devnet profiles are confirmed migrated.
  *
  * The `PlayerProfile` layout grew by 5 bytes in Stage 5D (`breeds_this_round: u8`,
  * `last_breed_round: u32` appended at the end). Existing devnet accounts are 68 bytes

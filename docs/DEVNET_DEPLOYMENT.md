@@ -2,8 +2,9 @@
 
 Program ID: `7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo`
 Status: **prepared, NOT deployed.** No devnet transaction has been sent. This document +
-`scripts/devnet-deploy.sh`, `scripts/devnet-setup.ts`, `scripts/devnet-verify.sh` are
-everything needed to deploy manually.
+`scripts/devnet-deploy.sh`, `scripts/devnet-upload-circuit.ts` (circuit comp-def
+registration + upload), `scripts/devnet-verify.sh`, and `scripts/operator.ts` (round /
+game-state operations) are everything needed to deploy and run manually.
 
 All Arcium commands/flags below were verified against docs.arcium.com for v0.10.x.
 
@@ -215,9 +216,10 @@ storage; switching to `Enc<Shared>` would change the trust model and is out of s
   To re-test breeding without re-registering, run a breed manually or temporarily skip the
   `before()` registration — but the usual case is: canary either passes or reveals the §5 fault.
 - **`setup` phase** is per-account idempotent-by-failure: each `initCompDef` (score_entry,
-  reveal_top3) **fails if the account already exists**. After a partial failure, comment out the
-  `it()` for the circuit that already succeeded in `scripts/devnet-setup.ts` and re-run the rest.
-  `uploadCircuit` can be re-run for a circuit whose upload didn't finish.
+  reveal_top3) **fails if the account already exists**. After a partial failure, re-run
+  `scripts/devnet-upload-circuit.ts` for only the circuit that didn't finish (a circuit whose
+  comp-def already exists is skipped). `uploadCircuit` can be re-run for a circuit whose upload
+  didn't finish.
 
 **What partial failure looks like**
 - Program deployed but MXE missing → `arcium deploy --skip-deploy …` initializes the MXE only.

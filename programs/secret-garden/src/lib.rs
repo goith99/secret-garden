@@ -1040,7 +1040,7 @@ pub struct StartBreeding<'info> {
     // --- arcium queue-side accounts (heavy accounts boxed, per v0.10) ---
     #[account(
         init_if_needed,
-        space = 9,
+        space = SIGN_PDA_ACCOUNT_LEN,
         payer = player,
         seeds = [&SIGN_PDA_SEED],
         bump,
@@ -1295,7 +1295,7 @@ pub struct QueueScoreEntry<'info> {
     // --- arcium queue-side accounts ---
     #[account(
         init_if_needed,
-        space = 9,
+        space = SIGN_PDA_ACCOUNT_LEN,
         payer = authority,
         seeds = [&SIGN_PDA_SEED],
         bump,
@@ -1353,7 +1353,7 @@ pub struct QueueRevealTop3<'info> {
     // --- arcium queue-side accounts ---
     #[account(
         init_if_needed,
-        space = 9,
+        space = SIGN_PDA_ACCOUNT_LEN,
         payer = authority,
         seeds = [&SIGN_PDA_SEED],
         bump,
