@@ -330,6 +330,71 @@ mod circuits {
         Mxe::get().from_arcis(score)
     }
 
+    /// Private per-player HINT (parallel to `score_entry`; does NOT modify it).
+    ///
+    /// Answers, privately, which of the round's PUBLIC target traits a player's own
+    /// encrypted genome satisfies. The answer is a single `u8` bitmask SEALED to the
+    /// requesting player's x25519 key via `client.from_arcis(..)`, so ONLY that player can
+    /// decrypt it — nothing is `.reveal()`ed and the output is NOT `Enc<Mxe, _>`, so neither
+    /// the operator nor the cluster ever learns the result. `client` is the player's sealing
+    /// key, supplied on-chain as an x25519 pubkey (same shape as `start_breeding`'s env key).
+    ///
+    /// Bit `i` (for `i in 0..target_trait_count`) is set iff `target_traits[i]` is satisfied
+    /// by the genome. One byte is all that is needed: the client reconstructs the percentage
+    /// and the per-trait checkmarks from this bitmask + the already-public `target_traits`
+    /// array + the `TRAIT_TABLE` names. Slots `>= target_trait_count` are always clear.
+    #[instruction]
+    pub fn private_hint(
+        genome: Enc<Mxe, Genome>,
+        target_traits: [u8; 4],
+        target_trait_count: u8,
+        client: Shared,
+    ) -> Enc<Shared, u8> {
+        let g = genome.to_arcis();
+
+        // ------------------------------------------------------------------------------
+        // MUST STAY IN SYNC with `score_entry`'s `trait_satisfied` (above) and with
+        // `constants::TRAIT_TABLE`. Copied VERBATIM: Arcis has no shared-helper path that
+        // cleanly spans two separate `#[instruction]` fns over the decrypted `Genome` here,
+        // so the conditions are duplicated on purpose. If a trait condition changes in
+        // `score_entry`, change it here too — otherwise hints and scores would disagree.
+        // ------------------------------------------------------------------------------
+        let trait_satisfied = |trait_id: u8| -> bool {
+            match trait_id {
+                0 => g.color_gene >= 180,          // Crimson
+                1 => g.color_gene < 64,            // Pale
+                2 => g.petal_gene >= 150,          // Full Bloom
+                3 => g.leaf_gene >= 128,           // Broadleaf
+                4 => g.stem_gene >= 160,           // Tall
+                5 => g.aroma_gene >= 150,          // Fragrant
+                6 => g.climate_gene >= 140,        // Hardy
+                7 => g.recessive_mask >= 32,       // Recessive Carrier
+                8 => g.mutation_affinity % 2 == 1, // Mutant (odd affinity)
+                9 => g.stability >= 150,           // Stable
+                _ => false,
+            }
+        };
+
+        // Build the 1-byte bitmask arithmetically. `bit_value[i]` is a PLAINTEXT constant, so
+        // `bitmask += bit_value[i]` is add-of-constant on a secret — no bitwise op ever runs
+        // on a secret value (unsupported in Arcis; see the `breed` mask comment). Each `i`
+        // contributes a distinct bit at most once, so the running sum equals the OR of the
+        // set bits. Inactive slots (`i >= target_trait_count`) never add, so their bits stay 0.
+        let bit_value: [u8; 4] = [1, 2, 4, 8];
+        let mut bitmask: u8 = 0;
+        for i in 0..4 {
+            let active = (i as u8) < target_trait_count;
+            let satisfied = trait_satisfied(target_traits[i]);
+            // Both branches always execute in MPC; gate with the combined public+secret cond.
+            if active && satisfied {
+                bitmask += bit_value[i];
+            }
+        }
+
+        // Seal to the requesting player only. Not `.reveal()`, not `Enc<Mxe, _>`.
+        client.from_arcis(bitmask)
+    }
+
     /// Reveals the top 3 entries (by score, descending) out of up to 16.
     ///
     /// Each `Enc<Mxe, u8>` score is read on-chain from its own `CompetitionEntry` account

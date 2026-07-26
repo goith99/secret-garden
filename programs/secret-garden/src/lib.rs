@@ -20,6 +20,8 @@ const COMP_DEF_OFFSET_BREED: u32 = comp_def_offset("breed");
 /// Stage 4A scoring circuits.
 const COMP_DEF_OFFSET_SCORE_ENTRY: u32 = comp_def_offset("score_entry");
 const COMP_DEF_OFFSET_REVEAL_TOP3: u32 = comp_def_offset("reveal_top3");
+/// Private Hint circuit (sealed per-player trait-satisfaction check).
+const COMP_DEF_OFFSET_PRIVATE_HINT: u32 = comp_def_offset("private_hint");
 
 /// Secret Garden Protocol.
 ///
@@ -259,6 +261,11 @@ pub mod secret_garden {
         let current_round = ctx.accounts.config.current_round as u32;
         ctx.accounts.profile.register_breed_attempt(current_round)?;
 
+        // V1: enforce the hard hybrid-collection cap in the same fail-fast spot. Breeding a
+        // new offspring would add one live hybrid, so refuse once the player is already at
+        // the cap (`total_flowers - STARTER_COUNT` live hybrids). See `check_collection_cap`.
+        ctx.accounts.profile.check_collection_cap()?;
+
         // Read both parents' public kind/species and their stored genome nonces.
         let flower_a_key = ctx.accounts.flower_a.key();
         let flower_b_key = ctx.accounts.flower_b.key();
@@ -439,7 +446,32 @@ pub mod secret_garden {
     /// offspring is the Locked flower bound to it both ways, rent destination == owner).
     /// Permissionless is safe because the rent destination is fixed to the flower's owner
     /// regardless of who calls — the caller gains nothing. Works while paused (recovery).
-    pub fn reclaim_dead_offspring(_ctx: Context<ReclaimDeadOffspring>) -> Result<()> {
+    ///
+    /// V1 (Option A) accounting: the dead offspring was counted in `total_flowers` at
+    /// `start_breeding` time (`+= 1`, done unconditionally for every started breed). Closing
+    /// its account here must therefore decrement `total_flowers`, or the collection cap would
+    /// permanently over-count phantom hybrids from failed breeds. This keeps
+    /// `total_flowers - STARTER_COUNT` an exact live-hybrid count.
+    pub fn reclaim_dead_offspring(ctx: Context<ReclaimDeadOffspring>) -> Result<()> {
+        ctx.accounts.profile.total_flowers = ctx.accounts.profile.total_flowers.saturating_sub(1);
+        Ok(())
+    }
+
+    /// V1: closes (deletes) one of the caller's own Active hybrid flowers, refunding its rent
+    /// to the owner and freeing a collection slot (`total_flowers -= 1`). All validity is
+    /// enforced by the `CloseFlower` account constraints:
+    ///   - `flower.owner == owner` (only your own flowers);
+    ///   - `flower.status == FLOWER_STATUS_ACTIVE` (excludes Locked mid-breed AND Submitted);
+    ///   - `flower.genome_status == GENOME_STATUS_ENCRYPTED` (starters are NEVER deletable —
+    ///     this is what preserves the `total_flowers - STARTER_COUNT` accounting invariant);
+    ///   - `!config.paused` (a player-facing action, unlike the recovery instructions).
+    /// Anchor's `close = owner` returns the rent and prevents any double-close.
+    ///
+    /// The flower's PDA index is deliberately NOT reused: `next_flower_index` stays monotonic,
+    /// so the closed index is retired forever (no PDA re-init risk); the freed slot is tracked
+    /// purely by the `total_flowers` decrement.
+    pub fn close_flower(ctx: Context<CloseFlower>) -> Result<()> {
+        ctx.accounts.profile.total_flowers = ctx.accounts.profile.total_flowers.saturating_sub(1);
         Ok(())
     }
 
@@ -857,6 +889,139 @@ pub mod secret_garden {
         });
         Ok(())
     }
+
+    // --- Private Hint: per-player sealed trait-satisfaction check ---
+
+    /// Registers the `private_hint` computation definition on-chain. Authority-only, once.
+    /// Same shape as the other `init_*_comp_def` instructions.
+    pub fn init_private_hint_comp_def(ctx: Context<InitPrivateHintCompDef>) -> Result<()> {
+        init_computation_def(ctx.accounts, None)?;
+        Ok(())
+    }
+
+    /// Queues a `private_hint` computation for one of the SIGNER'S OWN flowers against the
+    /// CURRENT open round's public target traits. The MPC seals a 1-byte trait-satisfaction
+    /// bitmask to the player's supplied x25519 key, so only they can decrypt the answer.
+    ///
+    /// Guards (all enforced by `QueuePrivateHint`'s account constraints, so they fail cleanly
+    /// with a specific error rather than doing nothing):
+    ///   - the flower is owned by the signer and is NOT Locked (mid-breed) — Active or
+    ///     Submitted flowers are both hint-checkable;
+    ///   - the round is the current one AND is Open (`NoActiveRound` otherwise).
+    ///
+    /// `hint_pubkey` / `hint_nonce` are the player's sealing key material (same shape as
+    /// `start_breeding`'s `env_pubkey` / `env_nonce`). The genome ciphertext is read in-place
+    /// from the flower account (never supplied by the caller), exactly like `queue_score_entry`.
+    pub fn queue_private_hint(
+        ctx: Context<QueuePrivateHint>,
+        computation_offset: u64,
+        hint_pubkey: [u8; 32],
+        hint_nonce: u128,
+    ) -> Result<()> {
+        let player_key = ctx.accounts.player.key();
+        let flower_key = ctx.accounts.flower.key();
+        let genome_nonce = u128::from_le_bytes(ctx.accounts.flower.encryption_metadata);
+        let target_traits = ctx.accounts.round.target_traits;
+        let target_trait_count = ctx.accounts.round.target_trait_count;
+        let round_id = ctx.accounts.round.round_id;
+        let hint_key = ctx.accounts.hint_result.key();
+
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        // Order matches the `private_hint` circuit params left-to-right:
+        //   Enc<Mxe, Genome>  -> nonce (u128) + 320-byte ciphertext read by reference,
+        //   target_traits[4]  -> four plaintext u8,
+        //   target_trait_count-> plaintext u8,
+        //   client: Shared    -> x25519 sealing pubkey + a client-supplied u128 nonce. A bare
+        //                        `Shared` recipient is encoded as (pubkey, nonce) — the SAME
+        //                        shape as an `Enc<Shared, _>` input MINUS its ciphertexts (cf.
+        //                        `start_breeding`'s env: pubkey + nonce + ciphertexts). Omitting
+        //                        the nonce makes the Arcium program reject the queue with
+        //                        `invalidArguments` (0x189d), so both parts are required.
+        let args = ArgBuilder::new()
+            .plaintext_u128(genome_nonce)
+            .account(
+                flower_key,
+                FLOWER_ENCRYPTED_GENOME_OFFSET,
+                ENCRYPTED_GENOME_LEN as u32,
+            )
+            .plaintext_u8(target_traits[0])
+            .plaintext_u8(target_traits[1])
+            .plaintext_u8(target_traits[2])
+            .plaintext_u8(target_traits[3])
+            .plaintext_u8(target_trait_count)
+            .x25519_pubkey(hint_pubkey)
+            .plaintext_u128(hint_nonce)
+            .build();
+
+        // The callback persists the sealed ciphertext into the player's hint account.
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            vec![PrivateHintCallback::callback_ix(
+                computation_offset,
+                &ctx.accounts.mxe_account,
+                &[CallbackAccount {
+                    pubkey: hint_key,
+                    is_writable: true,
+                }],
+            )?],
+            1,
+            0,
+        )?;
+
+        // Initialize / reset the per-player hint account. `ready = false` marks the previous
+        // answer (if any) as stale until this computation's callback lands — the ciphertext
+        // is left as-is (guarded by `ready`) and overwritten on success. Overwriting the same
+        // PDA keeps exactly one small account per player (no per-flower rent bloat / history).
+        let hint = &mut ctx.accounts.hint_result;
+        hint.player = player_key;
+        hint.round_id = round_id;
+        hint.target_trait_count = target_trait_count;
+        hint.ready = false;
+        hint.bump = ctx.bumps.hint_result;
+        Ok(())
+    }
+
+    /// Callback invoked by the Arcium cluster once `private_hint` finishes. Persists the
+    /// sealed bitmask (ciphertext + nonce + encryption key) into the player's `HintResult`
+    /// and flips `ready = true`. On failure it leaves `ready = false` so the client keeps
+    /// showing "no hint yet" and the player can simply re-request. There is no idempotency
+    /// flag to guard: a duplicate success callback just rewrites the identical sealed bytes.
+    #[arcium_callback(encrypted_ix = "private_hint")]
+    pub fn private_hint_callback(
+        ctx: Context<PrivateHintCallback>,
+        output: SignedComputationOutputs<PrivateHintOutput>,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let verified = output.verify_output(
+            &ctx.accounts.cluster_account,
+            &ctx.accounts.computation_account,
+        );
+        match verified {
+            // `private_hint` returns `Enc<Shared, u8>` -> a single `field_0` that is a
+            // `SharedEncryptedStruct<1>` (encryption_key + nonce + one ciphertext scalar).
+            Ok(PrivateHintOutput { field_0: sealed }) => {
+                let hint = &mut ctx.accounts.hint_result;
+                hint.encryption_key = sealed.encryption_key;
+                hint.nonce = sealed.nonce.to_le_bytes();
+                hint.ciphertext = sealed.ciphertexts[0];
+                hint.ready = true;
+                hint.computed_at = now;
+                emit!(HintComputedEvent {
+                    player: hint.player,
+                    round_id: hint.round_id,
+                });
+            }
+            Err(e) => {
+                // Arcium 0.10.4 only surfaces Success vs Failure to the callback. Leave the
+                // result not-ready so the client reports "no hint yet" and the player retries.
+                msg!("private_hint computation failed/aborted: {}", e);
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,6 +1333,58 @@ pub struct ReclaimDeadOffspring<'info> {
     /// CHECK: not read or written as a typed account; only receives the reclaimed
     /// lamports. Constrained above to equal `offspring.owner`.
     pub owner_recipient: UncheckedAccount<'info>,
+    /// The offspring owner's profile — decremented so `total_flowers` stops counting this
+    /// reclaimed dead hybrid (V1 Option A accounting). The PDA seeds bind it to
+    /// `offspring.owner`, so a permissionless caller cannot substitute a different profile.
+    /// (Declared after `offspring` so its `owner` field is available to the seeds.)
+    #[account(
+        mut,
+        seeds = [PROFILE_SEED, offspring.owner.as_ref()],
+        bump = profile.bump,
+    )]
+    pub profile: Box<Account<'info, PlayerProfile>>,
+}
+
+/// Accounts for `close_flower` — a player deleting one of their own Active hybrids. Reuses
+/// the `reclaim_dead_offspring` close pattern (`#[account(close = ...)]`), here self-closing
+/// to the signing owner. Pause-gated via `config` (matching every other player-facing
+/// instruction, e.g. `submit_entry` / `start_breeding`).
+#[derive(Accounts)]
+pub struct CloseFlower<'info> {
+    /// The flower's owner; signs, and receives the reclaimed rent.
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    /// Pause kill-switch: deleting is a player-facing action, blocked while paused.
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Account<'info, GameConfig>,
+
+    /// Owner's profile — `total_flowers` is decremented to free the collection slot. The PDA
+    /// seeds bind it to the signer, so it is necessarily the caller's own profile.
+    #[account(
+        mut,
+        seeds = [PROFILE_SEED, owner.key().as_ref()],
+        bump = profile.bump,
+    )]
+    pub profile: Account<'info, PlayerProfile>,
+
+    /// The flower to delete. `close = owner` refunds its rent to the owner; the constraints
+    /// enforce ownership, that it is Active (not Locked/Submitted), and that it is a hybrid
+    /// (never a starter). No `seeds` needed: Anchor proves it is a program-owned FlowerRecord,
+    /// and the `owner` constraint proves it belongs to the signer.
+    #[account(
+        mut,
+        close = owner,
+        constraint = flower.owner == owner.key() @ SecretGardenError::FlowerNotOwned,
+        constraint = flower.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
+        constraint = flower.genome_status == GENOME_STATUS_ENCRYPTED
+            @ SecretGardenError::StarterNotDeletable,
+    )]
+    pub flower: Account<'info, FlowerRecord>,
 }
 
 /// Permissionless reset of a stuck scoring computation (see `cancel_stuck_score`). No
@@ -1448,4 +1665,144 @@ pub struct Top3RevealedEvent {
     pub score_2: u8,
     pub entry_index_3: u16,
     pub score_3: u8,
+}
+
+// ---------------------------------------------------------------------------
+// Private Hint: Arcium account contexts (mirror the scoring contexts).
+// ---------------------------------------------------------------------------
+
+/// Registers the `private_hint` computation definition. Restricted to `config.authority`.
+#[init_computation_definition_accounts("private_hint", authority)]
+#[derive(Accounts)]
+pub struct InitPrivateHintCompDef<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        has_one = authority @ SecretGardenError::NotAuthority,
+    )]
+    pub config: Account<'info, GameConfig>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut)]
+    /// CHECK: comp_def_account, checked by the arcium program. Not initialized yet.
+    pub comp_def_account: UncheckedAccount<'info>,
+    #[account(mut, address = derive_mxe_lut_pda!(mxe_account.lut_offset_slot))]
+    /// CHECK: address_lookup_table, checked by the arcium program.
+    pub address_lookup_table: UncheckedAccount<'info>,
+    #[account(address = LUT_PROGRAM_ID)]
+    /// CHECK: lut_program is the Address Lookup Table program.
+    pub lut_program: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Queues a `private_hint` computation. The `player` signs and funds; they may only check a
+/// flower they OWN that is NOT Locked (mid-breed), against the current OPEN round. Only one
+/// round can be Open at a time (enforced by `open_round`), so `status == OPEN` uniquely
+/// identifies the current round — no separate `current_round` match is needed.
+#[queue_computation_accounts("private_hint", player)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct QueuePrivateHint<'info> {
+    #[account(mut)]
+    pub player: Signer<'info>,
+
+    /// The round to check against — it must be the current OPEN round. `NoActiveRound`
+    /// (rather than a silent no-op) if it is Closed/Finalized. Self-referential seeds prove
+    /// it is a genuine `CompetitionRound` PDA.
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+        constraint = round.status == ROUND_STATUS_OPEN @ SecretGardenError::NoActiveRound,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+
+    /// The player's own flower. Its encrypted genome is read in-place by the MPC (never
+    /// supplied by the caller). Must be owned by the signer and not Locked — a hint is
+    /// checkable for Active OR Submitted flowers, just not one that is mid-breed.
+    #[account(
+        constraint = flower.owner == player.key() @ SecretGardenError::FlowerNotOwned,
+        constraint = flower.status != FLOWER_STATUS_LOCKED @ SecretGardenError::FlowerNotActive,
+    )]
+    pub flower: Box<Account<'info, FlowerRecord>>,
+
+    /// The single overwritable per-player hint account. `init_if_needed`: created on the
+    /// first request, reused (overwritten) on every later one.
+    #[account(
+        init_if_needed,
+        payer = player,
+        space = 8 + HintResult::INIT_SPACE,
+        seeds = [HINT_SEED, player.key().as_ref()],
+        bump,
+    )]
+    pub hint_result: Box<Account<'info, HintResult>>,
+
+    // --- arcium queue-side accounts (mirror QueueScoreEntry) ---
+    #[account(
+        init_if_needed,
+        space = SIGN_PDA_ACCOUNT_LEN,
+        payer = player,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Account<'info, ArciumSignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut, address = derive_mempool_pda!(mxe_account))]
+    /// CHECK: mempool_account, checked by the arcium program.
+    pub mempool_account: UncheckedAccount<'info>,
+    #[account(mut, address = derive_execpool_pda!(mxe_account))]
+    /// CHECK: executing_pool, checked by the arcium program.
+    pub executing_pool: UncheckedAccount<'info>,
+    #[account(mut, address = derive_comp_pda!(computation_offset, mxe_account))]
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_PRIVATE_HINT))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+/// Callback context for `private_hint`. The single writable `hint_result` (registered in
+/// `queue_private_hint`'s `callback_ix`) receives the sealed bitmask. Self-referential seeds
+/// bind it to its stored `player`, so the callback can only write the correct PDA.
+#[callback_accounts("private_hint")]
+#[derive(Accounts)]
+pub struct PrivateHintCallback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_PRIVATE_HINT))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(address = ::arcium_anchor::solana_instructions_sysvar::ID)]
+    /// CHECK: instructions_sysvar, checked by the account constraint.
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [HINT_SEED, hint_result.player.as_ref()],
+        bump = hint_result.bump,
+    )]
+    pub hint_result: Box<Account<'info, HintResult>>,
+}
+
+/// Emitted by `private_hint_callback` when a hint is sealed and ready. Carries no secret
+/// data — only the player + round so a client can react (the bitmask stays encrypted).
+#[event]
+pub struct HintComputedEvent {
+    pub player: Pubkey,
+    pub round_id: u64,
 }

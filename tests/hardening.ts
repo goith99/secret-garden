@@ -32,15 +32,22 @@ const ERR_SCORE_NOT_YET_TIMED_OUT = "0x1787"; // 6023
 const ERR_EXPERIMENT_NOT_DEAD = "0x1788"; // 6024
 const ERR_OFFSPRING_NOT_RECLAIMABLE = "0x1789"; // 6025
 const ERR_INVALID_RENT_DESTINATION = "0x178a"; // 6026
+const ERR_FLOWER_NOT_OWNED = "0x177a"; // 6010
+const ERR_FLOWER_NOT_ACTIVE = "0x177b"; // 6011
+const ERR_COLLECTION_FULL = "0x1792"; // 6034
+const ERR_STARTER_NOT_DELETABLE = "0x1793"; // 6035
 
 // Mirror of on-chain constants (programs/.../constants.rs).
 const SCORE_TIMEOUT_SECONDS = 600;
 const FLOWER_STATUS_ACTIVE = 0;
 const FLOWER_STATUS_LOCKED = 1;
+const FLOWER_STATUS_SUBMITTED = 2;
 const EXPERIMENT_STATUS_COMPLETED = 2;
 const EXPERIMENT_STATUS_FAILED = 3;
 const EXPERIMENT_STATUS_EXPIRED = 4;
+const GENOME_STATUS_STARTER = 0;
 const GENOME_STATUS_ENCRYPTED = 1;
+const STARTER_COUNT = 6;
 const HYBRID_VISUAL_SPECIES_ID = 255;
 const ENCRYPTED_GENOME_LEN = 320;
 const GENOME_COMMITMENT_LEN = 32;
@@ -234,6 +241,75 @@ async function craftEntry(
   setAccount(h, pda, Buffer.from(data));
 }
 
+/** Craft a valid PlayerProfile PDA with a chosen `total_flowers` (canonical bump so the
+ *  `bump = profile.bump` seeds check passes when the instruction re-derives the PDA). */
+async function craftProfile(h: Harness, owner: PK, totalFlowers: number): Promise<void> {
+  const [pda, bump] = PublicKey.findProgramAddressSync(
+    [Buffer.from("profile"), owner.toBuffer()],
+    h.program.programId,
+  );
+  const data = await h.program.coder.accounts.encode("playerProfile", {
+    owner,
+    starterClaimed: true,
+    totalFlowers,
+    totalCrosses: 0,
+    dailyAttempts: 0,
+    finalSubmissions: 0,
+    createdAt: new BN(FIXED_UNIX_TS),
+    activeExperimentCount: 0,
+    totalExperiments: 0,
+    nextFlowerIndex: totalFlowers, // monotonic; value doesn't matter for these tests
+    bump,
+    breedsThisRound: 0,
+    lastBreedRound: 0,
+  });
+  setAccount(h, pda, Buffer.from(data));
+}
+
+/** Craft a FlowerRecord PDA with a chosen owner/index/status/genome_status. */
+async function craftFlower(
+  h: Harness,
+  owner: PK,
+  index: number,
+  status: number,
+  genomeStatus: number,
+  lamports = 3_000_000,
+): Promise<PK> {
+  const pda = h.flowerPda(owner, index);
+  const data = await h.program.coder.accounts.encode("flowerRecord", {
+    owner,
+    flowerIndex: index,
+    visualSpeciesId: genomeStatus === GENOME_STATUS_ENCRYPTED ? HYBRID_VISUAL_SPECIES_ID : 0,
+    generation: genomeStatus === GENOME_STATUS_ENCRYPTED ? 1 : 0,
+    rarity: 1,
+    stability: 90,
+    revealedTraitMask: 0,
+    parentA: PublicKey.default,
+    parentB: PublicKey.default,
+    genomeStatus,
+    sourceExperiment: PublicKey.default,
+    status,
+    createdAt: new BN(FIXED_UNIX_TS),
+    bump: 255,
+    genomeCommitment: Array.from(new Uint8Array(GENOME_COMMITMENT_LEN)),
+    encryptedGenome: Array.from(new Uint8Array(ENCRYPTED_GENOME_LEN)),
+    encryptionMetadata: Array.from(new Uint8Array(ENCRYPTION_METADATA_LEN)),
+  });
+  setAccount(h, pda, Buffer.from(data), lamports);
+  return pda;
+}
+
+const ixCloseFlower = (h: Harness, owner: PK, flower: PK) =>
+  h.program.methods
+    .closeFlower()
+    .accountsStrict({
+      owner,
+      config: h.configPda(),
+      profile: h.profilePda(owner),
+      flower,
+    })
+    .instruction();
+
 // =============================================================================
 
 describe("secret-garden Stage 5A: hardening (bankrun)", () => {
@@ -354,6 +430,7 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
               experiment: expPda,
               offspring,
               ownerRecipient: authority.publicKey,
+              profile: h.profilePda(authority.publicKey),
             })
             .instruction(),
         ],
@@ -461,13 +538,25 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
     const reclaimIx = async (caller: PK, experiment: PK, offspring: PK, recipient: PK) =>
       h.program.methods
         .reclaimDeadOffspring()
-        .accountsStrict({ caller, experiment, offspring, ownerRecipient: recipient })
+        .accountsStrict({
+          caller,
+          experiment,
+          offspring,
+          ownerRecipient: recipient,
+          // V1 Option A: reclaim now decrements the OFFSPRING OWNER's profile (always
+          // `player` in these tests), seeds-bound to offspring.owner in the program.
+          profile: h.profilePda(player.publicKey),
+        })
         .instruction();
 
     before(async () => {
       h = await Harness.create();
       player = h.payer;
       await h.send([await ixInitConfig(h, player.publicKey)], [player]);
+      // The reclaim ix now touches the offspring owner's profile. Craft it holding 7 flowers
+      // (6 permanent starters + 1 hybrid, as if one breed had been started) so the successful
+      // reclaim can prove `total_flowers` returns to the pre-breed value (6), not off-by-one.
+      await craftProfile(h, player.publicKey, 7);
     });
 
     it("fails on a Completed experiment's offspring (not dead)", async () => {
@@ -523,6 +612,12 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
       await craftExperiment(h, expPda, player.publicKey, EXPERIMENT_STATUS_FAILED, offspring);
       await craftOffspring(h, offspring, player.publicKey, FLOWER_STATUS_LOCKED, expPda, RENT);
 
+      const profilePda = h.profilePda(player.publicKey);
+      expect(
+        (await h.program.account.playerProfile.fetch(profilePda)).totalFlowers,
+        "profile starts at 7 (6 starters + 1 pending hybrid)",
+      ).to.equal(7);
+
       // The caller is NOT the owner, so the owner pays no fee — its balance delta is
       // exactly the reclaimed rent.
       const caller = h.fundedKeypair();
@@ -542,6 +637,14 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
       const closed = acc === null || acc.lamports === 0;
       expect(closed, "offspring account should be closed").to.equal(true);
 
+      // V1 Option A: the reclaimed dead hybrid was counted at start_breeding time; reclaim
+      // decrements total_flowers 7 -> 6, exactly back to the pre-breed value — NOT the
+      // off-by-one 7 that the pre-fix reclaim (no profile, no decrement) would have left.
+      expect(
+        (await h.program.account.playerProfile.fetch(profilePda)).totalFlowers,
+        "total_flowers recovered to 6 after reclaim (not off-by-one)",
+      ).to.equal(6);
+
       // Double-reclaim now fails because the offspring no longer exists.
       const caller2 = h.fundedKeypair();
       const r2 = await h.send(
@@ -549,6 +652,92 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
         [caller2],
       );
       assert.isNotNull(r2.result, "double reclaim should fail");
+    });
+  });
+
+  describe("V1: close_flower (delete a hybrid + free a cap slot)", () => {
+    // close_flower is a NON-Arcium instruction, so — unlike start_breeding — its full body
+    // and constraints run under bankrun. Each test is self-contained (fresh validator) so the
+    // paused test's global kill-switch can't leak into the others.
+
+    async function setup(): Promise<{ h: Harness; player: anchor.web3.Keypair }> {
+      const h = await Harness.create();
+      const player = h.payer;
+      await h.send([await ixInitConfig(h, player.publicKey)], [player]);
+      // 6 starters + 1 hybrid == total_flowers 7 (so a successful close returns it to 6).
+      await craftProfile(h, player.publicKey, STARTER_COUNT + 1);
+      return { h, player };
+    }
+
+    it("succeeds for an Active hybrid: refunds rent + total_flowers decrements by 1", async () => {
+      const { h, player } = await setup();
+      const RENT = 3_000_000;
+      const flower = await craftFlower(
+        h, player.publicKey, 6, FLOWER_STATUS_ACTIVE, GENOME_STATUS_ENCRYPTED, RENT);
+
+      const before = await h.client.getBalance(player.publicKey);
+      const r = await h.send([await ixCloseFlower(h, player.publicKey, flower)], [player]);
+      assert.isNull(r.result, `close_flower should succeed: ${r.result}`);
+
+      // Rent refunded to the owner (net positive even after the small tx fee: RENT >> fee).
+      const after = await h.client.getBalance(player.publicKey);
+      expect(after > before, "owner balance increased (rent refunded)").to.equal(true);
+      // Flower account closed.
+      const acc = await h.client.getAccount(flower);
+      expect(acc === null || acc.lamports === 0, "flower account closed").to.equal(true);
+      // Cap slot freed: total_flowers 7 -> 6.
+      expect(
+        (await h.program.account.playerProfile.fetch(h.profilePda(player.publicKey))).totalFlowers,
+      ).to.equal(STARTER_COUNT);
+    });
+
+    it("REJECTS a starter (genome_status STARTER) even when Active", async () => {
+      const { h, player } = await setup();
+      // A starter: Active but genome_status == STARTER. Must never be deletable.
+      const starter = await craftFlower(
+        h, player.publicKey, 0, FLOWER_STATUS_ACTIVE, GENOME_STATUS_STARTER);
+      const r = await h.send([await ixCloseFlower(h, player.publicKey, starter)], [player]);
+      assert.isNotNull(r.result, "closing a starter must fail");
+      expect(r.result).to.contain(ERR_STARTER_NOT_DELETABLE);
+    });
+
+    it("REJECTS a Locked flower (mid-breed)", async () => {
+      const { h, player } = await setup();
+      const flower = await craftFlower(
+        h, player.publicKey, 6, FLOWER_STATUS_LOCKED, GENOME_STATUS_ENCRYPTED);
+      const r = await h.send([await ixCloseFlower(h, player.publicKey, flower)], [player]);
+      assert.isNotNull(r.result, "closing a Locked flower must fail");
+      expect(r.result).to.contain(ERR_FLOWER_NOT_ACTIVE);
+    });
+
+    it("REJECTS a Submitted flower (in a round)", async () => {
+      const { h, player } = await setup();
+      const flower = await craftFlower(
+        h, player.publicKey, 6, FLOWER_STATUS_SUBMITTED, GENOME_STATUS_ENCRYPTED);
+      const r = await h.send([await ixCloseFlower(h, player.publicKey, flower)], [player]);
+      assert.isNotNull(r.result, "closing a Submitted flower must fail");
+      expect(r.result).to.contain(ERR_FLOWER_NOT_ACTIVE);
+    });
+
+    it("REJECTS a flower owned by someone else", async () => {
+      const { h, player } = await setup();
+      // A hybrid whose FlowerRecord.owner is a DIFFERENT wallet; `player` signs.
+      const other = h.fundedKeypair();
+      const foreign = await craftFlower(
+        h, other.publicKey, 6, FLOWER_STATUS_ACTIVE, GENOME_STATUS_ENCRYPTED);
+      const r = await h.send([await ixCloseFlower(h, player.publicKey, foreign)], [player]);
+      assert.isNotNull(r.result, "closing a foreign flower must fail");
+      expect(r.result).to.contain(ERR_FLOWER_NOT_OWNED);
+    });
+
+    it("REJECTS while the game is paused", async () => {
+      const { h, player } = await setup();
+      const flower = await craftFlower(
+        h, player.publicKey, 6, FLOWER_STATUS_ACTIVE, GENOME_STATUS_ENCRYPTED);
+      await h.setPaused(true);
+      const r = await h.send([await ixCloseFlower(h, player.publicKey, flower)], [player]);
+      assert.isNotNull(r.result, "close_flower must be blocked while paused");
+      expect(r.result).to.contain(ERR_GAME_PAUSED);
     });
   });
 

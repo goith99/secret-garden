@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::constants::{
     ENCRYPTED_GENOME_LEN, ENCRYPTION_METADATA_LEN, ENTRY_SCORE_LEN, ENTRY_SCORE_NONCE_LEN,
-    GENOME_COMMITMENT_LEN,
+    GENOME_COMMITMENT_LEN, HINT_CIPHERTEXT_LEN, HINT_ENCRYPTION_KEY_LEN, HINT_NONCE_LEN,
 };
 
 /// Singleton game configuration. PDA seeds: `[b"config"]`.
@@ -109,6 +109,27 @@ impl PlayerProfile {
             crate::error::SecretGardenError::BreedingLimitReached
         );
         self.breeds_this_round += 1;
+        Ok(())
+    }
+
+    /// V1 hybrid collection cap. `total_flowers - STARTER_COUNT` is the live hybrid count
+    /// (Option A accounting — the `STARTER_COUNT` starters are permanent, and every hybrid
+    /// create/destroy adjusts `total_flowers`). Returns `Err(CollectionFull)` once the player
+    /// already holds `FLOWER_COLLECTION_CAP` hybrids. `saturating_sub` guards the u16
+    /// subtraction (a pre-claim profile with `total_flowers < STARTER_COUNT` yields 0, which
+    /// is always under the cap — and you cannot breed before claiming starters anyway).
+    ///
+    /// Pure (no Anchor context), so it is unit-testable in isolation like
+    /// `register_breed_attempt`; the `start_breeding` body that calls it is unreachable under
+    /// bankrun (its Arcium accounts don't exist) and only fully runs against a live cluster.
+    pub fn check_collection_cap(&self) -> Result<()> {
+        let live_hybrids = self
+            .total_flowers
+            .saturating_sub(crate::constants::STARTER_COUNT as u16);
+        require!(
+            live_hybrids < crate::constants::FLOWER_COLLECTION_CAP,
+            crate::error::SecretGardenError::CollectionFull
+        );
         Ok(())
     }
 }
@@ -276,6 +297,44 @@ pub struct Experiment {
     pub bump: u8,
 }
 
+/// Per-player Private Hint result. PDA seeds: `[b"hint", player]` — exactly ONE account per
+/// player, OVERWRITTEN on each new `queue_private_hint` (hints are transient/informational,
+/// so no history is kept on-chain and rent stays bounded to one small account per player).
+///
+/// Created (or reset to `ready = false`) at queue time; the sealed ciphertext is written by
+/// `private_hint_callback`. `ready` is the "no hint yet" vs "hint ready" flag: a freshly
+/// queued (or never-computed) result reads `ready == false`, so a client never mistakes a
+/// stale/blank ciphertext for a fresh answer. The ciphertext is `Enc<Shared, u8>` sealed to
+/// this `player`'s x25519 key; only they can decrypt it (see the `private_hint` circuit).
+#[account]
+#[derive(InitSpace)]
+pub struct HintResult {
+    /// The player this hint belongs to (also the PDA seed). Only this wallet's sealing key
+    /// can decrypt `ciphertext`.
+    pub player: Pubkey,
+    /// The `round_id` whose target traits the latest hint was computed against. Lets a client
+    /// detect a hint left over from a previous round.
+    pub round_id: u64,
+    /// Number of meaningful low bits in the decrypted bitmask (== the round's
+    /// `target_trait_count` at request time). Public convenience; bits `>= count` are 0.
+    pub target_trait_count: u8,
+    /// `false` until `private_hint_callback` writes a fresh sealed result; reset to `false`
+    /// by every new `queue_private_hint`. Distinguishes "no hint yet" from "hint ready".
+    pub ready: bool,
+    /// x25519 encryption key from the sealed output (`SharedEncryptedStruct::encryption_key`);
+    /// the client combines it with its own private key to derive the decryption shared secret.
+    pub encryption_key: [u8; HINT_ENCRYPTION_KEY_LEN],
+    /// Sealing nonce (little-endian u128) for `ciphertext`.
+    pub nonce: [u8; HINT_NONCE_LEN],
+    /// The sealed 1-byte bitmask (`Enc<Shared, u8>` = 1 scalar * 32 bytes). Meaningless until
+    /// `ready == true`.
+    pub ciphertext: [u8; HINT_CIPHERTEXT_LEN],
+    /// Unix timestamp the latest hint was computed (0 until the first callback lands).
+    pub computed_at: i64,
+    /// PDA bump.
+    pub bump: u8,
+}
+
 #[cfg(test)]
 mod tests {
     //! Stage 5D: per-round breeding limit. These exercise the decision logic directly —
@@ -335,5 +394,45 @@ mod tests {
         assert!(p.register_breed_attempt(7).is_ok());
         assert_eq!(p.last_breed_round, 7);
         assert_eq!(p.breeds_this_round, 1);
+    }
+
+    // --- V1: hybrid collection cap boundary (proves the require! arithmetic directly, since
+    //     the start_breeding body that calls check_collection_cap is unreachable under bankrun) ---
+    use crate::constants::{FLOWER_COLLECTION_CAP, STARTER_COUNT};
+
+    /// Set `total_flowers` so the profile holds exactly `hybrids` live hybrids.
+    fn profile_with_hybrids(hybrids: u16) -> PlayerProfile {
+        let mut p = blank_profile();
+        p.total_flowers = STARTER_COUNT as u16 + hybrids;
+        p
+    }
+
+    #[test]
+    fn cap_allows_up_to_the_limit_then_blocks_at_the_boundary() {
+        // 0 hybrids (fresh, just-claimed profile) -> allowed.
+        assert!(profile_with_hybrids(0).check_collection_cap().is_ok());
+        // 19 hybrids -> breeding the 20th is allowed (19 < 20).
+        assert!(profile_with_hybrids(FLOWER_COLLECTION_CAP - 1)
+            .check_collection_cap()
+            .is_ok());
+        // 20 hybrids -> breeding the 21st is blocked (20 is NOT < 20).
+        assert!(profile_with_hybrids(FLOWER_COLLECTION_CAP)
+            .check_collection_cap()
+            .is_err());
+        // Above the cap stays blocked.
+        assert!(profile_with_hybrids(FLOWER_COLLECTION_CAP + 5)
+            .check_collection_cap()
+            .is_err());
+    }
+
+    #[test]
+    fn cap_subtraction_never_underflows_below_starter_count() {
+        // A profile with fewer than STARTER_COUNT flowers (shouldn't happen in practice, but
+        // must not panic): saturating_sub -> 0 hybrids -> allowed.
+        let mut p = blank_profile();
+        p.total_flowers = 0;
+        assert!(p.check_collection_cap().is_ok());
+        p.total_flowers = STARTER_COUNT as u16 - 1;
+        assert!(p.check_collection_cap().is_ok());
     }
 }

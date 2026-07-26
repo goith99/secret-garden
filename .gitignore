@@ -25,5 +25,6 @@ id.json
 keypairs/
 wallets/
 
-# Local AI tool config (never commit)
+# Local AI tool config / artifacts (never commit)
 .claude/
+graphify-out/

@@ -298,3 +298,33 @@ pub const SCORE_ERROR_ABORTED: u16 = 1;
 /// independent MPC latency profiles; decoupling the two recovery windows lets either be
 /// tuned without affecting the other.
 pub const SCORE_TIMEOUT_SECONDS: i64 = 600;
+
+// --- Private Hint: per-player sealed trait-satisfaction check ---
+//
+// A player can privately ask which of the CURRENT round's public target traits their own
+// encrypted flower genome satisfies. The `private_hint` circuit returns a single `u8`
+// bitmask SEALED to the player's x25519 key (`Enc<Shared, u8>`), so only that player can
+// decrypt it. The result is stored in ONE overwritable account per player (see `HintResult`).
+
+/// PDA seed prefix for the per-player `HintResult` account: `[b"hint", player]`.
+pub const HINT_SEED: &[u8] = b"hint";
+
+/// Sealed-output sizes for `Enc<Shared, u8>` (see `arcium_anchor::SharedEncryptedStruct<1>`):
+/// a 32-byte x25519 encryption key + a 16-byte (u128) nonce + one 32-byte ciphertext scalar.
+/// The client derives its shared secret from `encryption_key` + its own private key to
+/// decrypt `ciphertext` under `nonce`.
+pub const HINT_ENCRYPTION_KEY_LEN: usize = 32;
+pub const HINT_NONCE_LEN: usize = 16;
+pub const HINT_CIPHERTEXT_LEN: usize = 32;
+
+// --- V1: hybrid collection cap + delete ---
+
+/// Hard cap on a player's LIVE hybrid collection. Breeding is blocked once a player holds
+/// this many hybrids until they `close_flower` some to free a slot.
+///
+/// Accounting invariant (Option A): `total_flowers - STARTER_COUNT` == live hybrid count.
+/// The `STARTER_COUNT` starters are permanent (never deletable — see `close_flower`), and
+/// every hybrid CREATE (`start_breeding`, `total_flowers += 1`) is matched by a hybrid
+/// DESTROY (`close_flower` AND `reclaim_dead_offspring`, each `total_flowers -= 1`). Keeping
+/// both destroyers in sync is what makes the subtraction a true live count.
+pub const FLOWER_COLLECTION_CAP: u16 = 20;

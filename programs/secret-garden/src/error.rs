@@ -129,4 +129,20 @@ pub enum SecretGardenError {
     /// the minimum delay. The authority may close at any time.
     #[msg("The round has been open too briefly for an operator to close it")]
     RoundTooRecentToClose,
+
+    // --- Private Hint ---
+    /// `queue_private_hint` requires the CURRENT round to be Open — no Open round means
+    /// there are no target traits to check a flower against yet.
+    #[msg("There is no active (open) round to request a hint for")]
+    NoActiveRound,
+
+    // --- V1: hybrid collection cap + delete ---
+    /// `start_breeding` refused because the player already holds `FLOWER_COLLECTION_CAP`
+    /// live hybrids; they must `close_flower` some first.
+    #[msg("Your hybrid collection is full; delete some flowers to breed more")]
+    CollectionFull,
+    /// `close_flower` called on a starter flower — starters are permanent and never
+    /// deletable (this preserves the `total_flowers - STARTER_COUNT` accounting invariant).
+    #[msg("Starter flowers cannot be deleted")]
+    StarterNotDeletable,
 }
