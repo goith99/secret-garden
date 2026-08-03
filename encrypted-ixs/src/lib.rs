@@ -268,12 +268,21 @@ mod circuits {
         // revealing the mask leaks nothing about the encrypted genome — it is a purely
         // cosmetic, MPC-random label. This is computed AFTER `child`, so the genome output
         // is byte-for-byte unchanged from Stage 3A/3B (no regression to the proven genome).
-        let species_nudge = parent_a_species as u16 + parent_b_species as u16;
+        // `parent_a_species` / `parent_b_species` are PUBLIC plaintext parameters, so this
+        // residue is computed in the clear and costs nothing in MPC. Pre-reducing it is what
+        // lets the SECRET modulo below run at u8 width: the old form summed r (0..=255) with
+        // species_nudge (0..=510, since a hybrid's species id is 255) and the salt, reaching
+        // 768 and forcing a 16-bit modulo.
+        let species_nudge_r: u8 = ((parent_a_species as u16 + parent_b_species as u16) % 5) as u8;
         // Distinct salt per class → four independent RNG draws (not one repeated value).
-        let class = |salt: u16| -> u8 {
+        let class = |salt: u8| -> u8 {
             let r = ArcisRNG::gen_uniform::<u8>();
             // RNG dominates; %5 maps to the five visual classes (slight, harmless bias).
-            (((r as u16) + species_nudge + salt) % 5) as u8
+            // Value-identical to the previous `(r + species_nudge + salt) % 5` by modular
+            // arithmetic: (r + N) % 5 == ((r % 5) + (N % 5)) % 5. Every operand now stays
+            // under 256 — `r % 5` and `(species_nudge_r + salt) % 5` are each 0..=4, so their
+            // sum is 0..=8 — which keeps the whole expression at u8 width.
+            ((r % 5) + (species_nudge_r + salt) % 5) % 5
         };
         let petal_class = class(0);
         let color_class = class(1);
