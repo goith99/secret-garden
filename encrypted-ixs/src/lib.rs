@@ -202,8 +202,20 @@ mod circuits {
                 gb
             };
 
-            // Mutation: average of both parents jittered by a fresh random value.
-            let mutated = ((ga as u16 + gb as u16 + mutate_roll as u16) / 3) as u8;
+            // Mutation (~1/8 of the time, gated by `mutate_roll < 32` below): emit the TRUE
+            // two-parent average instead of the dominant-parent copy. This is a genuine
+            // blended-offspring gene — distinct from the `inherited` branch, which copies
+            // whichever single parent won the weighted roll. We divide the two-parent SUM by 2
+            // (a real average). The prior code divided the sum by 3 with `mutate_roll` folded
+            // into the numerator; that had no documented rationale and systematically pulled
+            // mutated genes ~29% BELOW the parent average (mean ~90 instead of ~127.5),
+            // silently making every `>=`-threshold trait harder to satisfy. Fixed to a true
+            // average. No jitter is added: symmetric jitter under Arcis's unsigned arithmetic
+            // risks underflow and costs an extra comparison in this closure (which runs 7x per
+            // breed), and the mutation is meaningful without it (blend vs dominant-parent copy).
+            // `mutate_roll` is therefore used ONLY as the 1/8 gate. Max (255+255)/2 = 255, so
+            // the `as u8` cast never truncates.
+            let mutated = ((ga as u16 + gb as u16) / 2) as u8;
             if mutate_roll < 32 {
                 mutated
             } else {
