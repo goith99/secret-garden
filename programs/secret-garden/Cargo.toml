@@ -27,9 +27,9 @@ anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
 # already in the lockfile transitively). anchor_lang::solana_program strips the hasher
 # modules, so depend on the hasher crate directly.
 solana-sha256-hasher = "3.1.0"
-arcium-client = { default-features = false, version = "=0.10.4" }
-arcium-macros = "=0.10.4"
-arcium-anchor = "=0.10.4"
+arcium-client = { default-features = false, version = "=0.14.1" }
+arcium-macros = "=0.14.1"
+arcium-anchor = "=0.14.1"
 # pin so that we do not have 1.13.*
 unicode-segmentation = { version = "=1.12.0" }
 # pin so that we do not have edition = 2024

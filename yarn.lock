@@ -45,15 +45,15 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@arcium-hq/client@npm:^0.10.4":
-  version: 0.10.4
-  resolution: "@arcium-hq/client@npm:0.10.4"
+"@arcium-hq/client@npm:0.14.1":
+  version: 0.14.1
+  resolution: "@arcium-hq/client@npm:0.14.1"
   dependencies:
     "@anchor-lang/core": "npm:^1.0.2"
     "@noble/curves": "npm:^1.9.5"
     "@noble/hashes": "npm:^1.7.1"
     "@solana/web3.js": "npm:^1.95.4"
-  checksum: 10c0/e2f49419237123bb6fa842a7ae762905d58d0a6cbab990c18d033bcfaa0ba4353ab366f310b2abb3d11a69c34bbc45f00fc2163b0fc86541261d67aadfa82108
+  checksum: 10c0/79bfa352331e6a8d7608fb6c7544e968f718b1d2d2c4ac772aa0c40826c92165f54c0aa2d53a3d2add6bddd9987ceede61fa4498daf364013abdd50779fa32ed
   languageName: node
   linkType: hard
 
@@ -1298,7 +1298,7 @@ __metadata:
   resolution: "secret-garden@workspace:."
   dependencies:
     "@anchor-lang/core": "npm:^1.0.2"
-    "@arcium-hq/client": "npm:^0.10.4"
+    "@arcium-hq/client": "npm:0.14.1"
     "@supabase/supabase-js": "npm:^2.108.2"
     "@types/bn.js": "npm:^5.1.0"
     "@types/chai": "npm:^4.3.0"

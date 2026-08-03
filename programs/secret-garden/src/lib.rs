@@ -23,6 +23,14 @@ const COMP_DEF_OFFSET_REVEAL_TOP3: u32 = comp_def_offset("reveal_top3");
 /// Private Hint circuit (sealed per-player trait-satisfaction check).
 const COMP_DEF_OFFSET_PRIVATE_HINT: u32 = comp_def_offset("private_hint");
 
+/// Compute-unit budget for Arcium callback transactions. Required from Arcium v0.11.0 onward
+/// (`queue_computation`'s 7th parameter; it did not exist in v0.10.4). Sized from a MEASURED
+/// successful `breed_callback` on devnet, which consumed 94,301 CU on its heaviest path
+/// (flatten 10 genome ciphertexts + SHA-256 commitment + ~400-byte account write). 200,000 is
+/// Solana's default per-instruction budget and leaves >2x headroom over that worst case; every
+/// other callback in this program (score/reveal/hint) writes far less.
+const CALLBACK_CU_LIMIT: u32 = 200_000;
+
 /// Secret Garden Protocol.
 ///
 /// Stage 1: game config, player profiles, starter-flower claiming.
@@ -349,6 +357,7 @@ pub mod secret_garden {
             )?],
             1,
             0,
+            CALLBACK_CU_LIMIT,
         )?;
 
         // Lock both parents (the long-reserved FLOWER_STATUS_LOCKED is finally used).
@@ -648,6 +657,7 @@ pub mod secret_garden {
             )?],
             1,
             0,
+            CALLBACK_CU_LIMIT,
         )?;
 
         // Stage 5A: mark this entry as having a scoring computation in flight, and stamp
@@ -752,6 +762,7 @@ pub mod secret_garden {
             )?],
             1,
             0,
+            CALLBACK_CU_LIMIT,
         )?;
         Ok(())
     }
@@ -969,6 +980,7 @@ pub mod secret_garden {
             )?],
             1,
             0,
+            CALLBACK_CU_LIMIT,
         )?;
 
         // Initialize / reset the per-player hint account. `ready = false` marks the previous

@@ -294,14 +294,13 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "arcis"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f6fe8cd55d81914ee41ef7b51c114ecc9d2be4d158a1ea478a53a070d09607"
+checksum = "26920b8ecbbfe4bb5ecfa17b94e14c3b3ed496d4cfd9b08ee89f43a5e700439c"
 dependencies = [
  "arcis-compiler",
  "arcis-interpreter-proc-macros",
  "ff",
- "num-bigint 0.4.6",
  "num-traits",
  "paste",
  "rand 0.8.6",
@@ -309,9 +308,9 @@ dependencies = [
 
 [[package]]
 name = "arcis-compiler"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59587d95b5c439f6b4ea5c8fcb36f5d158f2d35d2c968de53e99a08c2e63c0e8"
+checksum = "8a8d5846fc3ca9c278dab2493177ac1dd35e6eaf979abc0e72eb82aaff0fa91b"
 dependencies = [
  "aes",
  "arcis-interface",
@@ -330,6 +329,8 @@ dependencies = [
  "ed25519-dalek",
  "ff",
  "group",
+ "hkdf",
+ "hmac",
  "hybrid-array",
  "indexmap 2.13.1",
  "keccak",
@@ -349,23 +350,25 @@ dependencies = [
  "sha2",
  "sha3",
  "solana-zk-sdk",
+ "wincode-arcium-fork",
 ]
 
 [[package]]
 name = "arcis-interface"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5171e3ccfe8e15dd25a1e3e291ebf2d9cfff5790f9daada57ab4a5e14d336bd2"
+checksum = "cac99bdfaa7f641d5cd04a24c3717639d5df214140095d2b2d6d8b6216a37d35"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "arcis-internal-expr-macro"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "910f1b35aa4a20ca92ee3a2972d6c32b5ed4a4060a472403ace435f8996dc5ed"
+checksum = "f6e4fb20165aa9fca2d42337b1a9614d7db85ca7619cc9b594fc8070463dc84b"
 dependencies = [
  "indexmap 2.13.1",
  "proc-macro2",
@@ -376,9 +379,9 @@ dependencies = [
 
 [[package]]
 name = "arcis-interpreter"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "227ab486f097808a98c546d81c3e52c73f79dd4c14f63f6205a234118fa0b627"
+checksum = "a83bba6c05f8dc2184bc67487d9c025615775b57a1ed5e3d11f34f755e32e0a7"
 dependencies = [
  "arcis-compiler",
  "arcis-interface",
@@ -398,20 +401,30 @@ dependencies = [
 
 [[package]]
 name = "arcis-interpreter-proc-macros"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e71ecb7d60e44219f74304abb13f53d71ab594d0a1bb36f0cb0d65dd725219"
+checksum = "e460d03f19298d656cf9d4dfb4426ef63fa22ace8ca23f4c69f3007003786f8f"
 dependencies = [
  "arcis-interpreter",
 ]
 
 [[package]]
 name = "arcium-anchor"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e656379f1b8bf73ae10b184dc38c7068e9834e7faa2c26463512002eeb60f615"
+checksum = "5d87ed3bc7a2c919a30ee81a844c18e049b9945b1d50caf396b2c702d9051658"
 dependencies = [
+ "anchor-attribute-access-control",
+ "anchor-attribute-account",
+ "anchor-attribute-constant",
+ "anchor-attribute-error",
+ "anchor-attribute-event",
+ "anchor-attribute-program",
+ "anchor-derive-accounts",
+ "anchor-derive-serde",
+ "anchor-derive-space",
  "anchor-lang",
+ "anchor-syn",
  "arcium-client",
  "arcium-macros",
  "sha2-const-stable",
@@ -422,11 +435,21 @@ dependencies = [
 
 [[package]]
 name = "arcium-client"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d4fadd7d5af4e4789f1a8a0425c549f788800b7078fce4b15f68cc1981b7f2"
+checksum = "ec0f33ce5ec1c2624cbaef125cbe3d1da07d58a55922499bf46bff773bd09922"
 dependencies = [
+ "anchor-attribute-access-control",
+ "anchor-attribute-account",
+ "anchor-attribute-constant",
+ "anchor-attribute-error",
+ "anchor-attribute-event",
+ "anchor-attribute-program",
+ "anchor-derive-accounts",
+ "anchor-derive-serde",
+ "anchor-derive-space",
  "anchor-lang",
+ "anchor-syn",
  "bytemuck",
  "const-crypto",
  "rand 0.8.6",
@@ -439,9 +462,9 @@ dependencies = [
 
 [[package]]
 name = "arcium-core-utils"
-version = "0.4.5"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "955e4028bf48df2f257e2f37ffffb9d1f6fabb6e62cee169e5bb518c5b44c1de"
+checksum = "94d2cd8f794c605df309ad90a5ca29993a580e5f43fdf6702783114c85b90759"
 dependencies = [
  "arcium-primitives",
  "bincode",
@@ -464,9 +487,9 @@ dependencies = [
 
 [[package]]
 name = "arcium-macros"
-version = "0.10.4"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d243d274971e381fdd15363a6f3762e8a5bf393f26242ee62a6b6e93fb250dcd"
+checksum = "3c86f5659a7e0b2eae7e214dfd7fc1bc34349ed1b5972de1419e7470add37e11"
 dependencies = [
  "arcis-interface",
  "convert_case",
@@ -479,9 +502,9 @@ dependencies = [
 
 [[package]]
 name = "arcium-primitives"
-version = "0.4.5"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0f016fae5f16f5ab111821033c56359e004b341d0f87e92e9083df0298ba872"
+checksum = "1eeba983791d10f9dadee052f358a59cd3a6a89e62d5344ab061a072075460ff"
 dependencies = [
  "aes",
  "bincode",
@@ -2047,6 +2070,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2346,9 +2378,9 @@ dependencies = [
 
 [[package]]
 name = "mpc-macros"
-version = "0.4.5"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02c8d8054c5f5b89f2f93d8412de1737d03a071c481971c586b2b542f17047f9"
+checksum = "5125fcb0e4510fee2983bf74a45e653dd1435a0033a4c2b13dbe790ab399bcda"
 dependencies = [
  "itertools 0.12.1",
  "proc-macro2",
