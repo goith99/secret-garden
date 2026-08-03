@@ -177,9 +177,26 @@ mod circuits {
             // Threshold to favour parent A. Stronger parent gets a higher base (160 vs
             // 96 out of 255); the environment bias nudges it by up to +63.
             let a_stronger = ga >= gb;
-            let base = if a_stronger { 160u16 } else { 96u16 };
-            let threshold = base + (bias as u16) / 4;
-            let inherited = if (pick_roll as u16) < threshold {
+            // The environment dial biases inheritance TOWARD THE STRONGER GENE, so a higher
+            // dial always pushes this gene group up regardless of which slot the player put
+            // the stronger parent in. Previously `threshold = base + bias / 4` always favoured
+            // parent A, which made the dial's DIRECTION depend on slot order: with the stronger
+            // flower in slot B, turning Light up made colour go DOWN (measured -30 mean colour
+            // over 300k trials, vs +30 with this form). `add` is symmetric about the two bases.
+            //
+            // Ranges: `bias` is a u8 so `add = bias / 4` is at most 63. Upper branch peaks at
+            // 160 + 63 = 223 (no u8 overflow); lower branch bottoms at 96 - 63 = 33 (no
+            // underflow). `P(inherit stronger) = threshold / 256`, so the dial spans roughly
+            // 62.5%..87.1% when A is stronger and the mirror of that when B is.
+            //
+            // NOTE: splitting this into three INDEPENDENT comparisons (precomputing both
+            // candidate thresholds to shorten the dependent chain) was measured and is WORSE —
+            // network_depth 118 -> 119 and +0.3% ACU. The Arcis scheduler already handles this
+            // chain well; the extra comparison costs more than the reordering saves. Do not
+            // retry that transformation.
+            let add = bias / 4;
+            let threshold = if a_stronger { 160u8 + add } else { 96u8 - add };
+            let inherited = if pick_roll < threshold {
                 ga
             } else {
                 gb
