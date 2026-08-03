@@ -18,7 +18,7 @@ declare_id!("7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo");
 /// `#[instruction] fn breed` name across all Arcium macros).
 const COMP_DEF_OFFSET_BREED: u32 = comp_def_offset("breed");
 /// Stage 4A scoring circuits.
-const COMP_DEF_OFFSET_SCORE_ENTRY: u32 = comp_def_offset("score_entry");
+const COMP_DEF_OFFSET_SCORE_ENTRY: u32 = comp_def_offset("score_entry_v2");
 const COMP_DEF_OFFSET_REVEAL_TOP3: u32 = comp_def_offset("reveal_top3");
 /// Private Hint circuit (sealed per-player trait-satisfaction check).
 const COMP_DEF_OFFSET_PRIVATE_HINT: u32 = comp_def_offset("private_hint");
@@ -641,7 +641,7 @@ pub mod secret_garden {
             ctx.accounts,
             computation_offset,
             args,
-            vec![ScoreEntryCallback::callback_ix(
+            vec![ScoreEntryV2Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &[
@@ -662,7 +662,7 @@ pub mod secret_garden {
 
         // Stage 5A: mark this entry as having a scoring computation in flight, and stamp
         // the queue time so `cancel_stuck_score` can time it out if the callback never
-        // lands. Cleared by `score_entry_callback` (success or failure) or by a timed-out
+        // lands. Cleared by `score_entry_v2_callback` (success or failure) or by a timed-out
         // `cancel_stuck_score`. `scored_count` is NOT touched here — only the (idempotent)
         // success callback ever increments it, so the count stays exactly-once across any
         // number of queue/cancel/retry cycles.
@@ -773,10 +773,10 @@ pub mod secret_garden {
     /// impossible even if `queue_score_entry` were somehow called twice before the first
     /// callback lands. On failure: records a sentinel error_code and leaves `scored =
     /// false` so the entry can be re-queued.
-    #[arcium_callback(encrypted_ix = "score_entry")]
-    pub fn score_entry_callback(
-        ctx: Context<ScoreEntryCallback>,
-        output: SignedComputationOutputs<ScoreEntryOutput>,
+    #[arcium_callback(encrypted_ix = "score_entry_v2")]
+    pub fn score_entry_v2_callback(
+        ctx: Context<ScoreEntryV2Callback>,
+        output: SignedComputationOutputs<ScoreEntryV2Output>,
     ) -> Result<()> {
         if ctx.accounts.entry.scored {
             return Ok(());
@@ -786,7 +786,7 @@ pub mod secret_garden {
             &ctx.accounts.computation_account,
         );
         match verified {
-            Ok(ScoreEntryOutput { field_0: score }) => {
+            Ok(ScoreEntryV2Output { field_0: score }) => {
                 let entry = &mut ctx.accounts.entry;
                 entry.encrypted_score = score.ciphertexts[0];
                 entry.score_nonce = score.nonce.to_le_bytes();
@@ -1426,7 +1426,7 @@ pub struct BreedingComputedEvent {
 // ---------------------------------------------------------------------------
 
 /// Registers the `score_entry` computation definition. Restricted to `config.authority`.
-#[init_computation_definition_accounts("score_entry", authority)]
+#[init_computation_definition_accounts("score_entry_v2", authority)]
 #[derive(Accounts)]
 pub struct InitScoreEntryCompDef<'info> {
     #[account(mut)]
@@ -1481,7 +1481,7 @@ pub struct InitRevealTop3CompDef<'info> {
 
 /// Queues a `score_entry` computation for one entry in a Closed round. Round authority
 /// signs and funds. The entry is bound to the round and to the flower being scored.
-#[queue_computation_accounts("score_entry", authority)]
+#[queue_computation_accounts("score_entry_v2", authority)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
 pub struct QueueScoreEntry<'info> {
@@ -1614,9 +1614,9 @@ pub struct QueueRevealTop3<'info> {
 
 /// Callback context for `score_entry`. The writable `entry` + `round` (in that order,
 /// matching `queue_score_entry`'s registration) are persisted by the callback.
-#[callback_accounts("score_entry")]
+#[callback_accounts("score_entry_v2")]
 #[derive(Accounts)]
-pub struct ScoreEntryCallback<'info> {
+pub struct ScoreEntryV2Callback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_SCORE_ENTRY))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,

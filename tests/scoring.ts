@@ -112,7 +112,7 @@ describe("secret-garden Stage 4B: scoring (live cluster)", () => {
 
   /** Initialize a comp def and upload its compiled circuit. */
   async function initCompDef(
-    circuit: "breed" | "score_entry" | "reveal_top3",
+    circuit: "breed" | "score_entry_v2" | "reveal_top3",
     method: "initBreedingCompDef" | "initScoreEntryCompDef" | "initRevealTop3CompDef",
   ): Promise<void> {
     const offset = arcium.getCompDefAccOffset(circuit);
@@ -267,7 +267,7 @@ describe("secret-garden Stage 4B: scoring (live cluster)", () => {
         round,
         entry,
         flowerRecord: flower,
-        ...queueAccsFor("score_entry", offset),
+        ...queueAccsFor("score_entry_v2", offset),
       })
       .signers([authority])
       .rpc({ skipPreflight: true, commitment: "confirmed" });
@@ -331,7 +331,7 @@ describe("secret-garden Stage 4B: scoring (live cluster)", () => {
       .rpc({ commitment: "confirmed" });
 
     await initCompDef("breed", "initBreedingCompDef");
-    await initCompDef("score_entry", "initScoreEntryCompDef");
+    await initCompDef("score_entry_v2", "initScoreEntryCompDef");
     await initCompDef("reveal_top3", "initRevealTop3CompDef");
 
     // MXE key + cipher for breeding's private environment.
@@ -404,7 +404,7 @@ describe("secret-garden Stage 4B: scoring (live cluster)", () => {
           round,
           entry,
           flowerRecord: flower,
-          ...queueAccsFor("score_entry", off),
+          ...queueAccsFor("score_entry_v2", off),
         })
         .signers([authority])
         .rpc({ commitment: "confirmed" });
@@ -489,7 +489,7 @@ describe("secret-garden Stage 4B: scoring (live cluster)", () => {
           round,
           entry,
           flowerRecord: aFlowers[1],
-          ...queueAccsFor("score_entry", freshOffset()),
+          ...queueAccsFor("score_entry_v2", freshOffset()),
         })
         .signers([authority])
         .rpc({ commitment: "confirmed" });

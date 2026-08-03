@@ -26,7 +26,7 @@ describe("secret-garden DEVNET verify (read-only)", () => {
 
   it("all 3 computation definitions are registered", async function () {
     this.timeout(60_000);
-    for (const circuit of ["breed", "score_entry", "reveal_top3"] as const) {
+    for (const circuit of ["breed", "score_entry_v2", "reveal_top3"] as const) {
       const offset = arcium.getCompDefAccOffset(circuit);
       const compDefPda = PublicKey.findProgramAddressSync(
         [arcium.getArciumAccountBaseSeed("ComputationDefinitionAccount"), program.programId.toBuffer(), offset],

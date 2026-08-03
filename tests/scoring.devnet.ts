@@ -130,7 +130,7 @@ describe("secret-garden DEVNET: scoring gate (cluster 456)", () => {
 
     // All three comp-defs must be finalized on-chain (uploaded this session).
     const arciumProgram = arcium.getArciumProgram(provider);
-    for (const c of ["score_entry", "reveal_top3"] as const) {
+    for (const c of ["score_entry_v2", "reveal_top3"] as const) {
       const pda = PublicKey.findProgramAddressSync(
         [arcium.getArciumAccountBaseSeed("ComputationDefinitionAccount"),
           program.programId.toBuffer(), arcium.getCompDefAccOffset(c)],
@@ -196,7 +196,7 @@ describe("secret-garden DEVNET: scoring gate (cluster 456)", () => {
     const scoreTx = await program.methods.queueScoreEntry(scoreOffset)
       .accountsPartial({
         authority: authority.publicKey, round, entry, flowerRecord: entryFlower,
-        ...queueAccsFor("score_entry", scoreOffset),
+        ...queueAccsFor("score_entry_v2", scoreOffset),
       }).transaction();
     await sendTxHttp(scoreTx, "queueScoreEntry");
     console.log(`  [score_entry] queued; awaiting MPC finalization...`);

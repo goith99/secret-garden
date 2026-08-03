@@ -308,10 +308,21 @@ mod circuits {
     /// evaluated only here — the genome is encrypted, so they can never run in plaintext
     /// on-chain; this closure is therefore the canonical definition of each condition.
     ///
-    /// Score = (matched / count) * 100, plus a generation bonus (+5 per generation above
-    /// 1), capped at 100. Returned ENCRYPTED so it stays hidden until reveal_top3.
+    /// Score = the synergy multiplier below: `(matched / count) * (70 + gen_bonus_raw)`,
+    /// where `gen_bonus_raw = min(2 * (generation - 1), 30)`. Reaches exactly 100 when every
+    /// target trait matches at generation >= 16, and is ZERO at any generation with no
+    /// matches. Returned ENCRYPTED so it stays hidden until reveal_top3.
+    ///
+    /// NAMED `_v2` FOR A DEPLOYMENT REASON, NOT A LOGIC ONE. The synergy circuit is larger
+    /// than the flat-bonus one it replaces (163085 B vs 100806 B), so its computation
+    /// definition had to be re-registered rather than re-uploaded in place. Closing the old
+    /// `score_entry` definition is impossible on shared devnet cluster 456: the on-chain
+    /// close checks that the cluster execpool is EMPTY, and another MXE's expired
+    /// computations have been wedged in it since 2026-08-02 (only their payer may reclaim
+    /// them). Renaming the circuit yields a fresh comp-def offset that needs no close. The
+    /// Anchor instruction names are deliberately unchanged, so operator tooling is unaffected.
     #[instruction]
-    pub fn score_entry(
+    pub fn score_entry_v2(
         genome: Enc<Mxe, Genome>,
         target_traits: [u8; 4],
         target_trait_count: u8,
@@ -353,16 +364,43 @@ mod circuits {
         } else {
             target_trait_count
         };
-        let base: u16 = (matched as u16 * 100) / (safe_count as u16);
+        // --- SYNERGY MULTIPLIER (permanent formula; REPLACES the temporary +25 flat cap) ---
+        //
+        //   trait_ratio   = matched / target_trait_count
+        //   base          = floor(trait_ratio * 70)
+        //   gen_bonus_raw = min(2 * (generation - 1), 30)      // 0 when generation <= 1
+        //   gen_bonus     = floor(trait_ratio * gen_bonus_raw)
+        //   score         = base + gen_bonus                   // 100 exactly when ratio == 1
+        //
+        // The generation term is MULTIPLIED by the trait-match ratio, not added flat. A flat
+        // bonus let a high-generation flower score well with zero matched traits, which was
+        // unfair to new gardeners; now generation only amplifies actual matches. Zero matches
+        // scores ZERO no matter the generation.
+        //
+        // INTEGER ORDER MATTERS: multiply THEN divide in both terms. Computing the ratio first
+        // (`matched / safe_count`) would truncate it to 0 or 1 and destroy the whole formula.
+        // Both numerators are tiny — matched <= 4, so `matched * 70 <= 280` and
+        // `matched * gen_bonus_raw <= 120`, nowhere near u16.
+        //
+        // `generation` is PUBLIC plaintext, so `gen_bonus_raw` is computed in the clear and
+        // costs nothing in MPC. `matched` is secret; the divisor is public.
+        let base: u16 = (matched as u16 * 70) / (safe_count as u16);
 
-        // Generation bonus (generation is public plaintext).
-        let bonus: u16 = if generation > 1 {
-            (generation - 1) * 5
+        // `generation >= 16` short-circuits the cap: 2 * (16 - 1) = 30, so every generation at
+        // or above 16 yields exactly 30. Verified equal to `min(2 * (generation - 1), 30)` for
+        // every u16 input, while avoiding the overflow the literal form has at generation
+        // >= 32769 (and the underflow at generation 0).
+        let gen_bonus_raw: u16 = if generation >= 16 {
+            30
+        } else if generation > 1 {
+            2 * (generation - 1)
         } else {
             0
         };
+        let gen_bonus: u16 = (matched as u16 * gen_bonus_raw) / (safe_count as u16);
 
-        let total = base + bonus;
+        // Cannot exceed 100 by construction (70 + 30 at ratio 1); the clamp is a guard only.
+        let total = base + gen_bonus;
         let score = if total > 100 { 100u8 } else { total as u8 };
 
         Mxe::get().from_arcis(score)

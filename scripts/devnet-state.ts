@@ -57,7 +57,7 @@ describe("secret-garden DEVNET state dump (read-only)", () => {
 
     // --- per-circuit comp-def + raw circuit account(s) ---
     const MAX_ACCOUNT_SIZE = 10485760;
-    for (const circuit of ["breed", "score_entry", "reveal_top3"] as const) {
+    for (const circuit of ["breed", "score_entry_v2", "reveal_top3"] as const) {
       const offset = arcium.getCompDefAccOffset(circuit);
       const compDefPda = PublicKey.findProgramAddressSync(
         [arcium.getArciumAccountBaseSeed("ComputationDefinitionAccount"), programId.toBuffer(), offset],

@@ -345,7 +345,7 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
             round,
             entry,
             flowerRecord: e.flowerRecord as PK,
-            ...queueAccsFor("score_entry", offset),
+            ...queueAccsFor("score_entry_v2", offset),
           }).transaction();
         await sendTxHttp(tx, `queueScoreEntry[${i + 1}]`);
         await arcium.awaitComputationFinalization(

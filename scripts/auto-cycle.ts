@@ -454,7 +454,7 @@ async function main(): Promise<void> {
           round,
           entry,
           flowerRecord: e.flowerRecord as PK,
-          ...queueAccsFor("score_entry", offset),
+          ...queueAccsFor("score_entry_v2", offset),
         }).transaction();
       await sendTxHttp(tx, `queueScoreEntry[${i + 1}]`);
       await arcium.awaitComputationFinalization(

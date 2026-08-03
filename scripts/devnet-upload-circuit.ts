@@ -50,7 +50,7 @@ const MAX_EMBIGGEN_IX_PER_TX = 18;
 const RAW_HEADER = 9; // 8-byte discriminator + 1-byte bump
 
 const CIRCUIT = (process.env.CIRCUIT ?? "breed") as
-  | "breed" | "score_entry" | "reveal_top3" | "private_hint";
+  | "breed" | "score_entry" | "score_entry_v2" | "reveal_top3" | "private_hint";
 const EXECUTE = process.env.UPLOAD_EXECUTE === "yes";
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? "8");
 const INTER_BATCH_DELAY_MS = Number(process.env.INTER_BATCH_DELAY_MS ?? "250");
