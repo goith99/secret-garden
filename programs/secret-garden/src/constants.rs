@@ -328,3 +328,148 @@ pub const HINT_CIPHERTEXT_LEN: usize = 32;
 /// DESTROY (`close_flower` AND `reclaim_dead_offspring`, each `total_flowers -= 1`). Keeping
 /// both destroyers in sync is what makes the subtraction a true live count.
 pub const FLOWER_COLLECTION_CAP: u16 = 20;
+
+// ---------------------------------------------------------------------------
+// reveal_top3_v3 (ADOPTED). The lower-cost reveal circuit the BRACKET runs on; also
+// reachable standalone for differential testing. See `RevealTop3V3Result`.
+// ---------------------------------------------------------------------------
+
+/// PDA seed for the per-round standalone `reveal_top3_v3` result record:
+/// `[TOP3_V3_SEED, round]`. The bracket uses `SHARD_RESULT_SEED` instead.
+pub const TOP3_V3_SEED: &[u8] = b"top3v3";
+
+// ---------------------------------------------------------------------------
+// Bracket reveal (ADDITIVE). Lets a round larger than one MPC call can handle be
+// revealed as several `reveal_top3_v3` calls plus one final call over the winners.
+// Nothing below is read by the live `reveal_top3` path.
+// ---------------------------------------------------------------------------
+
+/// MEASURED Arcium ceiling: a single `queue_computation` is REJECTED with Arcium error
+/// 6202 (`InvalidCallbackAccsLen`) once the argument list references 15 or more DISTINCT
+/// accounts via `ArgBuilder::account()`. Bisected on devnet cluster 456 on 2026-08-05:
+/// N=13 ok, N=14 ok, N=15 rejected, N=16 rejected — for BOTH `reveal_top3` (which
+/// registers 6+1+N callback accounts) and `reveal_top3_v3` (which registers a CONSTANT
+/// 7). Because the two paths share the boundary while their callback lists differ wildly,
+/// the limit is on the INPUT side, not the callback side; the error name is misleading.
+///
+/// This is the reason a round cannot simply be revealed in one call once it exceeds 14
+/// entries, and the reason `MAX_SHARD_SIZE` is 13 rather than 16.
+pub const MAX_REVEAL_ACCOUNT_REFS: u16 = 14;
+
+/// Entries per shard. One under `MAX_REVEAL_ACCOUNT_REFS` so a shard reveal keeps a
+/// one-account safety margin against the measured ceiling, and so the queue transaction
+/// keeps ~89 bytes of headroom under the 1232-byte legacy limit (a later priority-fee
+/// instruction costs ~42 of those).
+pub const MAX_SHARD_SIZE: u8 = 13;
+
+/// Winners taken from each shard. Three is exactly what makes the bracket EXACT: under a
+/// strict total order the global top-3 must lie in the union of the per-shard top-3s
+/// (the global #1 is #1 in its shard, #2 is at worst #2, #3 at worst #3).
+pub const SHARD_WINNERS: u8 = REVEAL_TOP_K as u8;
+
+/// A shard must hold at least this many real entries.
+///
+/// ONE is safe, and the phantom-finalist worry that suggested 3 turns out to be handled
+/// structurally elsewhere: `collect_shard_winners` takes only `min(SHARD_WINNERS,
+/// shard_size)` winners, and real entries always occupy the LOW slots while padding sits
+/// at `shard_size..16` with score 0 — so for every rank `k < shard_size` the winning slot
+/// is guaranteed to name a real entry (a real entry with score 0 still beats a padding
+/// slot on the lower-slot tie-break). Ranks `>= shard_size` are never read.
+///
+/// Keeping this at 1 is what lets the SAME bracket flow serve a 1- or 2-entry round, which
+/// is required now that every round is revealed through the bracket.
+pub const MIN_SHARD_SIZE: u8 = 1;
+
+/// Maximum shards per round. 4 * 13 = 52 >= `ROUND_CAPACITY`.
+pub const MAX_SHARDS: usize = 4;
+
+/// Maximum finalists = `MAX_SHARDS * SHARD_WINNERS` = 12, comfortably under
+/// `MAX_REVEAL_ACCOUNT_REFS` so the FINAL reveal is a single ordinary call.
+pub const MAX_FINALISTS: usize = MAX_SHARDS * SHARD_WINNERS as usize;
+
+// --- two-tier bracket (ADDITIVE; only engaged above SINGLE_TIER_CAPACITY) ---
+
+/// Largest round one tier of shards can reveal: `MAX_SHARDS` shards feeding the final
+/// directly. Rounds at or under this use the ORIGINAL single-tier path, untouched.
+pub const SINGLE_TIER_CAPACITY: u16 = (MAX_SHARDS as u16) * MAX_SHARD_SIZE as u16; // 52
+
+/// Tier-1 shards in a two-tier bracket. Derived, not chosen: their winners
+/// (`MAX_TIER1_SHARDS * SHARD_WINNERS`) must fit the semifinal tier, which is itself capped
+/// at `MAX_SHARDS * MAX_SHARD_SIZE` = 52 slots — so 52 / 3 = 17, giving 17 * 13 = 221.
+///
+/// This reaches the full arithmetic ceiling only because `Tier1State` is ZERO-COPY. With a
+/// plain `Account<T>` the 2,246-byte struct is deserialized onto the 4 KB BPF stack (`Box`
+/// does not help — Anchor deserializes first, then boxes, and its codegen holds two copies),
+/// which aborted on devnet with "Access violation ... at address 0x0" after 15,259 CU.
+/// `AccountLoader` maps the account data instead, so the struct never touches the stack.
+pub const MAX_TIER1_SHARDS: usize = 17;
+
+/// Tier-1 winners promoted into the semifinal tier: 17 * 3 = 51 (<= 52 slots available).
+pub const MAX_TIER1_WINNERS: usize = MAX_TIER1_SHARDS * SHARD_WINNERS as usize;
+
+/// Largest round the two-tier bracket can reveal: 17 shards * 13 = 221.
+pub const TWO_TIER_CAPACITY: u16 = (MAX_TIER1_SHARDS as u16) * MAX_SHARD_SIZE as u16;
+
+/// PDA seed for the per-round Tier-1 tracker: `[TIER1_SEED, round]`. Absent for
+/// single-tier rounds — its ABSENCE is what selects the original code path.
+pub const TIER1_SEED: &[u8] = b"tier1";
+
+/// PDA seed for a semifinal reveal result: `[SEMI_RESULT_SEED, round, semi_index]`.
+/// A SEPARATE namespace from `SHARD_RESULT_SEED` because in two-tier mode tier-1 shard k
+/// and semifinal k would otherwise derive the same address.
+pub const SEMI_RESULT_SEED: &[u8] = b"semires";
+
+/// Round capacity for `submit_entry` purposes. Deliberately SEPARATE from
+/// `MAX_PARTICIPANTS` (which stays 16 — it is the reveal CIRCUIT WIDTH every reveal path
+/// sizes its argument arrays by). Now set to the two-tier ceiling; rounds at or under
+/// `SINGLE_TIER_CAPACITY` still take the original one-tier path.
+pub const ROUND_CAPACITY: u16 = TWO_TIER_CAPACITY;
+
+/// A round must be shardable: every entry has to land in one of `MAX_SHARDS` shards holding
+/// at most `MAX_SHARD_SIZE` each, or it could be accepted and then never revealed — exactly
+/// the failure mode `ROUND_CAPACITY` exists to fix. Raising `ROUND_CAPACITY` past 52 (or
+/// lowering either shard constant) breaks the BUILD rather than a live round.
+const _: () = assert!(
+    ROUND_CAPACITY <= TWO_TIER_CAPACITY,
+    "ROUND_CAPACITY exceeds what two tiers can reveal — such a round could not be revealed"
+);
+
+/// TIER-1 -> TIER-2 HANDOFF. Every tier-1 winner must land in the semifinal tier, which is
+/// the ORIGINAL single-tier structure (<= MAX_SHARDS shards of <= MAX_SHARD_SIZE). If
+/// `MAX_TIER1_SHARDS` were raised without widening the semifinal tier, promotion would have
+/// nowhere to put the extra winners and a legitimately-filled round would become
+/// unrevealable — the exact class of bug the bracket exists to prevent.
+const _: () = assert!(
+    MAX_TIER1_WINNERS <= MAX_SHARDS * MAX_SHARD_SIZE as usize,
+    "MAX_TIER1_SHARDS * SHARD_WINNERS exceeds the semifinal tier's capacity"
+);
+
+/// The single-tier path must remain reachable: rounds <= SINGLE_TIER_CAPACITY take it, and
+/// it must still be a subset of what the round can accept.
+const _: () = assert!(
+    SINGLE_TIER_CAPACITY <= ROUND_CAPACITY,
+    "SINGLE_TIER_CAPACITY above ROUND_CAPACITY leaves the two-tier path unreachable"
+);
+
+/// The FINAL reveal is itself one computation, so the shard winners it ranks are subject to
+/// the same `MAX_REVEAL_ACCOUNT_REFS` ceiling as a shard. At 4 shards x 3 winners = 12 this
+/// has two to spare — but raising `MAX_SHARDS` to 5 to fit a bigger round would silently
+/// push the final reveal to 15 refs and make every such round UNREVEALABLE, which is exactly
+/// the failure this whole design exists to prevent. Break the build instead.
+const _: () = assert!(
+    MAX_FINALISTS <= MAX_REVEAL_ACCOUNT_REFS as usize,
+    "MAX_SHARDS * SHARD_WINNERS exceeds the reveal ceiling — the FINAL reveal would be rejected"
+);
+
+/// PDA seed for the per-round bracket tracker: `[BRACKET_SEED, round]`.
+pub const BRACKET_SEED: &[u8] = b"bracket";
+
+/// PDA seed for a per-shard reveal result: `[SHARD_RESULT_SEED, round, shard_index]`.
+/// The account TYPE is `RevealTop3V3Result` so the existing, already-deployed
+/// `reveal_top3_v3` computation definition and its callback are reused verbatim — the
+/// bracket adds NO new circuit and therefore NO new comp-def rent.
+pub const SHARD_RESULT_SEED: &[u8] = b"shardres";
+
+/// `shard_index` reserved for the FINAL reveal's result record, so it shares the
+/// `SHARD_RESULT_SEED` namespace without colliding with a real shard.
+pub const FINAL_SHARD_INDEX: u8 = 255;

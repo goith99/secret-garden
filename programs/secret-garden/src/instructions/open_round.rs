@@ -104,7 +104,11 @@ pub(crate) fn handler(ctx: Context<OpenRound>) -> Result<()> {
         status: ROUND_STATUS_OPEN,
         start_time: now,
         end_time: now + ROUND_DURATION_SECONDS,
-        max_participants: MAX_PARTICIPANTS,
+        // ROUND_CAPACITY, not MAX_PARTICIPANTS: the latter is the reveal CIRCUIT's fixed
+        // 16-slot width (still used by every shard reveal under the hood), whereas this is
+        // how many entries a round may ACCEPT. They were the same number only while a round
+        // had to be revealed by one circuit call; the bracket removed that coupling.
+        max_participants: ROUND_CAPACITY,
         participant_count: 0,
         authority: ctx.accounts.authority.key(),
         bump: ctx.bumps.round,

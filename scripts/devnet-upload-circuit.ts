@@ -50,7 +50,7 @@ const MAX_EMBIGGEN_IX_PER_TX = 18;
 const RAW_HEADER = 9; // 8-byte discriminator + 1-byte bump
 
 const CIRCUIT = (process.env.CIRCUIT ?? "breed") as
-  | "breed" | "score_entry" | "score_entry_v2" | "reveal_top3" | "private_hint";
+  | "breed" | "score_entry_v2" | "reveal_top3" | "private_hint" | "reveal_top3_v3";
 const EXECUTE = process.env.UPLOAD_EXECUTE === "yes";
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? "8");
 const INTER_BATCH_DELAY_MS = Number(process.env.INTER_BATCH_DELAY_MS ?? "250");
@@ -74,11 +74,21 @@ describe(`secret-garden DEVNET resilient upload: ${CIRCUIT} (execute=${EXECUTE})
     arcium.getArciumProgramId(),
   )[0];
   const configPda = PublicKey.findProgramAddressSync([Buffer.from("config")], programId)[0];
+  // Circuit name -> the program's registration instruction. NOTE the asymmetry: the circuit
+  // was renamed score_entry -> score_entry_v2, but the on-chain instruction kept its original
+  // name `init_score_entry_comp_def` (it registers COMP_DEF_OFFSET_SCORE_ENTRY =
+  // comp_def_offset("score_entry_v2")). So the KEY must be the CIRCUIT name and the VALUE the
+  // legacy instruction name — keying this on `score_entry` meant CIRCUIT=score_entry_v2 never
+  // resolved a registration instruction.
+  // `reveal_top3_v3` is the bracket's circuit: its own comp-def offset and its own
+  // registration instruction, registered ALONGSIDE `reveal_top3` (which stays live for
+  // `queue_reveal_top3`). Here the instruction name does match the circuit name.
   const INIT_METHOD: Record<string, string> = {
     breed: "initBreedingCompDef",
-    score_entry: "initScoreEntryCompDef",
+    score_entry_v2: "initScoreEntryCompDef",
     reveal_top3: "initRevealTop3CompDef",
     private_hint: "initPrivateHintCompDef",
+    reveal_top3_v3: "initRevealTop3V3CompDef",
   };
 
   it(`uploads/repairs ${CIRCUIT} circuit and finalizes`, async function () {

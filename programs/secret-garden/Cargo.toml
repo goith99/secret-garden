@@ -23,6 +23,10 @@ custom-panic = []
 
 [dependencies]
 anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
+# Required by `#[account(zero_copy)]` (Tier1State): the SAFE form derives bytemuck's
+# Pod/Zeroable, which additionally REFUSES TO COMPILE if the struct has any implicit
+# padding — that check is exactly what keeps the zero-copy layout honest.
+bytemuck = { version = "1.17", features = ["derive", "min_const_generics"] }
 # SHA-256 over the offspring ciphertext for the genome commitment (BPF-compatible,
 # already in the lockfile transitively). anchor_lang::solana_program strips the hasher
 # modules, so depend on the hasher crate directly.

@@ -572,4 +572,139 @@ mod circuits {
             top_score[2].reveal(),
         )
     }
+
+    /// ACU-targeted replacement candidate for `reveal_top3`. NOT WIRED TO ANY INSTRUCTION.
+    ///
+    /// WHY v2 FAILED, AND WHAT THIS DOES DIFFERENTLY. The measured Arcium cost function is
+    ///   ACU = 2_097_837*network_depth + 209.6*gates + 256.8*network_size
+    ///         + 0.825*preprocess + 1.0*associated
+    /// so ONE unit of network depth costs about as much as 3.8 secret comparisons. `_v2`
+    /// cut gates 65% but serialised the algorithm, taking depth 76 -> 168, and ended up
+    /// 6.7% MORE expensive. Gates are only 4.6% of `reveal_top3`'s cost; depth is 22.7%.
+    /// So this version keeps the ORIGINAL's fully-parallel shape — one comparison layer,
+    /// then one equality layer, nothing sequential — and attacks the comparison COUNT
+    /// only, which is the sole term that moves without touching depth.
+    ///
+    /// THE REDUNDANCY. `reveal_top3` evaluates the comparator for all 16x16 ordered pairs.
+    /// But for j != i the comparator is exactly the negation of its transpose:
+    ///     beats(j,i) = s[j] > s[i]  || (s[j] == s[i] && j < i)
+    ///   j < i  =>  beats(j,i) = s[j] >= s[i] = NOT (s[i] > s[j])
+    ///   j > i  =>  beats(j,i) = s[j] >  s[i]
+    /// and beats(i,i) is identically false. So a single strict-greater bit per UNORDERED
+    /// pair determines both directions:
+    ///     G[a][b] = (s[b] > s[a])   for a < b        -- C(16,2) = 120 comparisons
+    ///     rank[i] = sum_{j<i} (1 - G[j][i]) + sum_{j>i} G[i][j]
+    /// The negations and the sums are local field arithmetic — no communication, no depth.
+    /// That is 120 secret comparisons instead of 256, and it drops the `==` half of the
+    /// comparator entirely (the original needs an equality test on every j < i pair to
+    /// implement the tie-break; here the tie-break is implied by the negation, exactly as
+    /// in `_v2`, but WITHOUT `_v2`'s sequential dependency chain).
+    ///
+    /// The selection stage is left byte-for-byte identical to `reveal_top3` on purpose, so
+    /// this candidate isolates a single variable: the pairwise layer. Output is identical
+    /// by construction — the identity above is exact, not approximate.
+    ///
+    /// DEPTH IS UNCHANGED BY DESIGN: the 120 comparisons are mutually independent (one
+    /// parallel layer, as before), and the rank sums are linear. Only the width shrinks.
+    #[allow(clippy::too_many_arguments)]
+    #[instruction]
+    pub fn reveal_top3_v3(
+        s0: Enc<Mxe, u8>,
+        s1: Enc<Mxe, u8>,
+        s2: Enc<Mxe, u8>,
+        s3: Enc<Mxe, u8>,
+        s4: Enc<Mxe, u8>,
+        s5: Enc<Mxe, u8>,
+        s6: Enc<Mxe, u8>,
+        s7: Enc<Mxe, u8>,
+        s8: Enc<Mxe, u8>,
+        s9: Enc<Mxe, u8>,
+        s10: Enc<Mxe, u8>,
+        s11: Enc<Mxe, u8>,
+        s12: Enc<Mxe, u8>,
+        s13: Enc<Mxe, u8>,
+        s14: Enc<Mxe, u8>,
+        s15: Enc<Mxe, u8>,
+        participant_count: u8,
+    ) -> (u16, u8, u16, u8, u16, u8) {
+        let raw = [
+            s0.to_arcis(),
+            s1.to_arcis(),
+            s2.to_arcis(),
+            s3.to_arcis(),
+            s4.to_arcis(),
+            s5.to_arcis(),
+            s6.to_arcis(),
+            s7.to_arcis(),
+            s8.to_arcis(),
+            s9.to_arcis(),
+            s10.to_arcis(),
+            s11.to_arcis(),
+            s12.to_arcis(),
+            s13.to_arcis(),
+            s14.to_arcis(),
+            s15.to_arcis(),
+        ];
+
+        // Mask inactive slots to 0. Identical to `reveal_top3`.
+        let mut s = [0u8; 16];
+        for i in 0..16 {
+            let active = (i as u8) < participant_count;
+            s[i] = if active { raw[i] } else { 0u8 };
+        }
+
+        // --- ONE parallel comparison layer: upper triangle only (120 comparisons) ---
+        // `a < b` is a compile-time predicate over unrolled loop indices, so the compiler
+        // emits comparisons for the upper triangle only; the lower triangle and the
+        // diagonal cost nothing.
+        let mut g = [0u16; 256];
+        for a in 0..16 {
+            for b in 0..16 {
+                if a < b {
+                    g[a * 16 + b] = if s[b] > s[a] { 1u16 } else { 0u16 };
+                }
+            }
+        }
+
+        // --- rank by summation: purely local, adds no depth ---
+        // j < i : beats(j,i) = s[j] >= s[i] = 1 - G[j][i]
+        // j > i : beats(j,i) = s[j] >  s[i] =     G[i][j]
+        // j = i : never beats.
+        let mut rank = [0u16; 16];
+        for i in 0..16 {
+            let mut r: u16 = 0;
+            for j in 0..16 {
+                if j < i {
+                    r += 1u16 - g[j * 16 + i];
+                } else if j > i {
+                    r += g[i * 16 + j];
+                }
+            }
+            rank[i] = r;
+        }
+
+        // --- selection: unchanged from `reveal_top3` (second parallel layer) ---
+        let mut top_slot = [0u16; 3];
+        let mut top_score = [0u8; 3];
+        for k in 0..3 {
+            let mut found_slot: u16 = 0;
+            let mut found_score: u8 = 0;
+            for i in 0..16 {
+                let is_k = rank[i] == (k as u16);
+                found_slot = if is_k { i as u16 } else { found_slot };
+                found_score = if is_k { s[i] } else { found_score };
+            }
+            top_slot[k] = found_slot;
+            top_score[k] = found_score;
+        }
+
+        (
+            top_slot[0].reveal(),
+            top_score[0].reveal(),
+            top_slot[1].reveal(),
+            top_score[1].reveal(),
+            top_slot[2].reveal(),
+            top_score[2].reveal(),
+        )
+    }
 }

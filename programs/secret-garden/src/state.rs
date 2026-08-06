@@ -335,6 +335,199 @@ pub struct HintResult {
     pub bump: u8,
 }
 
+/// Result record for a `reveal_top3_v3` computation. Used BOTH by the standalone
+/// differential-test path (one per round, seeded `[TOP3_V3_SEED, round]`) and, crucially, by
+/// the BRACKET: every shard/semifinal/final reveal lands its raw output in one of these,
+/// seeded `[SHARD_RESULT_SEED, round, shard_index]`.
+///
+/// WHY A SEPARATE ACCOUNT rather than writing `CompetitionRound`. The v3 callback deliberately
+/// does NOT touch `top1/top2/top3` or `scoring_revealed`. For the bracket that is essential —
+/// a shard reveal ranks only its own slice, so writing the round's winners from it would be
+/// wrong; `apply_bracket_result` is what finally writes the round, once, from the final reveal.
+#[account]
+#[derive(InitSpace)]
+pub struct RevealTop3V3Result {
+    /// The round this result belongs to (also the PDA seed).
+    pub round: Pubkey,
+    /// `false` until `reveal_top3_v3_callback` lands; reset by every new queue.
+    pub ready: bool,
+    /// Winning SLOT indices, exactly as revealed by the circuit.
+    pub slot1: u16,
+    pub slot2: u16,
+    pub slot3: u16,
+    /// The three revealed scores, in rank order.
+    pub score1: u8,
+    pub score2: u8,
+    pub score3: u8,
+    /// Failure code (0 = none) if the computation aborted.
+    pub error_code: u16,
+    /// PDA bump.
+    pub bump: u8,
+}
+
+/// Per-round bracket tracker. PDA seeds: `[BRACKET_SEED, round]`. ADDITIVE.
+///
+/// WHY THIS EXISTS. A single Arcium computation may reference at most
+/// `MAX_REVEAL_ACCOUNT_REFS` (14) distinct accounts in its argument list, so a round
+/// larger than that cannot be revealed by one `reveal_top3_v3` call. This account tracks a
+/// two-level reveal: several shard reveals, then one final reveal over the shard winners.
+///
+/// THE PARTITION IS PINNED HERE, NOT TRUSTED. `init_bracket` records `shard_sizes` and
+/// `shard_bounds` (the FIRST entry pubkey of each shard) once. Every `queue_shard_reveal`
+/// then re-derives nothing — it VERIFIES that the supplied entry accounts are strictly
+/// ascending by pubkey, start exactly at this shard's bound, and stay below the next
+/// shard's bound. Strict ordering + disjoint declared intervals + `sum(shard_sizes) ==
+/// participant_count` proves the shards are a partition of exactly the round's entries,
+/// so the operator cannot drop, duplicate or smuggle in an entry.
+///
+/// `CompetitionRound::top1/2/3` and `scoring_revealed` stay UNTOUCHED until
+/// `apply_bracket_result` runs at the very end, so anything reading a round today sees
+/// either "not revealed" or the final answer — never a half-finished bracket.
+#[account]
+#[derive(InitSpace)]
+pub struct BracketState {
+    /// The round this bracket belongs to (also the PDA seed).
+    pub round: Pubkey,
+    /// Number of shards in use (1..=`MAX_SHARDS`).
+    pub shard_count: u8,
+    /// Entries in each shard; only the first `shard_count` slots are meaningful.
+    pub shard_sizes: [u8; crate::constants::MAX_SHARDS],
+    /// FIRST entry pubkey of each shard, ascending. Defines the partition boundaries.
+    pub shard_bounds: [Pubkey; crate::constants::MAX_SHARDS],
+    /// Bit `k` set once shard `k`'s winners have been collected into `finalists`.
+    pub shards_collected: u8,
+    /// Shard winners in shard order, then rank order within a shard. Re-sorted into
+    /// pubkey-ascending order by `queue_final_reveal`'s caller and verified there.
+    pub finalists: [Pubkey; crate::constants::MAX_FINALISTS],
+    /// How many slots of `finalists` are filled.
+    pub finalist_count: u8,
+    /// Set once the final reveal has been queued (blocks a second concurrent queue).
+    pub final_queued: bool,
+    /// Set by `apply_bracket_result` once the round's top1/2/3 have been written.
+    pub applied: bool,
+    /// PDA bump.
+    pub bump: u8,
+}
+
+impl BracketState {
+    /// True once every shard's winners have been collected.
+    pub fn all_shards_collected(&self) -> bool {
+        let full = if self.shard_count >= 8 {
+            u8::MAX
+        } else {
+            (1u8 << self.shard_count) - 1
+        };
+        self.shards_collected == full
+    }
+}
+
+/// Tier-1 tracker for a round too large for one tier of shards. PDA: `[TIER1_SEED, round]`.
+/// ADDITIVE — this account simply does not exist for rounds at or under
+/// `SINGLE_TIER_CAPACITY`, and its ABSENCE is what selects the original single-tier path.
+/// `BracketState` is NOT modified: in two-tier mode its existing `shard_*` fields describe
+/// the SEMIFINAL tier, which has exactly the shape it already models.
+///
+/// ZERO-COPY, and it has to be. At 2,246 bytes a plain `Account<Tier1State>` deserializes
+/// onto the 4 KB BPF stack and aborts the program before the handler runs (measured on
+/// devnet: "Access violation ... at address 0x0" after 15,259 CU). `AccountLoader` maps the
+/// account data in place, so size stops mattering for the stack.
+///
+/// POD LAYOUT RULES this struct obeys, both enforced by bytemuck's derive at compile time:
+///   * no `bool` — `promoted` is a `u8` (0/1), because `bool` is not `Pod`;
+///   * NO IMPLICIT PADDING — every field is align-1 (`Pubkey` is `[u8; 32]`, the rest are
+///     `u8`/`[u8; N]`), so the struct is align-1 and no padding byte can exist regardless
+///     of field order. That is also why `shards_collected` became a `[u8; N]` flag array
+///     instead of a `u32` bitmask: a `u32` would force 4-byte alignment and introduce
+///     trailing padding, which the safe `Pod` derive rejects.
+#[account(zero_copy)]
+#[repr(C)]
+pub struct Tier1State {
+    /// The round this belongs to (also the PDA seed).
+    pub round: Pubkey,
+    /// First entry pubkey of each tier-1 shard, ascending — the partition boundaries.
+    pub shard_bounds: [Pubkey; crate::constants::MAX_TIER1_SHARDS],
+    /// Tier-1 winners, kept in ASCENDING PUBKEY ORDER by insertion at collect time.
+    ///
+    /// Sorting as we go is what lets the semifinal partition be derived and verified BY
+    /// INDEX (`winners[start..end]`) rather than trusting operator-declared boundaries.
+    pub winners: [Pubkey; crate::constants::MAX_TIER1_WINNERS],
+    /// Entries per tier-1 shard; only the first `shard_count` slots are meaningful.
+    pub shard_sizes: [u8; crate::constants::MAX_TIER1_SHARDS],
+    /// `1` once shard `k`'s winners have been collected. A flag array rather than a bitmask
+    /// so the struct stays align-1 (see the Pod rules above); it also removes the 8-shard
+    /// ceiling a `u8` mask would have imposed.
+    pub shard_done: [u8; crate::constants::MAX_TIER1_SHARDS],
+    /// Number of tier-1 shards (1..=`MAX_TIER1_SHARDS`).
+    pub shard_count: u8,
+    /// How many slots of `winners` are filled. NOT necessarily `3 * shard_count`: a shard
+    /// smaller than `SHARD_WINNERS` contributes fewer.
+    pub winner_count: u8,
+    /// `1` once `promote_tier1` has written the semifinal partition to `BracketState`.
+    pub promoted: u8,
+    /// PDA bump.
+    pub bump: u8,
+}
+
+/// Layout guard. bytemuck's safe `Pod` derive already rejects implicit padding, but pinning
+/// the exact size catches a field being added/reordered in a way that silently changes the
+/// on-chain account length (which would make every existing Tier1State undeserializable).
+const _: () = assert!(
+    core::mem::size_of::<Tier1State>()
+        == 32
+            + crate::constants::MAX_TIER1_SHARDS * 32
+            + crate::constants::MAX_TIER1_WINNERS * 32
+            + crate::constants::MAX_TIER1_SHARDS
+            + crate::constants::MAX_TIER1_SHARDS
+            + 4,
+    "Tier1State size changed — check for padding or a field change"
+);
+const _: () = assert!(
+    core::mem::align_of::<Tier1State>() == 1,
+    "Tier1State must stay align-1 so no padding can appear"
+);
+
+impl Tier1State {
+    /// True once every tier-1 shard's winners have been collected.
+    pub fn all_shards_collected(&self) -> bool {
+        self.shard_done[..self.shard_count as usize]
+            .iter()
+            .all(|d| *d == 1)
+    }
+
+    /// Insert `key` into `winners` keeping ascending pubkey order. Returns `false` if the
+    /// array is full or the key is already present (a duplicate would corrupt the
+    /// partition-by-index invariant the semifinal tier relies on).
+    ///
+    /// The duplicate scan is COMPLETE despite stopping early: `winners[..n]` is sorted, so
+    /// once `winners[i] > key` every later element is also `> key` and cannot equal it,
+    /// while every earlier element was compared directly.
+    pub fn insert_winner_sorted(&mut self, key: Pubkey) -> bool {
+        let n = self.winner_count as usize;
+        if n >= crate::constants::MAX_TIER1_WINNERS {
+            return false;
+        }
+        let mut pos = n;
+        for i in 0..n {
+            if self.winners[i] == key {
+                return false;
+            }
+            if self.winners[i] > key {
+                pos = i;
+                break;
+            }
+        }
+        // Shift right from the tail so no element is overwritten before it is copied.
+        let mut i = n;
+        while i > pos {
+            self.winners[i] = self.winners[i - 1];
+            i -= 1;
+        }
+        self.winners[pos] = key;
+        self.winner_count += 1;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Stage 5D: per-round breeding limit. These exercise the decision logic directly —
@@ -386,6 +579,68 @@ mod tests {
         assert!(p.register_breed_attempt(2).is_ok());
         assert_eq!(p.breeds_this_round, 1);
         assert_eq!(p.last_breed_round, 2);
+    }
+
+    // --- two-tier: sorted winner insertion (the invariant the semifinal tier depends on) ---
+    fn blank_tier1() -> Tier1State {
+        Tier1State {
+            round: Pubkey::default(),
+            shard_count: 0,
+            shard_sizes: [0; crate::constants::MAX_TIER1_SHARDS],
+            shard_bounds: [Pubkey::default(); crate::constants::MAX_TIER1_SHARDS],
+            shard_done: [0; crate::constants::MAX_TIER1_SHARDS],
+            winners: [Pubkey::default(); crate::constants::MAX_TIER1_WINNERS],
+            winner_count: 0,
+            promoted: 0,
+            bump: 0,
+        }
+    }
+    fn pk(b: u8) -> Pubkey {
+        let mut a = [0u8; 32];
+        a[31] = b;
+        Pubkey::new_from_array(a)
+    }
+
+    #[test]
+    fn winners_stay_sorted_regardless_of_insertion_order() {
+        let mut t = blank_tier1();
+        for b in [7u8, 3, 9, 1, 5] {
+            assert!(t.insert_winner_sorted(pk(b)));
+        }
+        assert_eq!(t.winner_count, 5);
+        let got: Vec<u8> = (0..5).map(|i| t.winners[i].to_bytes()[31]).collect();
+        assert_eq!(got, vec![1, 3, 5, 7, 9], "winners must be ascending by pubkey");
+    }
+
+    #[test]
+    fn duplicate_winner_is_refused() {
+        // A duplicate would break the partition-by-index invariant the semifinals rely on.
+        let mut t = blank_tier1();
+        assert!(t.insert_winner_sorted(pk(4)));
+        assert!(!t.insert_winner_sorted(pk(4)));
+        assert_eq!(t.winner_count, 1);
+    }
+
+    #[test]
+    fn winners_array_refuses_overflow_at_capacity() {
+        let mut t = blank_tier1();
+        for i in 0..crate::constants::MAX_TIER1_WINNERS {
+            assert!(t.insert_winner_sorted(pk(i as u8)));
+        }
+        assert_eq!(t.winner_count as usize, crate::constants::MAX_TIER1_WINNERS);
+        assert!(!t.insert_winner_sorted(pk(200)), "must refuse past capacity");
+    }
+
+    #[test]
+    fn all_shards_collected_tracks_the_full_shard_mask() {
+        let mut t = blank_tier1();
+        let n = crate::constants::MAX_TIER1_SHARDS;
+        t.shard_count = n as u8;
+        for k in 0..n {
+            assert!(!t.all_shards_collected(), "incomplete at {k}");
+            t.shard_done[k] = 1;
+        }
+        assert!(t.all_shards_collected());
     }
 
     #[test]

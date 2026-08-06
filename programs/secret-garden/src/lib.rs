@@ -20,6 +20,10 @@ const COMP_DEF_OFFSET_BREED: u32 = comp_def_offset("breed");
 /// Stage 4A scoring circuits.
 const COMP_DEF_OFFSET_SCORE_ENTRY: u32 = comp_def_offset("score_entry_v2");
 const COMP_DEF_OFFSET_REVEAL_TOP3: u32 = comp_def_offset("reveal_top3");
+/// ADDITIVE, VERIFICATION-ONLY. Own offset for the `reveal_top3_v3` candidate (the
+/// upper-triangle rewrite: 603,016,496 ACU vs the original's 702,629,424 at identical
+/// network depth). Registered alongside — never replacing — `reveal_top3`.
+const COMP_DEF_OFFSET_REVEAL_TOP3_V3: u32 = comp_def_offset("reveal_top3_v3");
 /// Private Hint circuit (sealed per-player trait-satisfaction check).
 const COMP_DEF_OFFSET_PRIVATE_HINT: u32 = comp_def_offset("private_hint");
 
@@ -594,6 +598,13 @@ pub mod secret_garden {
         Ok(())
     }
 
+    /// Registers the `reveal_top3_v3` computation definition. Authority-only, once.
+    /// ADDITIVE, VERIFICATION-ONLY — see `COMP_DEF_OFFSET_REVEAL_TOP3_V3`.
+    pub fn init_reveal_top3_v3_comp_def(ctx: Context<InitRevealTop3V3CompDef>) -> Result<()> {
+        init_computation_def(ctx.accounts, None)?;
+        Ok(())
+    }
+
     /// Queues scoring of one entry's flower against the round's public target traits.
     /// Valid once the round is Closed and the entry has NOT already been scored (GAP 1
     /// guard; enforced by the `!entry.scored` constraint on `QueueScoreEntry`). Round
@@ -767,6 +778,1067 @@ pub mod secret_garden {
         Ok(())
     }
 
+    /// ADDITIVE, VERIFICATION-ONLY twin of `queue_reveal_top3` targeting the
+    /// `reveal_top3_v3` circuit. Argument construction is a DELIBERATE copy of
+    /// `queue_reveal_top3`'s — same guards, same in-place `ArgBuilder::account()` reads at
+    /// `ENTRY_SCORE_OFFSET`, same first-entry padding — so v3 receives the byte-identical
+    /// argument vector the live circuit receives. Only the comp-def offset, the callback
+    /// and the result account differ. The live reveal path is untouched.
+    pub fn queue_reveal_top3_v3(
+        ctx: Context<QueueRevealTop3V3>,
+        computation_offset: u64,
+    ) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        require!(
+            ctx.accounts.round.status == ROUND_STATUS_CLOSED,
+            SecretGardenError::RoundNotClosed
+        );
+        require!(
+            ctx.accounts.round.scored_count == ctx.accounts.round.participant_count,
+            SecretGardenError::ScoringIncomplete
+        );
+        let participant_count = ctx.accounts.round.participant_count as usize;
+        require!(
+            (1..=MAX_PARTICIPANTS as usize).contains(&participant_count),
+            SecretGardenError::ScoringIncomplete
+        );
+        require!(
+            ctx.remaining_accounts.len() == participant_count,
+            SecretGardenError::WrongEntryCount
+        );
+
+        let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
+        let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
+        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+            let entry = Account::<CompetitionEntry>::try_from(info)?;
+            require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
+            require!(entry.scored, SecretGardenError::ScoringIncomplete);
+            entry_keys[i] = info.key();
+            entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
+        }
+        for i in participant_count..MAX_PARTICIPANTS as usize {
+            entry_keys[i] = entry_keys[0];
+            entry_nonces[i] = entry_nonces[0];
+        }
+
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let result = &mut ctx.accounts.result;
+        result.round = round_key;
+        result.ready = false;
+        result.error_code = 0;
+        result.bump = ctx.bumps.result;
+
+        let mut builder = ArgBuilder::new();
+        for i in 0..MAX_PARTICIPANTS as usize {
+            builder = builder.plaintext_u128(entry_nonces[i]).account(
+                entry_keys[i],
+                ENTRY_SCORE_OFFSET,
+                ENTRY_SCORE_LEN as u32,
+            );
+        }
+        let args = builder.plaintext_u8(participant_count as u8).build();
+
+        let callback_accs = vec![CallbackAccount {
+            pubkey: ctx.accounts.result.key(),
+            is_writable: true,
+        }];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            vec![RevealTop3V3Callback::callback_ix(
+                computation_offset,
+                &ctx.accounts.mxe_account,
+                &callback_accs,
+            )?],
+            1,
+            0,
+            CALLBACK_CU_LIMIT,
+        )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Bracket reveal (ADDITIVE). Reveals a round too large for a single MPC call as
+    // `shard_count` shard reveals plus one final reveal over the shard winners. Every
+    // call reuses the already-deployed `reveal_top3_v3` circuit — no new comp def, no
+    // new circuit rent. The live `reveal_top3` path is not referenced anywhere below.
+    // -----------------------------------------------------------------------
+
+    /// Pins the shard partition for a Closed, fully-scored round. Operator or authority.
+    ///
+    /// `shard_bounds[k]` is the FIRST entry pubkey of shard `k` when the round's entries
+    /// are sorted ascending by their PDA address — a canonical order anyone can recompute
+    /// offline (fetch the round's entries, sort by pubkey, chunk by `shard_sizes`).
+    /// Recording it once here is what lets each later shard call be verified independently
+    /// without ever re-reading all `participant_count` entries in one transaction.
+    pub fn init_bracket(
+        ctx: Context<InitBracket>,
+        shard_sizes: [u8; MAX_SHARDS],
+        shard_bounds: [Pubkey; MAX_SHARDS],
+        shard_count: u8,
+    ) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round = &ctx.accounts.round;
+        // CLOSED is the normal case. FINALIZED is accepted too, deliberately: a round that
+        // was finalized WITHOUT a reveal is stuck — the legacy path can no longer touch it
+        // and its winners would be lost forever. `scoring_revealed` below is the real
+        // guard, so admitting FINALIZED can only ever rescue a round, never re-reveal one.
+        require!(
+            round.status == ROUND_STATUS_CLOSED || round.status == ROUND_STATUS_FINALIZED,
+            SecretGardenError::RoundNotClosed
+        );
+        require!(
+            !round.scoring_revealed,
+            SecretGardenError::ScoringAlreadyRevealed
+        );
+        require!(
+            round.scored_count == round.participant_count,
+            SecretGardenError::ScoringIncomplete
+        );
+        require!(
+            (1..=MAX_SHARDS as u8).contains(&shard_count),
+            SecretGardenError::InvalidShardLayout
+        );
+
+        // Sizes must partition participant_count, and every shard must be big enough that
+        // its rank-2 winner names a REAL entry rather than a zero-masked padding slot.
+        let mut total: u32 = 0;
+        for k in 0..shard_count as usize {
+            let s = shard_sizes[k];
+            require!(
+                (MIN_SHARD_SIZE..=MAX_SHARD_SIZE).contains(&s),
+                SecretGardenError::InvalidShardLayout
+            );
+            total += s as u32;
+        }
+        require!(
+            total == round.participant_count as u32,
+            SecretGardenError::InvalidShardLayout
+        );
+        // Unused slots must be zeroed so the layout is unambiguous.
+        for k in shard_count as usize..MAX_SHARDS {
+            require!(shard_sizes[k] == 0, SecretGardenError::InvalidShardLayout);
+        }
+        // Boundaries must be strictly ascending, which is what makes the shard ranges
+        // provably disjoint when each shard is later checked against its own bounds.
+        for k in 1..shard_count as usize {
+            require!(
+                shard_bounds[k] > shard_bounds[k - 1],
+                SecretGardenError::InvalidShardLayout
+            );
+        }
+
+        let b = &mut ctx.accounts.bracket;
+        b.round = round.key();
+        b.shard_count = shard_count;
+        b.shard_sizes = shard_sizes;
+        b.shard_bounds = shard_bounds;
+        b.shards_collected = 0;
+        b.finalists = [Pubkey::default(); MAX_FINALISTS];
+        b.finalist_count = 0;
+        b.final_queued = false;
+        b.applied = false;
+        b.bump = ctx.bumps.bracket;
+        Ok(())
+    }
+
+    /// Reveals ONE shard: the shard's entries arrive as `remaining_accounts` in strictly
+    /// ascending pubkey order and are fed to `reveal_top3_v3` exactly the way
+    /// `queue_reveal_top3_v3` feeds a whole round — same in-place `ArgBuilder::account()`
+    /// reads at `ENTRY_SCORE_OFFSET`, same first-entry padding of the unused slots.
+    ///
+    /// The result lands in a PER-SHARD `RevealTop3V3Result` PDA, so the existing
+    /// `reveal_top3_v3_callback` is reused verbatim and the callback carries a CONSTANT 7
+    /// accounts regardless of round size.
+    pub fn queue_shard_reveal(
+        ctx: Context<QueueShardReveal>,
+        computation_offset: u64,
+        shard_index: u8,
+    ) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        let bracket = &ctx.accounts.bracket;
+        require!(
+            bracket.round == round_key,
+            SecretGardenError::BracketRoundMismatch
+        );
+        require!(
+            !ctx.accounts.round.scoring_revealed,
+            SecretGardenError::ScoringAlreadyRevealed
+        );
+
+        // NOTE: the shard-index range check lives in the non-final branch below, NOT here.
+        // `FINAL_SHARD_INDEX` (255) is deliberately outside `0..shard_count`, so an
+        // unconditional check here would reject the final reveal before it is dispatched.
+        // `FINAL_SHARD_INDEX` selects the FINAL reveal over the collected shard winners;
+        // any other index is an ordinary shard. Both feed the same circuit through the
+        // same argument construction, so they share one instruction and one context —
+        // only the membership rule for the supplied accounts differs.
+        let is_final = shard_index == FINAL_SHARD_INDEX;
+        let k = shard_index as usize;
+        let n = if is_final {
+            require!(
+                bracket.all_shards_collected(),
+                SecretGardenError::BracketNotReady
+            );
+            require!(!bracket.applied, SecretGardenError::BracketAlreadyFinal);
+            bracket.finalist_count as usize
+        } else {
+            require!(
+                shard_index < bracket.shard_count,
+                SecretGardenError::InvalidShardIndex
+            );
+            bracket.shard_sizes[k] as usize
+        };
+        require!(
+            n <= MAX_REVEAL_ACCOUNT_REFS as usize,
+            SecretGardenError::InvalidShardLayout
+        );
+        require!(
+            ctx.remaining_accounts.len() == n,
+            SecretGardenError::WrongEntryCount
+        );
+
+        // Validate the run: every account is a scored entry of THIS round and the run is
+        // strictly ascending by pubkey (which alone forbids duplicates).
+        //
+        // For a SHARD it must additionally start exactly at this shard's recorded boundary
+        // and stay below the next shard's — together with the sizes summing to
+        // participant_count (checked in `init_bracket`) that proves the shards partition
+        // the round's entries: no drops, no duplicates, nothing smuggled in.
+        //
+        // For the FINAL every account must be one of the recorded shard winners, which
+        // with the exact count and the no-duplicates ordering proves the supplied set IS
+        // the recorded finalist set, merely reordered into pubkey order.
+        let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
+        let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
+        let mut prev = Pubkey::default();
+        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+            let entry = Account::<CompetitionEntry>::try_from(info)?;
+            require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
+            require!(entry.scored, SecretGardenError::ScoringIncomplete);
+            let key = info.key();
+            if i > 0 {
+                require!(key > prev, SecretGardenError::ShardEntriesOutOfRange);
+            }
+            if is_final {
+                require!(
+                    bracket.finalists[..n].contains(&key),
+                    SecretGardenError::FinalistMismatch
+                );
+            } else {
+                if i == 0 {
+                    require!(
+                        key == bracket.shard_bounds[k],
+                        SecretGardenError::ShardEntriesOutOfRange
+                    );
+                }
+                if k + 1 < bracket.shard_count as usize {
+                    require!(
+                        key < bracket.shard_bounds[k + 1],
+                        SecretGardenError::ShardEntriesOutOfRange
+                    );
+                }
+            }
+            prev = key;
+            entry_keys[i] = key;
+            entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
+        }
+        // Pad the circuit's unused slots with the first entry (masked to 0 by the circuit).
+        for i in n..MAX_PARTICIPANTS as usize {
+            entry_keys[i] = entry_keys[0];
+            entry_nonces[i] = entry_nonces[0];
+        }
+        let shard_size = n;
+
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+
+        let result = &mut ctx.accounts.result;
+        result.round = round_key;
+        result.ready = false;
+        result.error_code = 0;
+        result.bump = ctx.bumps.result;
+
+        let mut builder = ArgBuilder::new();
+        for i in 0..MAX_PARTICIPANTS as usize {
+            builder = builder.plaintext_u128(entry_nonces[i]).account(
+                entry_keys[i],
+                ENTRY_SCORE_OFFSET,
+                ENTRY_SCORE_LEN as u32,
+            );
+        }
+        // The circuit masks slots >= this to 0, so it ranks only the shard's real entries.
+        let args = builder.plaintext_u8(shard_size as u8).build();
+
+        let callback_accs = vec![CallbackAccount {
+            pubkey: ctx.accounts.result.key(),
+            is_writable: true,
+        }];
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            vec![RevealTop3V3Callback::callback_ix(
+                computation_offset,
+                &ctx.accounts.mxe_account,
+                &callback_accs,
+            )?],
+            1,
+            0,
+            CALLBACK_CU_LIMIT,
+        )?;
+
+        if is_final {
+            // Persist the verified ascending order so `apply_bracket_result` can resolve
+            // the revealed slots to pubkeys from state alone — no entry accounts, and so
+            // no dependence on round size at resolution time.
+            let bracket = &mut ctx.accounts.bracket;
+            for i in 0..n {
+                bracket.finalists[i] = entry_keys[i];
+            }
+            bracket.final_queued = true;
+        }
+        Ok(())
+    }
+
+    /// Resolves one shard's revealed SLOT indices into entry pubkeys and records them as
+    /// finalists. The shard's entries must be supplied in the SAME ascending order used by
+    /// `queue_shard_reveal`, which the same bounds checks re-verify here — so a caller
+    /// cannot re-map slots onto different entries after the fact.
+    ///
+    /// No MPC and no `queue_computation`, so this is not subject to the 14-account
+    /// argument ceiling; it is an ordinary instruction with `shard_size` extra accounts.
+    pub fn collect_shard_winners(ctx: Context<CollectShardWinners>, shard_index: u8) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        require!(
+            ctx.accounts.bracket.round == round_key,
+            SecretGardenError::BracketRoundMismatch
+        );
+        require!(
+            shard_index < ctx.accounts.bracket.shard_count,
+            SecretGardenError::InvalidShardIndex
+        );
+        require!(
+            ctx.accounts.result.ready,
+            SecretGardenError::ShardResultNotReady
+        );
+        require!(
+            ctx.accounts.result.error_code == 0,
+            SecretGardenError::AbortedComputation
+        );
+
+        let k = shard_index as usize;
+        require!(
+            ctx.accounts.bracket.shards_collected & (1u8 << k) == 0,
+            SecretGardenError::ShardAlreadyCollected
+        );
+
+        let shard_size = ctx.accounts.bracket.shard_sizes[k] as usize;
+        require!(
+            ctx.remaining_accounts.len() == shard_size,
+            SecretGardenError::WrongEntryCount
+        );
+
+        // Re-verify the exact ordering the reveal used, so slot i still means entry i.
+        let mut entry_keys = [Pubkey::default(); MAX_SHARD_SIZE as usize];
+        let mut prev = Pubkey::default();
+        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+            let entry = Account::<CompetitionEntry>::try_from(info)?;
+            require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
+            let key = info.key();
+            if i == 0 {
+                require!(
+                    key == ctx.accounts.bracket.shard_bounds[k],
+                    SecretGardenError::ShardEntriesOutOfRange
+                );
+            } else {
+                require!(key > prev, SecretGardenError::ShardEntriesOutOfRange);
+            }
+            if k + 1 < ctx.accounts.bracket.shard_count as usize {
+                require!(
+                    key < ctx.accounts.bracket.shard_bounds[k + 1],
+                    SecretGardenError::ShardEntriesOutOfRange
+                );
+            }
+            prev = key;
+            entry_keys[i] = key;
+        }
+
+        let slots = [
+            ctx.accounts.result.slot1,
+            ctx.accounts.result.slot2,
+            ctx.accounts.result.slot3,
+        ];
+        let take = core::cmp::min(SHARD_WINNERS as usize, shard_size);
+        let bracket = &mut ctx.accounts.bracket;
+        for slot in slots.iter().take(take) {
+            let s = *slot as usize;
+            // A shard always holds >= MIN_SHARD_SIZE real entries, so every rank names a
+            // real slot; this bound check makes that structural rather than assumed.
+            require!(s < shard_size, SecretGardenError::WrongEntryCount);
+            let idx = bracket.finalist_count as usize;
+            require!(idx < MAX_FINALISTS, SecretGardenError::InvalidShardLayout);
+            bracket.finalists[idx] = entry_keys[s];
+            bracket.finalist_count += 1;
+        }
+        bracket.shards_collected |= 1u8 << k;
+        Ok(())
+    }
+
+    /// Writes the round's `top1/2/3` + `scoring_revealed` from the final reveal's result.
+    ///
+    /// This is the ONLY place the bracket touches `CompetitionRound`'s result fields, so
+    /// every existing reader sees either an unrevealed round or the finished answer — never
+    /// a partially-built bracket. Needs NO entry accounts: `queue_final_reveal` already
+    /// stored the slot->pubkey mapping in `BracketState::finalists`.
+    pub fn apply_bracket_result(ctx: Context<ApplyBracketResult>, result_index: u8) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        require!(
+            ctx.accounts.bracket.round == round_key,
+            SecretGardenError::BracketRoundMismatch
+        );
+        require!(
+            !ctx.accounts.bracket.applied,
+            SecretGardenError::BracketAlreadyFinal
+        );
+        require!(
+            ctx.accounts.bracket.all_shards_collected(),
+            SecretGardenError::BracketNotReady
+        );
+        require!(
+            ctx.accounts.result.ready,
+            SecretGardenError::ShardResultNotReady
+        );
+        require!(
+            ctx.accounts.result.error_code == 0,
+            SecretGardenError::AbortedComputation
+        );
+        // Idempotent against a re-run, and refuses to overwrite a legacy reveal.
+        require!(
+            !ctx.accounts.round.scoring_revealed,
+            SecretGardenError::ScoringAlreadyRevealed
+        );
+
+        let n = ctx.accounts.bracket.finalist_count as usize;
+        let single = ctx.accounts.bracket.shard_count == 1;
+        let mut top = [Pubkey::default(); REVEAL_TOP_K];
+
+        if single {
+            // SINGLE-SHARD FAST PATH. The whole round fitted in one shard, so that shard's
+            // ranking IS the round's ranking and a second MPC call over the very same
+            // entries would be pure waste. `collect_shard_winners` already stored the
+            // winners in RANK order, so they are the answer verbatim.
+            //
+            // `result_index` must name shard 0 here: there is no final-reveal record.
+            require!(result_index == 0, SecretGardenError::InvalidShardIndex);
+            for (k, slot) in top.iter_mut().enumerate() {
+                if k >= n {
+                    break;
+                }
+                *slot = ctx.accounts.bracket.finalists[k];
+            }
+        } else {
+            // MULTI-SHARD. The final reveal ranked the shard winners; its slots index into
+            // the pubkey-ascending order `queue_shard_reveal` persisted into `finalists`.
+            require!(
+                result_index == FINAL_SHARD_INDEX,
+                SecretGardenError::InvalidShardIndex
+            );
+            require!(
+                ctx.accounts.bracket.final_queued,
+                SecretGardenError::BracketNotReady
+            );
+            let r = &ctx.accounts.result;
+            let slots = [r.slot1, r.slot2, r.slot3];
+            for (k, slot) in slots.iter().enumerate() {
+                if k >= n {
+                    break;
+                }
+                let s = *slot as usize;
+                require!(s < n, SecretGardenError::WrongEntryCount);
+                top[k] = ctx.accounts.bracket.finalists[s];
+            }
+        }
+
+        // The revealed SCORES are the same in both modes — they come from whichever record
+        // produced the final ranking (shard 0 for a single-shard round, the final-reveal
+        // record otherwise), which is exactly the `result` account passed in.
+        let res = &ctx.accounts.result;
+        let ev = Top3RevealedEvent {
+            entry_index_1: res.slot1,
+            score_1: res.score1,
+            entry_index_2: res.slot2,
+            score_2: res.score2,
+            entry_index_3: res.slot3,
+            score_3: res.score3,
+        };
+
+        let round = &mut ctx.accounts.round;
+        round.top1 = top[0];
+        round.top2 = top[1];
+        round.top3 = top[2];
+        round.scoring_revealed = true;
+        ctx.accounts.bracket.applied = true;
+
+        emit!(ev);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // TWO-TIER bracket (ADDITIVE). Engaged only when participant_count exceeds
+    // SINGLE_TIER_CAPACITY. Tier-1 shards feed a semifinal tier, and the semifinal tier IS
+    // the already-proven single-tier structure — so `queue_shard_reveal(255)` (the final)
+    // and `apply_bracket_result` run afterwards completely unchanged.
+    //
+    // These are SEPARATE instructions rather than optional accounts bolted onto
+    // `queue_shard_reveal`/`collect_shard_winners`, for two reasons: `BracketState` does
+    // not exist yet while tier 1 runs (it is created by `promote_tier1`), and keeping the
+    // proven single-tier instructions byte-identical is worth more than sharing code.
+    // -----------------------------------------------------------------------
+
+    /// Pins the tier-1 partition for a round too large for one tier. Operator or authority.
+    pub fn init_tier1_bracket(
+        ctx: Context<InitTier1Bracket>,
+        shard_sizes: [u8; MAX_TIER1_SHARDS],
+        shard_bounds: [Pubkey; MAX_TIER1_SHARDS],
+        shard_count: u8,
+    ) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round = &ctx.accounts.round;
+        require!(
+            round.status == ROUND_STATUS_CLOSED || round.status == ROUND_STATUS_FINALIZED,
+            SecretGardenError::RoundNotClosed
+        );
+        require!(
+            !round.scoring_revealed,
+            SecretGardenError::ScoringAlreadyRevealed
+        );
+        require!(
+            round.scored_count == round.participant_count,
+            SecretGardenError::ScoringIncomplete
+        );
+        // Two tiers are for rounds one tier cannot reveal. Smaller rounds must keep taking
+        // the original path, so this refuses them outright rather than silently duplicating.
+        require!(
+            round.participant_count > SINGLE_TIER_CAPACITY,
+            SecretGardenError::WrongBracketTier
+        );
+        require!(
+            (1..=MAX_TIER1_SHARDS as u8).contains(&shard_count),
+            SecretGardenError::InvalidShardLayout
+        );
+
+        let mut total: u32 = 0;
+        for k in 0..shard_count as usize {
+            let s = shard_sizes[k];
+            require!(
+                (MIN_SHARD_SIZE..=MAX_SHARD_SIZE).contains(&s),
+                SecretGardenError::InvalidShardLayout
+            );
+            total += s as u32;
+        }
+        require!(
+            total == round.participant_count as u32,
+            SecretGardenError::InvalidShardLayout
+        );
+        for k in shard_count as usize..MAX_TIER1_SHARDS {
+            require!(shard_sizes[k] == 0, SecretGardenError::InvalidShardLayout);
+        }
+        for k in 1..shard_count as usize {
+            require!(
+                shard_bounds[k] > shard_bounds[k - 1],
+                SecretGardenError::InvalidShardLayout
+            );
+        }
+        // The winners this will produce must fit the semifinal tier, or the round would be
+        // accepted here and become unrevealable at promotion.
+        let max_winners: u32 = (0..shard_count as usize)
+            .map(|k| core::cmp::min(SHARD_WINNERS, shard_sizes[k]) as u32)
+            .sum();
+        require!(
+            max_winners as usize <= MAX_TIER1_WINNERS,
+            SecretGardenError::InvalidShardLayout
+        );
+
+        // `load_init()` (not `load_mut()`): the account was just created by `init`, so its
+        // discriminator is still zero and only `load_init` will write it.
+        let mut t = ctx.accounts.tier1.load_init()?;
+        t.round = round.key();
+        t.shard_count = shard_count;
+        t.winner_count = 0;
+        t.promoted = 0;
+        t.bump = ctx.bumps.tier1;
+        // ELEMENT-WISE, never whole-array assignment. `t.winners = [Pubkey::default(); 51]`
+        // materialises a 1632-byte temporary on BPF's 4KB stack and aborts the program with
+        // an access violation before it can write anything (measured: 15,259 CU then
+        // "Access violation ... at address 0x0"). The same applies to the 544-byte
+        // `shard_bounds`. Writing through the Box'd account touches the heap only.
+        for i in 0..MAX_TIER1_SHARDS {
+            t.shard_sizes[i] = shard_sizes[i];
+            t.shard_bounds[i] = shard_bounds[i];
+            t.shard_done[i] = 0;
+        }
+        for i in 0..MAX_TIER1_WINNERS {
+            t.winners[i] = Pubkey::default();
+        }
+        Ok(())
+    }
+
+    /// Closes a round's `Tier1State`, returning its rent, so the tier-1 partition can be
+    /// re-pinned from scratch. Operator or authority, and only while the round is still
+    /// unrevealed — a finished round's bracket is never disturbed.
+    ///
+    /// Needed because `init_tier1_bracket` uses `init` (not `init_if_needed`): pinning a
+    /// partition is a one-shot act, so re-running it must be an explicit reset rather than a
+    /// silent overwrite. It is also the only way to recover a `Tier1State` written under an
+    /// older account layout, whose length no longer matches `size_of::<Tier1State>()`.
+    pub fn close_tier1_bracket(ctx: Context<CloseTier1Bracket>) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        require!(
+            !ctx.accounts.round.scoring_revealed,
+            SecretGardenError::ScoringAlreadyRevealed
+        );
+        Ok(())
+    }
+
+    /// Reveals ONE tier-1 shard. Identical argument construction to `queue_shard_reveal` —
+    /// same in-place `ArgBuilder::account()` reads, same first-entry padding, same
+    /// `reveal_top3_v3` circuit and callback. Only the partition it validates against and
+    /// the account it belongs to differ.
+    pub fn queue_tier1_shard_reveal(
+        ctx: Context<QueueTier1ShardReveal>,
+        computation_offset: u64,
+        shard_index: u8,
+    ) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        let t = ctx.accounts.tier1.load()?;
+        require!(t.round == round_key, SecretGardenError::BracketRoundMismatch);
+        require!(t.promoted == 0, SecretGardenError::Tier1AlreadyPromoted);
+        require!(
+            !ctx.accounts.round.scoring_revealed,
+            SecretGardenError::ScoringAlreadyRevealed
+        );
+        require!(
+            shard_index < t.shard_count,
+            SecretGardenError::InvalidShardIndex
+        );
+
+        let k = shard_index as usize;
+        let size = t.shard_sizes[k] as usize;
+        require!(
+            ctx.remaining_accounts.len() == size,
+            SecretGardenError::WrongEntryCount
+        );
+
+        let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
+        let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
+        let mut prev = Pubkey::default();
+        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+            let entry = Account::<CompetitionEntry>::try_from(info)?;
+            require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
+            require!(entry.scored, SecretGardenError::ScoringIncomplete);
+            let key = info.key();
+            if i == 0 {
+                require!(
+                    key == t.shard_bounds[k],
+                    SecretGardenError::ShardEntriesOutOfRange
+                );
+            } else {
+                require!(key > prev, SecretGardenError::ShardEntriesOutOfRange);
+            }
+            if k + 1 < t.shard_count as usize {
+                require!(
+                    key < t.shard_bounds[k + 1],
+                    SecretGardenError::ShardEntriesOutOfRange
+                );
+            }
+            prev = key;
+            entry_keys[i] = key;
+            entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
+        }
+        for i in size..MAX_PARTICIPANTS as usize {
+            entry_keys[i] = entry_keys[0];
+            entry_nonces[i] = entry_nonces[0];
+        }
+        // Release the zero-copy borrow before touching `ctx.accounts` mutably below.
+        drop(t);
+
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+        let result = &mut ctx.accounts.result;
+        result.round = round_key;
+        result.ready = false;
+        result.error_code = 0;
+        result.bump = ctx.bumps.result;
+
+        let mut builder = ArgBuilder::new();
+        for i in 0..MAX_PARTICIPANTS as usize {
+            builder = builder.plaintext_u128(entry_nonces[i]).account(
+                entry_keys[i],
+                ENTRY_SCORE_OFFSET,
+                ENTRY_SCORE_LEN as u32,
+            );
+        }
+        let args = builder.plaintext_u8(size as u8).build();
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            vec![RevealTop3V3Callback::callback_ix(
+                computation_offset,
+                &ctx.accounts.mxe_account,
+                &[CallbackAccount {
+                    pubkey: ctx.accounts.result.key(),
+                    is_writable: true,
+                }],
+            )?],
+            1,
+            0,
+            CALLBACK_CU_LIMIT,
+        )?;
+        Ok(())
+    }
+
+    /// Resolves one tier-1 shard's revealed slots into entry pubkeys and inserts them into
+    /// `Tier1State::winners` IN SORTED ORDER. Sorting here is what lets the semifinal tier
+    /// be partitioned and verified purely by index later.
+    pub fn collect_tier1_winners(ctx: Context<CollectTier1Winners>, shard_index: u8) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        require!(
+            ctx.accounts.result.ready,
+            SecretGardenError::ShardResultNotReady
+        );
+        require!(
+            ctx.accounts.result.error_code == 0,
+            SecretGardenError::AbortedComputation
+        );
+        let k = shard_index as usize;
+        let mut t = ctx.accounts.tier1.load_mut()?;
+        require!(t.round == round_key, SecretGardenError::BracketRoundMismatch);
+        require!(t.promoted == 0, SecretGardenError::Tier1AlreadyPromoted);
+        require!(
+            shard_index < t.shard_count,
+            SecretGardenError::InvalidShardIndex
+        );
+        require!(
+            t.shard_done[k] == 0,
+            SecretGardenError::ShardAlreadyCollected
+        );
+
+        let size = t.shard_sizes[k] as usize;
+        require!(
+            ctx.remaining_accounts.len() == size,
+            SecretGardenError::WrongEntryCount
+        );
+
+        // Re-verify the exact ordering the reveal used, so slot i still means entry i.
+        let mut entry_keys = [Pubkey::default(); MAX_SHARD_SIZE as usize];
+        let mut prev = Pubkey::default();
+        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+            let entry = Account::<CompetitionEntry>::try_from(info)?;
+            require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
+            let key = info.key();
+            if i == 0 {
+                require!(
+                    key == t.shard_bounds[k],
+                    SecretGardenError::ShardEntriesOutOfRange
+                );
+            } else {
+                require!(key > prev, SecretGardenError::ShardEntriesOutOfRange);
+            }
+            if k + 1 < t.shard_count as usize {
+                require!(
+                    key < t.shard_bounds[k + 1],
+                    SecretGardenError::ShardEntriesOutOfRange
+                );
+            }
+            prev = key;
+            entry_keys[i] = key;
+        }
+
+        let slots = [
+            ctx.accounts.result.slot1,
+            ctx.accounts.result.slot2,
+            ctx.accounts.result.slot3,
+        ];
+        let take = core::cmp::min(SHARD_WINNERS as usize, size);
+        for slot in slots.iter().take(take) {
+            let s = *slot as usize;
+            require!(s < size, SecretGardenError::WrongEntryCount);
+            require!(
+                t.insert_winner_sorted(entry_keys[s]),
+                SecretGardenError::Tier1WinnerRejected
+            );
+        }
+        t.shard_done[k] = 1;
+        Ok(())
+    }
+
+    /// Promotes tier 1 into the semifinal tier: derives a balanced partition over the SORTED
+    /// winners and writes it into `BracketState`, which from here on is the ordinary
+    /// single-tier bracket over those winners.
+    ///
+    /// The partition is COMPUTED, not supplied — the winners are already sorted on-chain, so
+    /// there is nothing for an operator to get wrong and nothing to verify.
+    pub fn promote_tier1(ctx: Context<PromoteTier1>) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        // Read everything needed from the zero-copy account, then DROP the borrow before
+        // touching `ctx.accounts.bracket` mutably — the Ref borrows `ctx.accounts.tier1`,
+        // and `&mut ctx.accounts.bracket` would conflict at the `ctx.accounts` level.
+        let (n, count, sizes, bounds) = {
+            let t = ctx.accounts.tier1.load()?;
+            require!(t.round == round_key, SecretGardenError::BracketRoundMismatch);
+            require!(t.promoted == 0, SecretGardenError::Tier1AlreadyPromoted);
+            require!(t.all_shards_collected(), SecretGardenError::Tier1NotReady);
+
+            let n = t.winner_count as usize;
+            require!(n >= 1, SecretGardenError::Tier1NotReady);
+            let count = n.div_ceil(MAX_SHARD_SIZE as usize);
+            require!(count <= MAX_SHARDS, SecretGardenError::InvalidShardLayout);
+
+            let base = n / count;
+            let extra = n % count;
+            let mut sizes = [0u8; MAX_SHARDS];
+            let mut bounds = [Pubkey::default(); MAX_SHARDS];
+            let mut cursor = 0usize;
+            for k in 0..count {
+                let sz = base + usize::from(k < extra);
+                sizes[k] = sz as u8;
+                bounds[k] = t.winners[cursor];
+                cursor += sz;
+            }
+            (n, count, sizes, bounds)
+        };
+        let _ = n;
+
+        let b = &mut ctx.accounts.bracket;
+        b.round = round_key;
+        b.shard_count = count as u8;
+        b.shards_collected = 0;
+        b.finalist_count = 0;
+        b.final_queued = false;
+        b.applied = false;
+        b.bump = ctx.bumps.bracket;
+        // Element-wise, for the same stack reason as `init_tier1_bracket`.
+        for i in 0..MAX_SHARDS {
+            b.shard_sizes[i] = sizes[i];
+            b.shard_bounds[i] = bounds[i];
+        }
+        for i in 0..MAX_FINALISTS {
+            b.finalists[i] = Pubkey::default();
+        }
+        ctx.accounts.tier1.load_mut()?.promoted = 1;
+        Ok(())
+    }
+
+    /// Reveals ONE semifinal: ranks a contiguous slice of the sorted tier-1 winners.
+    ///
+    /// Membership is checked BY INDEX against `Tier1State::winners` — the supplied accounts
+    /// must be exactly `winners[start..start+size]`. That is strictly stronger than the
+    /// bounds check tier 1 uses, because the winners are already sorted on-chain.
+    pub fn queue_semifinal_reveal(
+        ctx: Context<QueueSemifinalReveal>,
+        computation_offset: u64,
+        semi_index: u8,
+    ) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        let t = ctx.accounts.tier1.load()?;
+        require!(
+            t.round == round_key && ctx.accounts.bracket.round == round_key,
+            SecretGardenError::BracketRoundMismatch
+        );
+        require!(t.promoted == 1, SecretGardenError::SemifinalNotReady);
+        require!(
+            !ctx.accounts.round.scoring_revealed,
+            SecretGardenError::ScoringAlreadyRevealed
+        );
+        require!(
+            semi_index < ctx.accounts.bracket.shard_count,
+            SecretGardenError::InvalidShardIndex
+        );
+
+        let k = semi_index as usize;
+        let size = ctx.accounts.bracket.shard_sizes[k] as usize;
+        let start: usize = ctx.accounts.bracket.shard_sizes[..k]
+            .iter()
+            .map(|s| *s as usize)
+            .sum();
+        require!(
+            ctx.remaining_accounts.len() == size,
+            SecretGardenError::WrongEntryCount
+        );
+
+        let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
+        let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
+        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+            let entry = Account::<CompetitionEntry>::try_from(info)?;
+            require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
+            require!(entry.scored, SecretGardenError::ScoringIncomplete);
+            require!(
+                info.key() == t.winners[start + i],
+                SecretGardenError::SemifinalSliceMismatch
+            );
+            entry_keys[i] = info.key();
+            entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
+        }
+        for i in size..MAX_PARTICIPANTS as usize {
+            entry_keys[i] = entry_keys[0];
+            entry_nonces[i] = entry_nonces[0];
+        }
+        // Release the zero-copy borrow before touching `ctx.accounts` mutably below.
+        drop(t);
+
+        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
+        let result = &mut ctx.accounts.result;
+        result.round = round_key;
+        result.ready = false;
+        result.error_code = 0;
+        result.bump = ctx.bumps.result;
+
+        let mut builder = ArgBuilder::new();
+        for i in 0..MAX_PARTICIPANTS as usize {
+            builder = builder.plaintext_u128(entry_nonces[i]).account(
+                entry_keys[i],
+                ENTRY_SCORE_OFFSET,
+                ENTRY_SCORE_LEN as u32,
+            );
+        }
+        let args = builder.plaintext_u8(size as u8).build();
+
+        queue_computation(
+            ctx.accounts,
+            computation_offset,
+            args,
+            vec![RevealTop3V3Callback::callback_ix(
+                computation_offset,
+                &ctx.accounts.mxe_account,
+                &[CallbackAccount {
+                    pubkey: ctx.accounts.result.key(),
+                    is_writable: true,
+                }],
+            )?],
+            1,
+            0,
+            CALLBACK_CU_LIMIT,
+        )?;
+        Ok(())
+    }
+
+    /// Resolves one semifinal's slots into `BracketState::finalists`. Needs NO entry
+    /// accounts: the slice is `Tier1State::winners[start..]`, already on-chain and sorted.
+    /// From here the FINAL reveal and `apply_bracket_result` run exactly as they do for a
+    /// single-tier round.
+    pub fn collect_semifinal_winners(
+        ctx: Context<CollectSemifinalWinners>,
+        semi_index: u8,
+    ) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+        let round_key = ctx.accounts.round.key();
+        {
+            let t = ctx.accounts.tier1.load()?;
+            require!(
+                t.round == round_key && ctx.accounts.bracket.round == round_key,
+                SecretGardenError::BracketRoundMismatch
+            );
+            require!(t.promoted == 1, SecretGardenError::SemifinalNotReady);
+        }
+        require!(
+            semi_index < ctx.accounts.bracket.shard_count,
+            SecretGardenError::InvalidShardIndex
+        );
+        require!(
+            ctx.accounts.result.ready,
+            SecretGardenError::ShardResultNotReady
+        );
+        require!(
+            ctx.accounts.result.error_code == 0,
+            SecretGardenError::AbortedComputation
+        );
+        let k = semi_index as usize;
+        require!(
+            ctx.accounts.bracket.shards_collected & (1u8 << k) == 0,
+            SecretGardenError::ShardAlreadyCollected
+        );
+
+        let size = ctx.accounts.bracket.shard_sizes[k] as usize;
+        let start: usize = ctx.accounts.bracket.shard_sizes[..k]
+            .iter()
+            .map(|s| *s as usize)
+            .sum();
+        let slots = [
+            ctx.accounts.result.slot1,
+            ctx.accounts.result.slot2,
+            ctx.accounts.result.slot3,
+        ];
+        let take = core::cmp::min(SHARD_WINNERS as usize, size);
+        let mut picked = [Pubkey::default(); SHARD_WINNERS as usize];
+        {
+            let t = ctx.accounts.tier1.load()?;
+            for (j, slot) in slots.iter().take(take).enumerate() {
+                let s = *slot as usize;
+                require!(s < size, SecretGardenError::WrongEntryCount);
+                picked[j] = t.winners[start + s];
+            }
+        }
+
+        let b = &mut ctx.accounts.bracket;
+        for key in picked.iter().take(take) {
+            let idx = b.finalist_count as usize;
+            require!(idx < MAX_FINALISTS, SecretGardenError::InvalidShardLayout);
+            b.finalists[idx] = *key;
+            b.finalist_count += 1;
+        }
+        b.shards_collected |= 1u8 << k;
+        Ok(())
+    }
+
     /// On success: persists the entry's encrypted score, marks it `scored`, and bumps
     /// `round.scored_count` (saturating). Idempotent via `entry.scored` — a retried or
     /// raced callback no-ops, which is what makes the GAP 1 double-count structurally
@@ -889,6 +1961,45 @@ pub mod secret_garden {
         round.top2 = top2;
         round.top3 = top3;
         round.scoring_revealed = true;
+
+        emit!(Top3RevealedEvent {
+            entry_index_1: top.field_0,
+            score_1: top.field_1,
+            entry_index_2: top.field_2,
+            score_2: top.field_3,
+            entry_index_3: top.field_4,
+            score_3: top.field_5,
+        });
+        Ok(())
+    }
+
+    /// ADDITIVE, VERIFICATION-ONLY callback for `reveal_top3_v3`. Records the circuit's RAW
+    /// output into `RevealTop3V3Result`. It deliberately does NOT
+    /// touch `CompetitionRound` — not `top1/2/3`, not `scoring_revealed` — so it can run on
+    /// the same round as the live reveal without disturbing it.
+    #[arcium_callback(encrypted_ix = "reveal_top3_v3")]
+    pub fn reveal_top3_v3_callback(
+        ctx: Context<RevealTop3V3Callback>,
+        output: SignedComputationOutputs<RevealTop3V3Output>,
+    ) -> Result<()> {
+        let RevealTop3V3Output { field_0: top } = output
+            .verify_output(
+                &ctx.accounts.cluster_account,
+                &ctx.accounts.computation_account,
+            )
+            .map_err(|e| {
+                msg!("reveal_top3_v3 verify failed: {}", e);
+                SecretGardenError::AbortedComputation
+            })?;
+
+        let result = &mut ctx.accounts.result;
+        result.slot1 = top.field_0;
+        result.score1 = top.field_1;
+        result.slot2 = top.field_2;
+        result.score2 = top.field_3;
+        result.slot3 = top.field_4;
+        result.score3 = top.field_5;
+        result.ready = true;
 
         emit!(Top3RevealedEvent {
             entry_index_1: top.field_0,
@@ -1634,6 +2745,567 @@ pub struct ScoreEntryV2Callback<'info> {
     pub entry: Box<Account<'info, CompetitionEntry>>,
     #[account(mut, constraint = entry.round == round.key())]
     pub round: Box<Account<'info, CompetitionRound>>,
+}
+
+/// Registers the `reveal_top3_v3` computation definition. Restricted to `config.authority`.
+/// Mirrors `InitRevealTop3CompDef`, bound to the `reveal_top3_v3` circuit name. NOT optional:
+/// every bracket shard/semifinal/final reveal runs on this comp def, so it must be
+/// initialized before the bracket can be used.
+#[init_computation_definition_accounts("reveal_top3_v3", authority)]
+#[derive(Accounts)]
+pub struct InitRevealTop3V3CompDef<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        has_one = authority @ SecretGardenError::NotAuthority,
+    )]
+    pub config: Account<'info, GameConfig>,
+    #[account(mut, address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut)]
+    /// CHECK: comp_def_account, checked by the arcium program. Not initialized yet.
+    pub comp_def_account: UncheckedAccount<'info>,
+    #[account(mut, address = derive_mxe_lut_pda!(mxe_account.lut_offset_slot))]
+    /// CHECK: address_lookup_table, checked by the arcium program.
+    pub address_lookup_table: UncheckedAccount<'info>,
+    #[account(address = LUT_PROGRAM_ID)]
+    /// CHECK: lut_program is the Address Lookup Table program.
+    pub lut_program: UncheckedAccount<'info>,
+    pub arcium_program: Program<'info, Arcium>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Queues a standalone `reveal_top3_v3` computation. Mirrors `QueueRevealTop3`; the only
+/// structural differences are the `result` PDA (which replaces writing to `round`) and the
+/// comp-def offset. Retained as a single-shot differential-test path; the BRACKET does not go
+/// through here — it queues the same comp def via `QueueShardReveal` and friends.
+#[queue_computation_accounts("reveal_top3_v3", authority)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64)]
+pub struct QueueRevealTop3V3<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Box<Account<'info, GameConfig>>,
+
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+
+    /// Per-round v3 result record. `init_if_needed` so the round can be re-run.
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + RevealTop3V3Result::INIT_SPACE,
+        seeds = [TOP3_V3_SEED, round.key().as_ref()],
+        bump,
+    )]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
+
+    // --- arcium queue-side accounts (mirror QueueRevealTop3) ---
+    #[account(
+        init_if_needed,
+        space = SIGN_PDA_ACCOUNT_LEN,
+        payer = authority,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Account<'info, ArciumSignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut, address = derive_mempool_pda!(mxe_account))]
+    /// CHECK: mempool_account, checked by the arcium program.
+    pub mempool_account: UncheckedAccount<'info>,
+    #[account(mut, address = derive_execpool_pda!(mxe_account))]
+    /// CHECK: executing_pool, checked by the arcium program.
+    pub executing_pool: UncheckedAccount<'info>,
+    #[account(mut, address = derive_comp_pda!(computation_offset, mxe_account))]
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3_V3))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+/// Callback context for `reveal_top3_v3`. ADDITIVE, VERIFICATION-ONLY. The writable
+/// `result` receives the raw output; `CompetitionRound` is deliberately absent.
+#[callback_accounts("reveal_top3_v3")]
+#[derive(Accounts)]
+pub struct RevealTop3V3Callback<'info> {
+    pub arcium_program: Program<'info, Arcium>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3_V3))]
+    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Account<'info, MXEAccount>,
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Account<'info, Cluster>,
+    #[account(address = ::arcium_anchor::solana_instructions_sysvar::ID)]
+    /// CHECK: instructions_sysvar, checked by the account constraint.
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
+}
+
+// ---------------------------------------------------------------------------
+// Bracket reveal contexts (ADDITIVE). All reuse the `reveal_top3_v3` comp def.
+// ---------------------------------------------------------------------------
+
+/// Pins the shard partition. No Arcium accounts — this queues nothing.
+#[derive(Accounts)]
+pub struct InitBracket<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + BracketState::INIT_SPACE,
+        seeds = [BRACKET_SEED, round.key().as_ref()],
+        bump,
+    )]
+    pub bracket: Box<Account<'info, BracketState>>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Queues ONE shard's `reveal_top3_v3`. Mirrors `QueueRevealTop3V3` exactly, except the
+/// result PDA is per-shard and a `bracket` account is carried. 16 context accounts + the
+/// program id + <=13 entries = <=30 keys, which is 1143 bytes — inside the 1232 limit.
+#[queue_computation_accounts("reveal_top3_v3", authority)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64, shard_index: u8)]
+pub struct QueueShardReveal<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Box<Account<'info, GameConfig>>,
+
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+
+    #[account(
+        mut,
+        seeds = [BRACKET_SEED, round.key().as_ref()],
+        bump = bracket.bump,
+    )]
+    pub bracket: Box<Account<'info, BracketState>>,
+
+    /// Per-shard result. Typed `RevealTop3V3Result` so the EXISTING
+    /// `reveal_top3_v3_callback` writes it with no new circuit or callback.
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + RevealTop3V3Result::INIT_SPACE,
+        seeds = [SHARD_RESULT_SEED, round.key().as_ref(), &[shard_index]],
+        bump,
+    )]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
+
+    #[account(
+        init_if_needed,
+        space = SIGN_PDA_ACCOUNT_LEN,
+        payer = authority,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Account<'info, ArciumSignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut, address = derive_mempool_pda!(mxe_account))]
+    /// CHECK: mempool_account, checked by the arcium program.
+    pub mempool_account: UncheckedAccount<'info>,
+    #[account(mut, address = derive_execpool_pda!(mxe_account))]
+    /// CHECK: executing_pool, checked by the arcium program.
+    pub executing_pool: UncheckedAccount<'info>,
+    #[account(mut, address = derive_comp_pda!(computation_offset, mxe_account))]
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3_V3))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+/// Resolves one shard's slots to pubkeys. No Arcium accounts — nothing is queued, so the
+/// 14-account argument ceiling does not apply here.
+#[derive(Accounts)]
+#[instruction(shard_index: u8)]
+pub struct CollectShardWinners<'info> {
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        mut,
+        seeds = [BRACKET_SEED, round.key().as_ref()],
+        bump = bracket.bump,
+    )]
+    pub bracket: Box<Account<'info, BracketState>>,
+    #[account(
+        seeds = [SHARD_RESULT_SEED, round.key().as_ref(), &[shard_index]],
+        bump = result.bump,
+    )]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
+}
+
+/// Writes the round's final top1/2/3. Five accounts, independent of round size — the
+/// slot->pubkey mapping comes from `BracketState`, not from re-supplied entries.
+///
+/// `result_index` selects which reveal record produced the final ranking: `0` for a
+/// single-shard round (no final reveal was needed) and `FINAL_SHARD_INDEX` otherwise. The
+/// handler enforces that the index matches the bracket's actual shape.
+#[derive(Accounts)]
+#[instruction(result_index: u8)]
+pub struct ApplyBracketResult<'info> {
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        mut,
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        mut,
+        seeds = [BRACKET_SEED, round.key().as_ref()],
+        bump = bracket.bump,
+    )]
+    pub bracket: Box<Account<'info, BracketState>>,
+    #[account(
+        seeds = [SHARD_RESULT_SEED, round.key().as_ref(), &[result_index]],
+        bump = result.bump,
+    )]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
+}
+
+// ---------------------------------------------------------------------------
+// TWO-TIER contexts (ADDITIVE). All reuse the `reveal_top3_v3` comp def and callback.
+// ---------------------------------------------------------------------------
+
+/// Pins the tier-1 partition. No Arcium accounts — this queues nothing.
+#[derive(Accounts)]
+pub struct InitTier1Bracket<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + core::mem::size_of::<Tier1State>(),
+        seeds = [TIER1_SEED, round.key().as_ref()],
+        bump,
+    )]
+    pub tier1: AccountLoader<'info, Tier1State>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Closes a round's `Tier1State` and refunds its rent to the signer.
+///
+/// Uses `AccountLoader` because `close` requires it — but the handler deliberately never
+/// calls `load()`. `AccountLoader::try_from` validates only owner + discriminator; the
+/// data-length check lives in `load()`. So this can still reclaim an account written under
+/// an older layout, which is precisely what it is for.
+#[derive(Accounts)]
+pub struct CloseTier1Bracket<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        mut,
+        seeds = [TIER1_SEED, round.key().as_ref()],
+        bump,
+        close = authority,
+    )]
+    pub tier1: AccountLoader<'info, Tier1State>,
+}
+
+/// Queues ONE tier-1 shard. Mirrors `QueueShardReveal` but carries `Tier1State` instead of
+/// `BracketState` — which does not exist yet at this stage.
+#[queue_computation_accounts("reveal_top3_v3", authority)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64, shard_index: u8)]
+pub struct QueueTier1ShardReveal<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        seeds = [TIER1_SEED, round.key().as_ref()],
+        bump = tier1.load()?.bump,
+    )]
+    pub tier1: AccountLoader<'info, Tier1State>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + RevealTop3V3Result::INIT_SPACE,
+        seeds = [SHARD_RESULT_SEED, round.key().as_ref(), &[shard_index]],
+        bump,
+    )]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
+
+    #[account(
+        init_if_needed,
+        space = SIGN_PDA_ACCOUNT_LEN,
+        payer = authority,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Account<'info, ArciumSignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut, address = derive_mempool_pda!(mxe_account))]
+    /// CHECK: mempool_account, checked by the arcium program.
+    pub mempool_account: UncheckedAccount<'info>,
+    #[account(mut, address = derive_execpool_pda!(mxe_account))]
+    /// CHECK: executing_pool, checked by the arcium program.
+    pub executing_pool: UncheckedAccount<'info>,
+    #[account(mut, address = derive_comp_pda!(computation_offset, mxe_account))]
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3_V3))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+/// Sorted-inserts one tier-1 shard's winners. No Arcium accounts.
+#[derive(Accounts)]
+#[instruction(shard_index: u8)]
+pub struct CollectTier1Winners<'info> {
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        mut,
+        seeds = [TIER1_SEED, round.key().as_ref()],
+        bump = tier1.load()?.bump,
+    )]
+    pub tier1: AccountLoader<'info, Tier1State>,
+    #[account(
+        seeds = [SHARD_RESULT_SEED, round.key().as_ref(), &[shard_index]],
+        bump = result.bump,
+    )]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
+}
+
+/// Writes the semifinal partition into `BracketState`. This is where the two-tier path
+/// hands back to the proven single-tier machinery.
+#[derive(Accounts)]
+pub struct PromoteTier1<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        mut,
+        seeds = [TIER1_SEED, round.key().as_ref()],
+        bump = tier1.load()?.bump,
+    )]
+    pub tier1: AccountLoader<'info, Tier1State>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + BracketState::INIT_SPACE,
+        seeds = [BRACKET_SEED, round.key().as_ref()],
+        bump,
+    )]
+    pub bracket: Box<Account<'info, BracketState>>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Queues ONE semifinal. Result lands under the SEPARATE `SEMI_RESULT_SEED` namespace so it
+/// can never collide with tier-1 shard k's result.
+#[queue_computation_accounts("reveal_top3_v3", authority)]
+#[derive(Accounts)]
+#[instruction(computation_offset: u64, semi_index: u8)]
+pub struct QueueSemifinalReveal<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        seeds = [TIER1_SEED, round.key().as_ref()],
+        bump = tier1.load()?.bump,
+    )]
+    pub tier1: AccountLoader<'info, Tier1State>,
+    #[account(
+        seeds = [BRACKET_SEED, round.key().as_ref()],
+        bump = bracket.bump,
+    )]
+    pub bracket: Box<Account<'info, BracketState>>,
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + RevealTop3V3Result::INIT_SPACE,
+        seeds = [SEMI_RESULT_SEED, round.key().as_ref(), &[semi_index]],
+        bump,
+    )]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
+
+    #[account(
+        init_if_needed,
+        space = SIGN_PDA_ACCOUNT_LEN,
+        payer = authority,
+        seeds = [&SIGN_PDA_SEED],
+        bump,
+        address = derive_sign_pda!(),
+    )]
+    pub sign_pda_account: Account<'info, ArciumSignerAccount>,
+    #[account(address = derive_mxe_pda!())]
+    pub mxe_account: Box<Account<'info, MXEAccount>>,
+    #[account(mut, address = derive_mempool_pda!(mxe_account))]
+    /// CHECK: mempool_account, checked by the arcium program.
+    pub mempool_account: UncheckedAccount<'info>,
+    #[account(mut, address = derive_execpool_pda!(mxe_account))]
+    /// CHECK: executing_pool, checked by the arcium program.
+    pub executing_pool: UncheckedAccount<'info>,
+    #[account(mut, address = derive_comp_pda!(computation_offset, mxe_account))]
+    /// CHECK: computation_account, checked by the arcium program.
+    pub computation_account: UncheckedAccount<'info>,
+    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3_V3))]
+    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
+    #[account(mut, address = derive_cluster_pda!(mxe_account))]
+    pub cluster_account: Box<Account<'info, Cluster>>,
+    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
+    pub pool_account: Account<'info, FeePool>,
+    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
+    pub clock_account: Account<'info, ClockAccount>,
+    pub system_program: Program<'info, System>,
+    pub arcium_program: Program<'info, Arcium>,
+}
+
+/// Resolves one semifinal's slots into `BracketState::finalists`. Six accounts, no entries.
+#[derive(Accounts)]
+#[instruction(semi_index: u8)]
+pub struct CollectSemifinalWinners<'info> {
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, GameConfig>>,
+    #[account(
+        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
+        bump = round.bump,
+    )]
+    pub round: Box<Account<'info, CompetitionRound>>,
+    #[account(
+        seeds = [TIER1_SEED, round.key().as_ref()],
+        bump = tier1.load()?.bump,
+    )]
+    pub tier1: AccountLoader<'info, Tier1State>,
+    #[account(
+        mut,
+        seeds = [BRACKET_SEED, round.key().as_ref()],
+        bump = bracket.bump,
+    )]
+    pub bracket: Box<Account<'info, BracketState>>,
+    #[account(
+        seeds = [SEMI_RESULT_SEED, round.key().as_ref(), &[semi_index]],
+        bump = result.bump,
+    )]
+    pub result: Box<Account<'info, RevealTop3V3Result>>,
 }
 
 /// Callback context for `reveal_top3`. The writable `round` receives the winners; the

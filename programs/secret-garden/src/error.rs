@@ -145,4 +145,58 @@ pub enum SecretGardenError {
     /// deletable (this preserves the `total_flowers - STARTER_COUNT` accounting invariant).
     #[msg("Starter flowers cannot be deleted")]
     StarterNotDeletable,
+
+    // --- Bracket reveal (ADDITIVE) ---
+    /// `init_bracket`: the declared shard sizes do not sum to `participant_count`, or a
+    /// shard is outside `MIN_SHARD_SIZE..=MAX_SHARD_SIZE`, or `shard_count` is out of range.
+    #[msg("The declared shard layout is invalid for this round")]
+    InvalidShardLayout,
+    /// The supplied entry accounts are not in strictly ascending pubkey order, or do not
+    /// start at this shard's recorded boundary, or cross into the next shard's range.
+    #[msg("Shard entries must be strictly ascending and within this shard's bounds")]
+    ShardEntriesOutOfRange,
+    /// `queue_shard_reveal`/`collect_shard_winners` given a `shard_index >= shard_count`.
+    #[msg("That shard index does not exist in this bracket")]
+    InvalidShardIndex,
+    /// `collect_shard_winners` before the shard's reveal callback has landed.
+    #[msg("That shard's reveal has not produced a result yet")]
+    ShardResultNotReady,
+    /// `collect_shard_winners` called twice for the same shard.
+    #[msg("That shard's winners were already collected")]
+    ShardAlreadyCollected,
+    /// `queue_final_reveal` before every shard has been collected.
+    #[msg("Every shard must be revealed and collected before the final reveal")]
+    BracketNotReady,
+    /// `queue_final_reveal` called while a final reveal is already in flight, or
+    /// `apply_bracket_result` called twice.
+    #[msg("The final reveal has already been queued or applied")]
+    BracketAlreadyFinal,
+    /// The finalist accounts supplied do not match the ones recorded in `BracketState`.
+    #[msg("The supplied finalists do not match the recorded shard winners")]
+    FinalistMismatch,
+    /// A bracket instruction was pointed at a round whose `BracketState` belongs elsewhere.
+    #[msg("This bracket does not belong to that round")]
+    BracketRoundMismatch,
+
+    // --- two-tier bracket (ADDITIVE) ---
+    /// `init_tier1_bracket` on a round small enough for the single-tier path, or
+    /// a single-tier instruction used on a round that needs two tiers.
+    #[msg("This round's size does not match the bracket tier being used")]
+    WrongBracketTier,
+    /// `promote_tier1` before every tier-1 shard has been collected.
+    #[msg("Every tier-1 shard must be collected before promotion")]
+    Tier1NotReady,
+    /// `promote_tier1` called twice, or a tier-1 instruction after promotion.
+    #[msg("Tier 1 has already been promoted to the semifinal tier")]
+    Tier1AlreadyPromoted,
+    /// A semifinal instruction used before `promote_tier1` wrote the semifinal partition.
+    #[msg("The semifinal tier is not ready — promote tier 1 first")]
+    SemifinalNotReady,
+    /// The supplied accounts are not exactly this semifinal's slice of the sorted tier-1
+    /// winners, by index.
+    #[msg("The supplied accounts are not this semifinal's slice of the tier-1 winners")]
+    SemifinalSliceMismatch,
+    /// `collect_shard_winners` produced a duplicate or overflowed the tier-1 winner array.
+    #[msg("Could not record that tier-1 winner (duplicate or capacity reached)")]
+    Tier1WinnerRejected,
 }

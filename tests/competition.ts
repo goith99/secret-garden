@@ -27,7 +27,11 @@ const ERR_ROUND_NOT_CLOSED = "0x177c"; // 6012
 
 // Mirror of on-chain constants (programs/.../constants.rs).
 const ROUND_DURATION_SECONDS = 86_400; // 24h
-const MAX_PARTICIPANTS = 16;
+// What a round ACCEPTS — `open_round` writes this into `max_participants`. Deliberately
+// distinct from the program's `MAX_PARTICIPANTS` (still 16), which is the reveal CIRCUIT's
+// fixed slot width. The bracket decoupled the two: a round is now revealed as several
+// shard reveals rather than one call, so acceptance is no longer bounded by circuit width.
+const ROUND_CAPACITY = 221;
 const FLOWER_STATUS_ACTIVE = 0;
 const FLOWER_STATUS_SUBMITTED = 2;
 const ROUND_STATUS_OPEN = 0;
@@ -202,7 +206,7 @@ describe("secret-garden Stage 2: competition rounds", () => {
       );
       expect(round.roundId.toNumber()).to.equal(1);
       expect(round.status).to.equal(ROUND_STATUS_OPEN);
-      expect(round.maxParticipants).to.equal(MAX_PARTICIPANTS);
+      expect(round.maxParticipants).to.equal(ROUND_CAPACITY);
       expect(round.participantCount).to.equal(0);
       expect(round.authority.equals(authority.publicKey)).to.equal(true);
       expect(round.endTime.sub(round.startTime).toNumber()).to.equal(
@@ -341,9 +345,9 @@ describe("secret-garden Stage 2: competition rounds", () => {
     it("fails once participant_count reaches max_participants", async () => {
       const { h, authority } = await bootstrapWithOpenRound();
       // Practical testing: raise participant_count to the max via setAccount instead of
-      // performing 16 real submissions. The on-chain guard is then exercised directly.
+      // performing ROUND_CAPACITY real submissions. The on-chain guard is then exercised directly.
       await patchAccount(h, h.roundPda(1), (data) => {
-        data.writeUInt16LE(MAX_PARTICIPANTS, ROUND_PARTICIPANT_COUNT_OFFSET);
+        data.writeUInt16LE(ROUND_CAPACITY, ROUND_PARTICIPANT_COUNT_OFFSET);
       });
       const r = await h.send(
         [await ixSubmit(h, authority.publicKey, 1, 0)],

@@ -3141,6 +3141,7 @@ dependencies = [
  "arcium-anchor",
  "arcium-client",
  "arcium-macros",
+ "bytemuck",
  "hashbrown 0.16.1",
  "indexmap 2.13.1",
  "solana-sha256-hasher",
