@@ -24,8 +24,13 @@
  *   remove-operator OPERATOR=<pubkey> — unregister an operator wallet
  *   list-operators  — print the authority + the registered operators
  *
- * Run (always `source .env` first so HELIUS_RPC_URL is set):
- *   source .env && ANCHOR_PROVIDER_URL=$HELIUS_RPC_URL \
+ * Run — use `set -a` so .env is EXPORTED, not just set as shell variables. A plain
+ * `source .env` leaves SUPABASE_URL/SUPABASE_SERVICE_KEY invisible to this process, and
+ * saveResultsToSupabase() then skips SILENTLY: the reveal succeeds on-chain but the
+ * frontend's Daily Winners panel never learns about the round. (This is the same idiom the
+ * devnet tests already use.)
+ *   set -a; source .env; set +a
+ *   ANCHOR_PROVIDER_URL=$HELIUS_RPC_URL \
  *     ANCHOR_WALLET=$HOME/.config/solana/id.json \
  *     ARCIUM_CLUSTER_OFFSET=456 \
  *     COMMAND=status \
@@ -172,7 +177,15 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
   async function saveResultsToSupabase(roundNumber: number, round: any, scored: any[]) {
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_KEY;
-    if (!url || !key) return; // not configured — skip silently
+    if (!url || !key) {
+      // NOT silent: skipping here means the round is revealed on-chain but invisible to the
+      // frontend's Daily Winners panel, which previously looked like a frontend bug. The
+      // usual cause is `source .env` without `set -a` (vars set but not EXPORTED).
+      console.log(`  ⚠ SUPABASE_URL/SUPABASE_SERVICE_KEY not set — results NOT saved to Supabase.`);
+      console.log(`    Daily Winners will keep showing the previous round. Re-run with:`);
+      console.log(`      set -a; source .env; set +a`);
+      return;
+    }
 
     const { createClient } = await import("@supabase/supabase-js");
     const supabase = createClient(url, key);

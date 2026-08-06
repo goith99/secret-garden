@@ -15,8 +15,9 @@
  *
  * Requires the Stage 5D program (with `migrate_profile`) to be deployed to devnet first.
  *
- * Run:
- *   source .env && ANCHOR_PROVIDER_URL=$HELIUS_RPC_URL \
+ * Run (`set -a` so .env is EXPORTED to the process, not just set in the shell):
+ *   set -a; source .env; set +a
+ *   ANCHOR_PROVIDER_URL=$HELIUS_RPC_URL \
  *     ANCHOR_WALLET=$HOME/.config/solana/id.json ARCIUM_CLUSTER_OFFSET=456 \
  *     npx mocha --no-config --timeout 60000 scripts/migrate-profile.ts
  */
