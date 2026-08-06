@@ -22,7 +22,7 @@
  * signs only the prize transfers. They are never mixed into the same variable or file.
  *
  * PRIZE POOL: after a successful reveal_top3 and BEFORE finalize, the Treasury pays
- * 5 / 3 / 2 SOL to the rank 1 / 2 / 3 winner wallets. Transfers are sequential and
+ * 0.5 SOL to each of the rank 1 / 2 / 3 winner wallets. Transfers are sequential and
  * independent — one failure is logged for manual retry and does NOT stop the rest of the
  * cycle (close/score/reveal/finalize/open still complete).
  *
@@ -65,11 +65,13 @@ const MIN_BALANCE_SOL = 0.5;
 
 // Prize pool: SOL paid from the Treasury to the rank 1/2/3 winners, in that order. Indexed
 // by (rank - 1).
-const PRIZE_SOL = [5, 3, 2];
+const PRIZE_SOL = [0.5, 0.5, 0.5];
 // Minimum Treasury balance required before the cycle runs — at least one day's full prize
-// pool (5 + 3 + 2 = 10 SOL). Transfer fees come from headroom above this, so in practice the
-// treasury is kept well above 10; a per-payout shortfall is caught and logged for retry.
-const MIN_TREASURY_SOL = 10.1;
+// pool (0.5 + 0.5 + 0.5 = 1.5 SOL), plus the same 0.1 SOL absolute headroom the previous
+// 10-SOL-pool gate carried. Transfer fees come from that headroom (three transfers cost
+// ~0.000015 SOL, so 0.1 is deliberately generous); a per-payout shortfall is caught and
+// logged for retry.
+const MIN_TREASURY_SOL = 1.6;
 
 // Each key is materialized here (under /tmp ONLY — never the project dir) and removed on
 // exit. 0600 so only the process owner can read it. The operator key (cycle signer) and the
