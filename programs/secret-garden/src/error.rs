@@ -199,4 +199,31 @@ pub enum SecretGardenError {
     /// `collect_shard_winners` produced a duplicate or overflowed the tier-1 winner array.
     #[msg("Could not record that tier-1 winner (duplicate or capacity reached)")]
     Tier1WinnerRejected,
+    /// A reveal result was computed under an EARLIER bracket/tier1 generation (i.e. before a
+    /// re-init re-partitioned the round) and can no longer be collected/applied. Re-queue the
+    /// reveal under the current partition instead.
+    #[msg("This reveal result belongs to a superseded partition (stale generation)")]
+    StaleRevealResult,
+
+    // --- release_flower: return a competed flower to the player's collection ---
+    /// `release_flower` called on a round that is not yet Finalized. A flower stays Submitted
+    /// for as long as its round can still be scored/revealed — releasing earlier would let a
+    /// player pull an entry's flower out from under the round it is competing in.
+    #[msg("The round is not finalized")]
+    RoundNotFinalized,
+    /// `release_flower` called on a flower that is not Submitted (it is already Active, or
+    /// Locked mid-breed — neither is a flower awaiting release from a finished round).
+    #[msg("The flower is not submitted")]
+    FlowerNotSubmitted,
+    /// `release_flower`: the supplied `entry` does not match the round/flower pair given. The
+    /// entry PDA seeds already bind it to (round, owner), so the round half is defence in
+    /// depth; the flower half is the real check — it proves THIS flower is the one this
+    /// player submitted to THIS round.
+    #[msg("That entry does not match the supplied round and flower")]
+    EntryMismatch,
+    /// `release_flower`: this entry has already been used to release its flower. Release is
+    /// one-shot per entry — see `ENTRY_STATUS_RELEASED` for why replaying an old finalized
+    /// entry would otherwise pull a flower out of a LIVE later round.
+    #[msg("That entry has already released its flower")]
+    EntryAlreadyReleased,
 }

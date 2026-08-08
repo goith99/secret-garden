@@ -4,6 +4,7 @@ pub mod create_profile;
 pub mod finalize_round;
 pub mod initialize_config;
 pub mod open_round;
+pub mod release_flower;
 pub mod set_paused;
 pub mod submit_entry;
 
@@ -16,5 +17,6 @@ pub use create_profile::*;
 pub use finalize_round::*;
 pub use initialize_config::*;
 pub use open_round::*;
+pub use release_flower::*;
 pub use set_paused::*;
 pub use submit_entry::*;

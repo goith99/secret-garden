@@ -43,8 +43,20 @@ pub const ROUND_STATUS_OPEN: u8 = 0;
 pub const ROUND_STATUS_CLOSED: u8 = 1;
 pub const ROUND_STATUS_FINALIZED: u8 = 2;
 
-/// `CompetitionEntry::status` values. Stage 2 only ever sets `SUBMITTED`.
+/// `CompetitionEntry::status` values.
 pub const ENTRY_STATUS_SUBMITTED: u8 = 0;
+/// Set by `release_flower` once this entry's flower has been returned to the collection.
+/// The entry account itself is KEPT (it is the round's permanent record, and `round.top1/2/3`
+/// name entry pubkeys), so the status is what makes release ONE-SHOT per entry.
+///
+/// That one-shot property is load-bearing, not bookkeeping. Without it a finalized entry
+/// could be replayed: submit flower X to round N, release it after N finalizes, re-submit X
+/// to round N+1 — and then present round N's still-valid finalized entry again to yank X
+/// back out of the LIVE round N+1, defeating the round gate. (From there `close_flower`
+/// would delete a flower round N+1 still has to score, leaving that round permanently
+/// unrevealable.) Nothing else on-chain reads `CompetitionEntry::status`, so claiming it
+/// here costs no layout change and no migration of existing entries.
+pub const ENTRY_STATUS_RELEASED: u8 = 1;
 
 /// Length of a competition round in seconds: 24 hours (24 * 60 * 60 = 86400).
 pub const ROUND_DURATION_SECONDS: i64 = 86_400;

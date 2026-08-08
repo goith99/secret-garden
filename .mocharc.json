@@ -2,11 +2,13 @@
   "spec": [
     "tests/secret-garden.ts",
     "tests/competition.ts",
+    "tests/release-flower.ts",
     "tests/cancel.ts",
     "tests/hardening.ts",
     "tests/late-callback.ts",
     "tests/private-hint.ts",
-    "tests/mutation.ts"
+    "tests/mutation.ts",
+    "tests/bracket-generation.ts"
   ],
   "timeout": 1000000,
   "slow": 30000

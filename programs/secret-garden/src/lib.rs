@@ -191,6 +191,14 @@ pub mod secret_garden {
         instructions::finalize_round::handler(ctx)
     }
 
+    /// Returns a flower that competed in a now-Finalized round to the player's collection
+    /// (Submitted -> Active). Owner-only, and only once the round is fully Finalized —
+    /// see `ReleaseFlower` for the full constraint rationale. Does NOT touch
+    /// `total_flowers` (`submit_entry` never decremented it).
+    pub fn release_flower(ctx: Context<ReleaseFlower>) -> Result<()> {
+        instructions::release_flower::handler(ctx)
+    }
+
     // --- Stage 3A: encrypted breeding ---
 
     /// Grows a `FlowerRecord` to the current (genome-bearing) layout via Anchor's
@@ -832,6 +840,7 @@ pub mod secret_garden {
         result.ready = false;
         result.error_code = 0;
         result.bump = ctx.bumps.result;
+        result.generation = 0; // standalone verification path: no bracket, not collected
 
         let mut builder = ArgBuilder::new();
         for i in 0..MAX_PARTICIPANTS as usize {
@@ -949,6 +958,10 @@ pub mod secret_garden {
         b.final_queued = false;
         b.applied = false;
         b.bump = ctx.bumps.bracket;
+        // Bump the generation on EVERY init (init_if_needed persists the old value, so this
+        // strictly increases). Any result queued under a prior generation is now stale and
+        // rejected by collect_*/apply — this is what neutralises the re-init stale-result reuse.
+        b.generation = b.generation.wrapping_add(1);
         Ok(())
     }
 
@@ -1071,6 +1084,8 @@ pub mod secret_garden {
         result.ready = false;
         result.error_code = 0;
         result.bump = ctx.bumps.result;
+        // Stamp the CURRENT bracket generation (see collect_shard_winners for why).
+        result.generation = ctx.accounts.bracket.generation;
 
         let mut builder = ArgBuilder::new();
         for i in 0..MAX_PARTICIPANTS as usize {
@@ -1143,6 +1158,13 @@ pub mod secret_garden {
         require!(
             ctx.accounts.result.error_code == 0,
             SecretGardenError::AbortedComputation
+        );
+        // Reject a result computed under a superseded partition: after an `init_bracket`
+        // re-init bumps `bracket.generation`, any result still carrying the old generation
+        // was ranked over a DIFFERENT entry set and must not be collected.
+        require!(
+            ctx.accounts.result.generation == ctx.accounts.bracket.generation,
+            SecretGardenError::StaleRevealResult
         );
 
         let k = shard_index as usize;
@@ -1234,6 +1256,12 @@ pub mod secret_garden {
         require!(
             ctx.accounts.result.error_code == 0,
             SecretGardenError::AbortedComputation
+        );
+        // The result that decides top1/2/3 must belong to the CURRENT generation — a stale
+        // final/shard-0 record from before a re-init cannot be applied.
+        require!(
+            ctx.accounts.result.generation == ctx.accounts.bracket.generation,
+            SecretGardenError::StaleRevealResult
         );
         // Idempotent against a re-run, and refuses to overwrite a legacy reveal.
         require!(
@@ -1385,6 +1413,12 @@ pub mod secret_garden {
             SecretGardenError::InvalidShardLayout
         );
 
+        // Generation for the tier-1 result stamps. The low 32 bits of the Clock slot: unlike a
+        // counter it survives `close_tier1_bracket` + re-`init` (which zeroes the account), and
+        // since a stale result is only exploitable once MPC-ready — always many slots after
+        // this init — a re-init's slot is strictly greater, so the stamps can never collide.
+        let gen_bytes = (Clock::get()?.slot as u32).to_le_bytes();
+
         // `load_init()` (not `load_mut()`): the account was just created by `init`, so its
         // discriminator is still zero and only `load_init` will write it.
         let mut t = ctx.accounts.tier1.load_init()?;
@@ -1393,6 +1427,7 @@ pub mod secret_garden {
         t.winner_count = 0;
         t.promoted = 0;
         t.bump = ctx.bumps.tier1;
+        t.generation = gen_bytes;
         // ELEMENT-WISE, never whole-array assignment. `t.winners = [Pubkey::default(); 51]`
         // materialises a 1632-byte temporary on BPF's 4KB stack and aborts the program with
         // an access violation before it can write anything (measured: 15,259 CU then
@@ -1501,6 +1536,8 @@ pub mod secret_garden {
         result.ready = false;
         result.error_code = 0;
         result.bump = ctx.bumps.result;
+        // Tier-1 shard results are keyed to the tier1 state's generation (its init-time slot).
+        result.generation = u32::from_le_bytes(ctx.accounts.tier1.load()?.generation);
 
         let mut builder = ArgBuilder::new();
         for i in 0..MAX_PARTICIPANTS as usize {
@@ -1552,6 +1589,12 @@ pub mod secret_garden {
         let mut t = ctx.accounts.tier1.load_mut()?;
         require!(t.round == round_key, SecretGardenError::BracketRoundMismatch);
         require!(t.promoted == 0, SecretGardenError::Tier1AlreadyPromoted);
+        // Reject a tier-1 shard result queued under a superseded Tier1State (a re-init after
+        // close_tier1_bracket produces a fresh generation from a later slot).
+        require!(
+            ctx.accounts.result.generation == u32::from_le_bytes(t.generation),
+            SecretGardenError::StaleRevealResult
+        );
         require!(
             shard_index < t.shard_count,
             SecretGardenError::InvalidShardIndex
@@ -1659,6 +1702,9 @@ pub mod secret_garden {
         b.final_queued = false;
         b.applied = false;
         b.bump = ctx.bumps.bracket;
+        // Bump the semifinal bracket's generation on every promote, exactly as `init_bracket`
+        // does, so a re-promoted round cannot reuse stale semifinal/final results.
+        b.generation = b.generation.wrapping_add(1);
         // Element-wise, for the same stack reason as `init_tier1_bracket`.
         for i in 0..MAX_SHARDS {
             b.shard_sizes[i] = sizes[i];
@@ -1738,6 +1784,8 @@ pub mod secret_garden {
         result.ready = false;
         result.error_code = 0;
         result.bump = ctx.bumps.result;
+        // Semifinal results are keyed to the (promoted) bracket's generation.
+        result.generation = ctx.accounts.bracket.generation;
 
         let mut builder = ArgBuilder::new();
         for i in 0..MAX_PARTICIPANTS as usize {
@@ -1800,6 +1848,12 @@ pub mod secret_garden {
         require!(
             ctx.accounts.result.error_code == 0,
             SecretGardenError::AbortedComputation
+        );
+        // Semifinal results are keyed to the promoted bracket's generation; a re-promote bumps
+        // it and orphans any stale semifinal record.
+        require!(
+            ctx.accounts.result.generation == ctx.accounts.bracket.generation,
+            SecretGardenError::StaleRevealResult
         );
         let k = semi_index as usize;
         require!(
@@ -2287,14 +2341,20 @@ pub struct StartBreeding<'info> {
     #[account(
         mut,
         constraint = flower_a.owner == player.key() @ SecretGardenError::FlowerNotOwned,
-        constraint = flower_a.status != FLOWER_STATUS_LOCKED @ SecretGardenError::FlowerNotActive,
+        // MUST be `== ACTIVE`, not `!= LOCKED`. The old negative form admitted a SUBMITTED
+        // parent, and `breed_callback` unconditionally writes both parents back to ACTIVE on
+        // completion — so breeding mid-round silently laundered a Submitted flower back into
+        // an Active one regardless of round state, bypassing the round gate that
+        // `release_flower` exists to enforce.
+        constraint = flower_a.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
     )]
     pub flower_a: Box<Account<'info, FlowerRecord>>,
     #[account(
         mut,
         constraint = flower_b.key() != flower_a.key() @ SecretGardenError::ParentsMustBeDistinct,
         constraint = flower_b.owner == player.key() @ SecretGardenError::FlowerNotOwned,
-        constraint = flower_b.status != FLOWER_STATUS_LOCKED @ SecretGardenError::FlowerNotActive,
+        // Same `== ACTIVE` requirement as `flower_a` — see the note there.
+        constraint = flower_b.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
     )]
     pub flower_b: Box<Account<'info, FlowerRecord>>,
     #[account(

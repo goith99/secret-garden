@@ -363,6 +363,13 @@ pub struct RevealTop3V3Result {
     pub error_code: u16,
     /// PDA bump.
     pub bump: u8,
+    /// The `generation` of the bracket/tier1 state this result was queued under, stamped at
+    /// queue time and NEVER touched by the callback. `collect_*`/`apply` require it to equal
+    /// the state's CURRENT generation, so a result computed under an earlier partition (before
+    /// an `init_bracket`/`init_tier1_bracket` re-init) can no longer be reused to place a
+    /// winner that was never actually ranked against its real shard-mates. (APPENDED field —
+    /// old finalized result accounts are never re-read, so this needs no migration.)
+    pub generation: u32,
 }
 
 /// Per-round bracket tracker. PDA seeds: `[BRACKET_SEED, round]`. ADDITIVE.
@@ -407,6 +414,15 @@ pub struct BracketState {
     pub applied: bool,
     /// PDA bump.
     pub bump: u8,
+    /// Monotonic re-init counter, bumped by EVERY `init_bracket` (and `promote_tier1`) call.
+    /// Every shard/semifinal/final `RevealTop3V3Result` is stamped with the generation current
+    /// at queue time; `collect_*`/`apply` reject any result whose generation != this. That
+    /// makes a re-init (which resets `shards_collected`/`finalists` but leaves the per-shard
+    /// result PDAs intact and `ready`) unable to smuggle a stale, differently-partitioned
+    /// result back in. `BracketState` persists across re-inits (`init_if_needed`), so a plain
+    /// counter strictly increases and never collides. (APPENDED — old brackets are finalized
+    /// and never re-read, so no migration is needed.)
+    pub generation: u32,
 }
 
 impl BracketState {
@@ -466,6 +482,16 @@ pub struct Tier1State {
     pub promoted: u8,
     /// PDA bump.
     pub bump: u8,
+    /// Re-init discriminator, as little-endian `u32` bytes (a `[u8; 4]`, NOT a `u32`, so the
+    /// struct stays align-1 for zero-copy). Set at `init_tier1_bracket` to the low 32 bits of
+    /// the Clock slot; every tier-1 shard `RevealTop3V3Result` is stamped with it, and
+    /// `collect_tier1_winners` rejects a result whose generation != this. A monotonic counter
+    /// would NOT work here: `close_tier1_bracket` destroys this account and `init_tier1_bracket`
+    /// (`init`, not `init_if_needed`) recreates it zeroed, resetting a counter. The Clock slot
+    /// sidesteps that — the exploit needs a READY (MPC-complete) stale result, which is always
+    /// many slots after the original init, so a re-init's slot is strictly greater and the
+    /// stamps can never collide. (APPENDED; +4 bytes — see the size assertion below.)
+    pub generation: [u8; 4],
 }
 
 /// Layout guard. bytemuck's safe `Pod` derive already rejects implicit padding, but pinning
@@ -478,7 +504,8 @@ const _: () = assert!(
             + crate::constants::MAX_TIER1_WINNERS * 32
             + crate::constants::MAX_TIER1_SHARDS
             + crate::constants::MAX_TIER1_SHARDS
-            + 4,
+            + 4
+            + 4, // generation: [u8; 4]
     "Tier1State size changed — check for padding or a field change"
 );
 const _: () = assert!(
@@ -593,6 +620,7 @@ mod tests {
             winner_count: 0,
             promoted: 0,
             bump: 0,
+            generation: [0; 4],
         }
     }
     fn pk(b: u8) -> Pubkey {
