@@ -6,10 +6,32 @@
  *
  *   1. close_round   (skipped if the round is already closed/finalized)
  *   2. score         (auto-score every unscored CompetitionEntry)
- *   3. reveal_top3   (queue the reveal, wait for the MPC callback)
+ *   3. bracket reveal (partition -> shard reveals -> final reveal -> apply)
  *   3b. distribute   (pay the SOL prize pool from the Treasury to the top 3 winners)
  *   4. finalize_round
  *   5. open_round    (open the next round)
+ *
+ * REVEAL IS A BRACKET, NOT ONE CALL. `queue_reveal_top3` is retired from this script: Arcium
+ * rejects a queue_computation referencing 15+ distinct accounts (error 6202), and the program
+ * caps that path at MAX_PARTICIPANTS = 16 — so a real round (round 50 drew 91 entries) could
+ * never be revealed by it. Every round now goes through the bracket, whose shape depends only
+ * on the entry count:
+ *
+ *   <= 13    one shard; that shard's ranking IS the round's, so the final reveal is skipped
+ *            and apply_bracket_result(0) reads its winners directly. 1 MPC call.
+ *   14..52   a single tier of shards + a final reveal over their winners.
+ *   53..221  a tier-1 of up to 17 shards whose winners are promoted into the ordinary
+ *            single-tier bracket as semifinals, then the same final + apply.
+ *
+ * The planning + orchestration below is a PORT of the production frontend's
+ * src/program/{bracket,reveal}.ts — the same code the Operator Panel and
+ * scripts/live-reveal-round.mjs run, including byte-wise pubkey ordering and the explicit
+ * compute-unit limit on every reveal queue. Ported rather than imported because this script is
+ * deliberately standalone (Railway runs it with no access to the frontend repo).
+ *
+ * RESUMABILITY. Every bracket step is recorded on-chain (BracketState.shards_collected /
+ * final_queued, Tier1State.shard_done / promoted, per-shard result PDAs' `ready` flag), so an
+ * interrupted cycle is resumed by re-deriving what is already done and skipping it.
  *
  * It reuses the EXACT instruction-calling patterns proven in scripts/operator.ts
  * (HTTP send/confirm on Helius, public-RPC fallback for getProgramAccounts, the
@@ -47,6 +69,7 @@ import * as arcium from "@arcium-hq/client";
 import { randomBytes } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
+import { fileURLToPath } from "url";
 import type { SecretGarden } from "../target/types/secret_garden";
 
 const { PublicKey, Keypair, Connection, LAMPORTS_PER_SOL } = anchor.web3;
@@ -72,6 +95,38 @@ const PRIZE_SOL = [0.5, 0.5, 0.5];
 // ~0.000015 SOL, so 0.1 is deliberately generous); a per-payout shortfall is caught and
 // logged for retry.
 const MIN_TREASURY_SOL = 1.6;
+
+// --- bracket-reveal constants (mirror programs/secret-garden/src/constants.rs) ----------
+// Changing one here without changing it there produces a partition the program rejects.
+/** Entries per shard. One under the measured 14-account reveal ceiling. */
+const MAX_SHARD_SIZE = 13;
+/** Winners taken from each shard — what makes the bracket exact under a strict total order. */
+const SHARD_WINNERS = 3;
+/** Shards in the single tier (also the semifinal tier of a two-tier round). */
+const MAX_SHARDS = 4;
+/** Tier-1 shards in a two-tier bracket. */
+const MAX_TIER1_SHARDS = 17;
+/** Largest round one tier can reveal: 4 * 13. Past this the two-tier path is REQUIRED. */
+const SINGLE_TIER_CAPACITY = MAX_SHARDS * MAX_SHARD_SIZE; // 52
+/** Largest round the two-tier bracket can reveal: 17 * 13. */
+const TWO_TIER_CAPACITY = MAX_TIER1_SHARDS * MAX_SHARD_SIZE; // 221
+/** `shard_index` reserved for the FINAL reveal's result record (shares the shardres namespace). */
+const FINAL_SHARD_INDEX = 255;
+
+/** How often a pending reveal result is re-read. */
+const RESULT_POLL_MS = 3_000;
+/** How long a batch of queued reveals may take before the run gives up (stuck, not slow). */
+const RESULT_TIMEOUT_MS = 420_000;
+/** On resume, how long to let an already-queued-but-not-ready result land before re-queueing. */
+const RESUME_GRACE_MS = 90_000;
+
+/**
+ * Explicit compute ceiling for a reveal queue. Solana grants 200,000 CU when a tx carries no
+ * ComputeBudget instruction, and a 13-entry `queue_shard_reveal` was measured at 158,914 CU on
+ * devnet — only 20% headroom. 250,000 restores a ~57% margin for ~40 bytes of transaction.
+ * Requesting a limit does not spend it, and no CU price is set, so there is no priority fee.
+ */
+const REVEAL_CU_LIMIT = 250_000;
 
 // Each key is materialized here (under /tmp ONLY — never the project dir) and removed on
 // exit. 0600 so only the process owner can read it. The operator key (cycle signer) and the
@@ -101,6 +156,7 @@ const fatal = (msg: string): never => {
   console.error(`FATAL: ${msg}`);
   process.exit(1);
 };
+
 
 /**
  * Parse a Solana-CLI JSON-array secret key from `envVar`, write it to a 0600 temp file at
@@ -141,6 +197,132 @@ function loadKeypairFromEnv(envVar: string, tmpPath: string): anchor.web3.Keypai
   return kp!;
 }
 
+// --- bracket PLANNING (pure, chain-free; port of the frontend's src/program/bracket.ts) ---
+// The partition is the CLIENT's job — the program only VERIFIES it (strictly ascending shard
+// bounds, sizes summing to participant_count, every supplied entry inside its shard's range).
+
+/**
+ * Compare two entry addresses the way the PROGRAM does — as raw [u8; 32], byte by byte.
+ *
+ * NOT `a.toBase58() < b.toBase58()`. Base58 drops leading zero bytes, so a key beginning 0x00
+ * renders as a 43-character string that sorts LAST as text while sorting FIRST as bytes.
+ * Anchor's `Pubkey: Ord` is the byte order, so a base58-text sort silently produces a partition
+ * the program rejects with ShardEntriesOutOfRange (6037) — and only for the ~1-in-256 rounds
+ * that contain such a key, which is why it reads as an intermittent failure rather than a bug.
+ */
+function compareEntryKeys(a: PK, b: PK): number {
+  const x = a.toBytes();
+  const y = b.toBytes();
+  for (let i = 0; i < 32; i++) if (x[i] !== y[i]) return x[i] - y[i];
+  return 0;
+}
+
+/** A copy of `keys` in the program's canonical ascending order. Does not mutate the input. */
+const sortEntriesByteWise = (keys: PK[]): PK[] => [...keys].sort(compareEntryKeys);
+
+/**
+ * Split `n` items into the fewest shards of at most `max`, balanced as evenly as possible —
+ * the same arithmetic `promote_tier1` performs on-chain. Balanced rather than greedy-full
+ * matters: 53 entries become [11,11,11,10,10], not [13,13,13,13,1] (a trailing 1-entry shard
+ * is legal but spends a whole MPC call to rank a single flower).
+ */
+function planShardSizes(n: number, max: number = MAX_SHARD_SIZE): number[] {
+  if (n <= 0) return [];
+  const count = Math.max(1, Math.ceil(n / max));
+  const base = Math.floor(n / count);
+  const extra = n % count;
+  return Array.from({ length: count }, (_, i) => base + (i < extra ? 1 : 0));
+}
+
+/** How many winners a tier-1 layout produces: every shard yields min(3, size) of them. */
+const expectedTier1Winners = (sizes: number[]) =>
+  sizes.reduce((sum, s) => sum + Math.min(SHARD_WINNERS, s), 0);
+
+interface ShardPlan {
+  /** The shard's entry addresses, ascending by raw pubkey bytes. */
+  entries: PK[];
+  /** The shard's FIRST entry — recorded on-chain as shard_bounds[k]. */
+  bound: PK;
+}
+
+interface BracketPlan {
+  tier: "single" | "two";
+  entryCount: number;
+  /** Tier-1 shards for a two-tier round; the only tier of shards otherwise. */
+  shards: ShardPlan[];
+  sizes: number[];
+  /** False only for a single-shard round: that shard's ranking IS the round's ranking. */
+  finalReveal: boolean;
+  /** Semifinal sizes a two-tier round promotes into (authoritative copy is written on-chain). */
+  semifinalSizes: number[];
+}
+
+class BracketPlanError extends Error {}
+
+/**
+ * Partition a round's entries into the bracket the program will accept. `entries` may arrive
+ * in any order — it is sorted here, so callers cannot forget to.
+ */
+function planBracket(entries: PK[]): BracketPlan {
+  const sorted = sortEntriesByteWise(entries);
+  const n = sorted.length;
+  if (n === 0) throw new BracketPlanError("this round has no entries to reveal");
+  if (n > TWO_TIER_CAPACITY) {
+    throw new BracketPlanError(`${n} entries is past the bracket's ${TWO_TIER_CAPACITY}-entry ceiling`);
+  }
+
+  const tier = n > SINGLE_TIER_CAPACITY ? "two" : "single";
+  const sizes = planShardSizes(n, MAX_SHARD_SIZE);
+  const limit = tier === "two" ? MAX_TIER1_SHARDS : MAX_SHARDS;
+  if (sizes.length > limit) {
+    // Unreachable given the ceiling above; kept so a constant edited out of step with the
+    // program breaks here rather than as a rejected transaction.
+    throw new BracketPlanError(`${n} entries needs ${sizes.length} shards, past the ${limit} allowed`);
+  }
+
+  const shards: ShardPlan[] = [];
+  let cursor = 0;
+  for (const size of sizes) {
+    const chunk = sorted.slice(cursor, cursor + size);
+    shards.push({ entries: chunk, bound: chunk[0] });
+    cursor += size;
+  }
+
+  return {
+    tier,
+    entryCount: n,
+    shards,
+    sizes,
+    finalReveal: tier === "two" || shards.length > 1,
+    semifinalSizes: tier === "two" ? planShardSizes(expectedTier1Winners(sizes), MAX_SHARD_SIZE) : [],
+  };
+}
+
+/** One-line human summary of the plan, for the cycle log. */
+function describePlan(plan: BracketPlan): string {
+  const sizes = `[${plan.sizes.join(", ")}]`;
+  if (plan.tier === "single") {
+    return plan.shards.length === 1
+      ? `${plan.entryCount} entries fit one shard ${sizes} — a single reveal, no final round.`
+      : `${plan.entryCount} entries → ${plan.shards.length} shards ${sizes} → final reveal.`;
+  }
+  return `${plan.entryCount} entries → ${plan.shards.length} tier-1 shards ${sizes}`
+    + ` → ${plan.semifinalSizes.length} semifinals [${plan.semifinalSizes.join(", ")}] → final reveal.`;
+}
+
+// init_bracket / init_tier1_bracket take FIXED-LENGTH arrays and require every unused slot to
+// be zeroed, so the layout is unambiguous on-chain.
+function padNumbers(values: number[], width: number): number[] {
+  const out = new Array<number>(width).fill(0);
+  values.forEach((v, i) => (out[i] = v));
+  return out;
+}
+function padKeys(values: PK[], width: number): PK[] {
+  const out = new Array<PK>(width).fill(PublicKey.default);
+  values.forEach((v, i) => (out[i] = v));
+  return out;
+}
+
 // Player-facing flower name for a winner (matches the frontend's species map).
 const SPECIES_NAMES = [
   "Sunpetal Marigold", "Tideglass Bluebell", "Duskwisp Lavender",
@@ -167,12 +349,32 @@ interface PrizeResult {
   error?: string;
 }
 
+/**
+ * What the cycle ACTUALLY did. Every field is either a stage this run performed, or null/false
+ * because it did not — the previous shape conflated "the round this cycle looked at" with "the
+ * stage this cycle ran", so a cycle that only opened the next round still printed
+ * "Round closed: 50 (91 entries)" and "Entries scored: 0" for a round it never touched.
+ */
 interface CycleSummary {
+  /** The round this cycle worked on, whatever it did to it. Never implies an action. */
+  processedRound: number | null;
+  /** That round's on-chain participant_count, for context. */
+  entryCount: number | null;
+  /** Set ONLY when this run actually sent close_round. */
   closedRound: number | null;
-  closedEntryCount: number | null;
-  entriesScored: number;
+  /** The round's REAL on-chain scored_count, read on every path (not a per-run tally). */
+  scoredCount: number;
+  /** How many entries THIS run scored itself. */
+  scoredThisRun: number;
+  /** ALWAYS player wallets, resolved through the entry→player map on every path. */
   top3: string[];
   prizes: PrizeResult[];
+  /** True when the reveal ran in a PRIOR run, so this run deliberately did not distribute. */
+  revealedPreviously: boolean;
+  /** True when the round was already FINALIZED when the cycle started — i.e. finalized
+   *  OUTSIDE auto-cycle, so no prize distribution was ever run by a cycle. */
+  externallyFinalized: boolean;
+  /** Set ONLY when this run actually sent finalize_round. */
   finalizedRound: number | null;
   openedRound: number | null;
 }
@@ -215,6 +417,22 @@ async function main(): Promise<void> {
     [Buffer.from("round"), u64le(id)], program.programId)[0];
   const entryPda = (round: PK, player: PK) => PublicKey.findProgramAddressSync(
     [Buffer.from("entry"), round.toBuffer(), player.toBuffer()], program.programId)[0];
+
+  // --- bracket-reveal PDAs (seeds per constants.rs) ---
+  /** Per-round BracketState. Also the SEMIFINAL tier of a two-tier round — promote_tier1
+   *  writes the semifinal partition into this same account. */
+  const bracketPda = (round: PK) => PublicKey.findProgramAddressSync(
+    [Buffer.from("bracket"), round.toBuffer()], program.programId)[0];
+  /** Per-round Tier1State. Its very ABSENCE is what selects the single-tier code path. */
+  const tier1Pda = (round: PK) => PublicKey.findProgramAddressSync(
+    [Buffer.from("tier1"), round.toBuffer()], program.programId)[0];
+  /** A shard reveal's result record. Index 255 is the FINAL reveal's, sharing this namespace. */
+  const shardResultPda = (round: PK, shardIndex: number) => PublicKey.findProgramAddressSync(
+    [Buffer.from("shardres"), round.toBuffer(), Buffer.from([shardIndex])], program.programId)[0];
+  /** A semifinal reveal's result record. A SEPARATE namespace from shardres, or tier-1 shard k
+   *  and semifinal k would collide on one address. */
+  const semiResultPda = (round: PK, semiIndex: number) => PublicKey.findProgramAddressSync(
+    [Buffer.from("semires"), round.toBuffer(), Buffer.from([semiIndex])], program.programId)[0];
 
   const freshOffset = () => new BN(randomBytes(8), "hex");
   const compDefAccOf = (circuit: string) => arcium.getCompDefAccAddress(
@@ -272,14 +490,400 @@ async function main(): Promise<void> {
   // Enumerate every CompetitionEntry of a round via the public RPC (Helius free tier blocks
   // getProgramAccounts). The first field `round: pubkey` sits at offset 8 (after the
   // 8-byte discriminator). Decoded with the program's own coder.
+  //
+  // THE DISCRIMINATOR FILTER IS LOAD-BEARING. `round` at offset 8 is NOT unique to
+  // CompetitionEntry: BracketState, Tier1State and RevealTop3V3Result all store the round
+  // pubkey in the same position, so a round that has been through a bracket reveal matches
+  // extra accounts — 103 instead of 91 for devnet round 50 — and decoding one of those as a
+  // CompetitionEntry throws "Invalid account discriminator", aborting the cycle mid-flight.
+  // Filtering server-side on the 8-byte discriminator returns only genuine entries; the
+  // defensive skip below is a second layer in case a future account type is added with the
+  // same discriminator prefix (it cannot be, but the cycle should degrade rather than die).
+  const entryDiscriminator = program.coder.accounts.memcmp("competitionEntry") as {
+    offset: number; bytes: string;
+  };
   async function entriesForRound(round: PK): Promise<any[]> {
     const accounts = await publicConn.getProgramAccounts(program.programId, {
-      filters: [{ memcmp: { offset: 8, bytes: round.toBase58() } }],
+      filters: [
+        { memcmp: { offset: entryDiscriminator.offset, bytes: entryDiscriminator.bytes } },
+        { memcmp: { offset: 8, bytes: round.toBase58() } },
+      ],
     });
-    return accounts.map((a) => ({
-      pubkey: a.pubkey as PK,
-      ...(program.coder.accounts.decode("competitionEntry", a.account.data) as any),
-    }));
+    const out: any[] = [];
+    for (const a of accounts) {
+      try {
+        out.push({
+          pubkey: a.pubkey as PK,
+          ...(program.coder.accounts.decode("competitionEntry", a.account.data) as any),
+        });
+      } catch {
+        console.log(`  (skipping ${a.pubkey.toBase58()} — matched the round filter but is not a CompetitionEntry)`);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Resolve a round's top1/top2/top3 to PLAYER WALLETS.
+   *
+   * round.topN holds the winning ENTRY pubkey, never the player's — printing them raw is what
+   * made the round-50 summary list three addresses that looked like unknown winners but were
+   * actually the correct winners' entry PDAs. Every path that reports winners goes through
+   * here, so the healthy path and the skip paths can never disagree again. Unfilled ranks
+   * (fewer than three entrants) are omitted.
+   */
+  async function resolveWinnerWallets(round: PK, r: any): Promise<{ rank: number; wallet: PK }[]> {
+    const entries = await entriesForRound(round);
+    const byEntry = new Map<string, PK>(entries.map((e) => [(e.pubkey as PK).toBase58(), e.player as PK]));
+    const out: { rank: number; wallet: PK }[] = [];
+    [r.top1, r.top2, r.top3].forEach((entryPk: PK, idx: number) => {
+      if (entryPk.equals(PublicKey.default)) return; // unfilled rank
+      const player = byEntry.get(entryPk.toBase58());
+      if (player) out.push({ rank: idx + 1, wallet: player });
+      else console.log(`  ⚠ rank ${idx + 1}: entry ${entryPk.toBase58()} has no matching entry account`);
+    });
+    return out;
+  }
+
+  // ======================================================================================
+  // BRACKET REVEAL ORCHESTRATION
+  // Port of the frontend's src/program/reveal.ts — the same sequence the Operator Panel and
+  // scripts/live-reveal-round.mjs run. Every step is idempotent against the chain state it
+  // reads first, so an interrupted cycle resumes rather than restarting.
+  // ======================================================================================
+
+  /** `tx` with an explicit compute-unit ceiling prepended. Does not mutate the input. */
+  function withComputeUnitLimit(tx: anchor.web3.Transaction, units: number): anchor.web3.Transaction {
+    const out = new anchor.web3.Transaction().add(
+      anchor.web3.ComputeBudgetProgram.setComputeUnitLimit({ units }));
+    tx.instructions.forEach((ix) => out.add(ix));
+    return out;
+  }
+
+  const metas = (keys: PK[]) => keys.map((pubkey) => ({ pubkey, isWritable: false, isSigner: false }));
+
+  /** True once the computation's callback has written a usable result. */
+  const resultReady = (res: any): boolean => !!res && res.ready && res.errorCode === 0;
+
+  const fetchResults = async (pdas: PK[]): Promise<any[]> =>
+    pdas.length === 0 ? [] : await program.account.revealTop3V3Result.fetchMultiple(pdas);
+
+  /** Load a round's Tier1State. "stale" = the account exists but no longer decodes (a layout
+   *  change), recoverable only by closing and re-pinning it. */
+  async function loadTier1(tier1: PK): Promise<any | "stale" | null> {
+    try {
+      return await program.account.tier1State.fetchNullable(tier1);
+    } catch {
+      const info = await conn.getAccountInfo(tier1);
+      return info ? ("stale" as const) : null;
+    }
+  }
+
+  /** Does the partition already pinned on-chain match the one we just computed? */
+  function partitionMatches(onChain: any, plan: BracketPlan): boolean {
+    if (!onChain) return false;
+    if (onChain.shardCount !== plan.shards.length) return false;
+    return plan.shards.every((s, i) =>
+      s.entries.length === onChain.shardSizes[i] && s.bound.equals(onChain.shardBounds[i]));
+  }
+
+  /** Poll a set of result PDAs until every one is ready, reporting each landing. */
+  async function awaitResults(pdas: PK[], timeoutMs: number, label: string): Promise<number> {
+    if (pdas.length === 0) return 0;
+    const deadline = Date.now() + timeoutMs;
+    let ready = 0;
+    while (Date.now() < deadline) {
+      const results = await fetchResults(pdas);
+      const n = results.filter(resultReady).length;
+      if (n !== ready) {
+        ready = n;
+        console.log(`    ${label}: ${ready}/${pdas.length} results back`);
+      }
+      if (ready === pdas.length) return ready;
+      await sleep(RESULT_POLL_MS);
+    }
+    return ready;
+  }
+
+  /**
+   * The three tiers of the bracket — single-tier shards, tier-1 shards and semifinals — are the
+   * same shape: reveal every shard, then collect every shard's winners. Only the instructions
+   * and the "already collected" bit differ, so they share one driver.
+   *
+   * `forceRequeue` is set when the partition was just re-pinned: any result computed under the
+   * OLD partition ranked a different set of entries, so it must not be trusted even though its
+   * `ready` flag is set.
+   */
+  async function runTier(
+    spec: {
+      count: number;
+      noun: string;
+      resultPda: (k: number) => PK;
+      queue: (k: number) => Promise<void>;
+      collected: (k: number) => Promise<boolean>;
+      collect: (k: number) => Promise<void>;
+    },
+    forceRequeue: boolean,
+  ): Promise<void> {
+    const indices = Array.from({ length: spec.count }, (_, k) => k);
+    const pdas = indices.map(spec.resultPda);
+    const existing = await fetchResults(pdas);
+
+    // Split the shards three ways: already revealed (nothing to do), queued-but-not-ready
+    // (possibly still in flight), and never queued.
+    let needQueue = indices.filter((k) => forceRequeue || !resultReady(existing[k]));
+    if (!forceRequeue) {
+      const inFlight = needQueue.filter((k) => existing[k] !== null);
+      if (inFlight.length > 0) {
+        console.log(`    ${inFlight.length} ${spec.noun}(s) already in flight — waiting up to ${RESUME_GRACE_MS / 1000}s`);
+        await awaitResults(inFlight.map(spec.resultPda), RESUME_GRACE_MS, `${spec.noun} (resume)`);
+        const settled = await fetchResults(pdas);
+        needQueue = indices.filter((k) => !resultReady(settled[k]));
+      }
+    }
+
+    // Queued back-to-back with no pacing — a devnet mempool-rate probe showed 20 reveal-weight
+    // computations fired as fast as the RPC accepted them all landed (no 6103, no 6602), so the
+    // MPC calls run concurrently instead of waiting ~40s per shard in series.
+    for (let i = 0; i < needQueue.length; i++) {
+      const k = needQueue[i];
+      console.log(`    queueing ${spec.noun} ${i + 1}/${needQueue.length} (index ${k})`);
+      await spec.queue(k);
+    }
+
+    if (needQueue.length > 0) {
+      const landed = await awaitResults(needQueue.map(spec.resultPda), RESULT_TIMEOUT_MS, spec.noun);
+      if (landed < needQueue.length) {
+        throw new Error(
+          `only ${landed} of ${needQueue.length} ${spec.noun} results came back in time — `
+          + `nothing is lost, the next run resumes from here`);
+      }
+    }
+
+    for (let i = 0; i < spec.count; i++) {
+      if (await spec.collected(i)) continue;
+      console.log(`    collecting ${spec.noun} ${i + 1}/${spec.count}`);
+      await spec.collect(i);
+    }
+  }
+
+  /** Single tier: pin the partition, reveal + collect every shard. */
+  async function runSingleTier(round: PK, plan: BracketPlan): Promise<void> {
+    const bracket = bracketPda(round);
+    const existing = await program.account.bracketState.fetchNullable(bracket);
+    const matches = partitionMatches(existing, plan);
+    const repin = !!existing && !matches;
+
+    if (!matches) {
+      // init_bracket is `init_if_needed` and rewrites every field, so a bracket pinned from a
+      // bad ordering is cleanly reset without closing anything.
+      console.log(`    ${repin ? "re-pinning" : "pinning"} the shard partition (${plan.shards.length} shard(s))`);
+      const tx = await program.methods
+        .initBracket(padNumbers(plan.sizes, MAX_SHARDS),
+          padKeys(plan.shards.map((s) => s.bound), MAX_SHARDS), plan.shards.length)
+        .accountsPartial({ authority: signer.publicKey, config: configPda, round, bracket })
+        .transaction();
+      await sendTxHttp(tx, "initBracket");
+    }
+
+    await runTier({
+      count: plan.shards.length,
+      noun: "shard",
+      resultPda: (k) => shardResultPda(round, k),
+      queue: async (k) => {
+        const offset = freshOffset();
+        const tx = await program.methods.queueShardReveal(offset, k)
+          .accountsPartial({
+            authority: signer.publicKey, config: configPda, round, bracket,
+            result: shardResultPda(round, k),
+            ...queueAccsFor("reveal_top3_v3", offset),
+          })
+          .remainingAccounts(metas(plan.shards[k].entries))
+          .transaction();
+        await sendTxHttp(withComputeUnitLimit(tx, REVEAL_CU_LIMIT), `queueShardReveal[${k}]`);
+      },
+      collected: async (k) => {
+        const b: any = await program.account.bracketState.fetch(bracket);
+        return (b.shardsCollected & (1 << k)) !== 0;
+      },
+      collect: async (k) => {
+        const tx = await program.methods.collectShardWinners(k)
+          .accountsPartial({
+            authority: signer.publicKey, config: configPda, round, bracket,
+            result: shardResultPda(round, k),
+          })
+          .remainingAccounts(metas(plan.shards[k].entries))
+          .transaction();
+        await sendTxHttp(tx, `collectShardWinners[${k}]`);
+      },
+    }, repin);
+  }
+
+  /** Two tiers: pin tier-1, reveal + collect its shards, promote, then run the semifinals as
+   *  an ordinary BracketState (promote_tier1 wrote that partition on-chain — it is READ here,
+   *  never guessed). */
+  async function runTwoTier(round: PK, plan: BracketPlan): Promise<void> {
+    const bracket = bracketPda(round);
+    const tier1 = tier1Pda(round);
+
+    const existing = await loadTier1(tier1);
+    const stale = existing === "stale";
+    const decoded = stale ? null : existing;
+    const matches = partitionMatches(decoded, plan);
+    // A promoted tier 1 is finished and its winners are already in BracketState — never disturb
+    // it, even if the pinned partition looks unfamiliar.
+    const promoted = !!decoded && decoded.promoted !== 0;
+    const repin = !promoted && (stale || (!!decoded && !matches));
+
+    if (repin && (stale || decoded)) {
+      // init_tier1_bracket is `init`, NOT `init_if_needed` — pinning is one-shot, so re-pinning
+      // has to be an explicit close first.
+      console.log(`    clearing the stale tier-1 partition`);
+      const tx = await program.methods.closeTier1Bracket()
+        .accountsPartial({ authority: signer.publicKey, config: configPda, round, tier1 })
+        .transaction();
+      await sendTxHttp(tx, "closeTier1Bracket");
+    }
+
+    if (!decoded || repin) {
+      console.log(`    pinning the tier-1 partition (${plan.shards.length} shards)`);
+      const tx = await program.methods
+        .initTier1Bracket(padNumbers(plan.sizes, MAX_TIER1_SHARDS),
+          padKeys(plan.shards.map((s) => s.bound), MAX_TIER1_SHARDS), plan.shards.length)
+        .accountsPartial({ authority: signer.publicKey, config: configPda, round, tier1 })
+        .transaction();
+      await sendTxHttp(tx, "initTier1Bracket");
+    }
+
+    if (!promoted) {
+      await runTier({
+        count: plan.shards.length,
+        noun: "tier-1 shard",
+        resultPda: (k) => shardResultPda(round, k),
+        queue: async (k) => {
+          const offset = freshOffset();
+          const tx = await program.methods.queueTier1ShardReveal(offset, k)
+            .accountsPartial({
+              authority: signer.publicKey, config: configPda, round, tier1,
+              result: shardResultPda(round, k),
+              ...queueAccsFor("reveal_top3_v3", offset),
+            })
+            .remainingAccounts(metas(plan.shards[k].entries))
+            .transaction();
+          await sendTxHttp(withComputeUnitLimit(tx, REVEAL_CU_LIMIT), `queueTier1ShardReveal[${k}]`);
+        },
+        collected: async (k) => {
+          const t: any = await program.account.tier1State.fetch(tier1);
+          return t.shardDone[k] !== 0;
+        },
+        collect: async (k) => {
+          const tx = await program.methods.collectTier1Winners(k)
+            .accountsPartial({
+              authority: signer.publicKey, config: configPda, round, tier1,
+              result: shardResultPda(round, k),
+            })
+            .remainingAccounts(metas(plan.shards[k].entries))
+            .transaction();
+          await sendTxHttp(tx, `collectTier1Winners[${k}]`);
+        },
+      }, repin);
+
+      console.log(`    promoting tier-1 winners to the semifinals`);
+      const tx = await program.methods.promoteTier1()
+        .accountsPartial({ authority: signer.publicKey, config: configPda, round, tier1, bracket })
+        .transaction();
+      await sendTxHttp(tx, "promoteTier1");
+    }
+
+    const t1: any = await program.account.tier1State.fetch(tier1);
+    const b: any = await program.account.bracketState.fetch(bracket);
+    const semis = b.shardCount;
+    const winners: PK[] = t1.winners.slice(0, t1.winnerCount);
+    const sliceFor = (k: number) => {
+      const start = b.shardSizes.slice(0, k).reduce((a: number, s: number) => a + s, 0);
+      return winners.slice(start, start + b.shardSizes[k]);
+    };
+
+    await runTier({
+      count: semis,
+      noun: "semifinal",
+      resultPda: (k) => semiResultPda(round, k),
+      queue: async (k) => {
+        const offset = freshOffset();
+        const tx = await program.methods.queueSemifinalReveal(offset, k)
+          .accountsPartial({
+            authority: signer.publicKey, config: configPda, round, tier1, bracket,
+            result: semiResultPda(round, k),
+            ...queueAccsFor("reveal_top3_v3", offset),
+          })
+          .remainingAccounts(metas(sliceFor(k)))
+          .transaction();
+        await sendTxHttp(withComputeUnitLimit(tx, REVEAL_CU_LIMIT), `queueSemifinalReveal[${k}]`);
+      },
+      collected: async (k) => {
+        const cur: any = await program.account.bracketState.fetch(bracket);
+        return (cur.shardsCollected & (1 << k)) !== 0;
+      },
+      // No entry accounts: the slice is Tier1State.winners[start..], already on-chain.
+      collect: async (k) => {
+        const tx = await program.methods.collectSemifinalWinners(k)
+          .accountsPartial({
+            authority: signer.publicKey, config: configPda, round, tier1, bracket,
+            result: semiResultPda(round, k),
+          })
+          .transaction();
+        await sendTxHttp(tx, `collectSemifinalWinners[${k}]`);
+      },
+    }, false);
+  }
+
+  /**
+   * Run the whole bracket reveal for `round`, from wherever it stands to scoring_revealed.
+   * Returns the plan actually used, for the cycle log.
+   */
+  async function runBracketReveal(round: PK, entryKeys: PK[]): Promise<BracketPlan> {
+    const plan = planBracket(entryKeys);
+    console.log(`  plan: ${describePlan(plan)}`);
+
+    if (plan.tier === "two") await runTwoTier(round, plan);
+    else await runSingleTier(round, plan);
+
+    // ---- FINAL reveal + apply. Identical for both tiers: by this point BracketState holds the
+    // finalists either way, so the two-tier path rejoins the single-tier code here.
+    const bracket = bracketPda(round);
+    const single = plan.shards.length === 1 && plan.tier === "single";
+    const finalIndex = single ? 0 : FINAL_SHARD_INDEX;
+    const finalResult = shardResultPda(round, finalIndex);
+
+    if (!single) {
+      const b: any = await program.account.bracketState.fetch(bracket);
+      if (!b.finalQueued) {
+        // The program checks the supplied finalists against BracketState.finalists and requires
+        // them ascending, so they are re-sorted here — collection order is rank order, not
+        // pubkey order.
+        const finalists = sortEntriesByteWise(b.finalists.slice(0, b.finalistCount));
+        console.log(`    final reveal over ${finalists.length} finalists`);
+        const offset = freshOffset();
+        const tx = await program.methods.queueShardReveal(offset, FINAL_SHARD_INDEX)
+          .accountsPartial({
+            authority: signer.publicKey, config: configPda, round, bracket,
+            result: finalResult,
+            ...queueAccsFor("reveal_top3_v3", offset),
+          })
+          .remainingAccounts(metas(finalists))
+          .transaction();
+        await sendTxHttp(withComputeUnitLimit(tx, REVEAL_CU_LIMIT), "queueShardReveal[FINAL]");
+      }
+      const landed = await awaitResults([finalResult], RESULT_TIMEOUT_MS, "final reveal");
+      if (landed === 0) throw new Error("the final reveal did not come back in time — the next run resumes it");
+    }
+
+    console.log(`    applying the bracket result (writing winners on-chain)`);
+    const tx = await program.methods.applyBracketResult(finalIndex)
+      .accountsPartial({ authority: signer.publicKey, config: configPda, round, bracket, result: finalResult })
+      .transaction();
+    await sendTxHttp(tx, "applyBracketResult");
+    return plan;
   }
 
   // Persist a finished round's results to Supabase (same pattern as operator.ts). Skipped
@@ -403,8 +1007,10 @@ async function main(): Promise<void> {
 
   const current = cfg.currentRound.toNumber();
   const summary: CycleSummary = {
-    closedRound: null, closedEntryCount: null, entriesScored: 0,
-    top3: [], prizes: [], finalizedRound: null, openedRound: null,
+    processedRound: null, entryCount: null, closedRound: null,
+    scoredCount: 0, scoredThisRun: 0, top3: [], prizes: [],
+    revealedPreviously: false, externallyFinalized: false,
+    finalizedRound: null, openedRound: null,
   };
 
   // First-ever run (no round opened yet): there is nothing to close/score/reveal/finalize —
@@ -421,19 +1027,44 @@ async function main(): Promise<void> {
 
   // ---------------------------------------------------------------- 1. CLOSE
   let r: any = await program.account.competitionRound.fetch(round);
+  summary.processedRound = current;
+  summary.entryCount = r.participantCount;
   console.log(`\n[close] round ${current} is ${ROUND_STATUS_NAME[r.status]}, ${r.participantCount} entries`);
+
+  // A round already FINALIZED when the cycle STARTS was finalized by something other than a
+  // cycle — a manual bracket reveal, the operator panel, or a partial run someone finished by
+  // hand. That path has no prize step, and the reveal branch below will (correctly) skip
+  // distribution, so without this warning the run reports "no payouts this run" for a round
+  // whose winners may never have been paid at all. Devnet round 50 is exactly that case: 91
+  // entrants, finalized manually on 2026-08-09, 1.5 SOL of prizes never sent.
+  if (r.status === ROUND_STATUS_FINALIZED) {
+    summary.externallyFinalized = true;
+    console.log(`\n  ${"!".repeat(72)}`);
+    console.log(`  ⚠ ACTION REQUIRED — ROUND ${current} WAS FINALIZED EXTERNALLY`);
+    console.log(`    This round was already FINALIZED before the cycle started, so it was`);
+    console.log(`    finalized OUTSIDE auto-cycle (manual reveal / operator panel).`);
+    console.log(`    PRIZE DISTRIBUTION WAS NOT RUN BY THIS CYCLE — auto-cycle only pays after a`);
+    console.log(`    reveal it performed itself. Verify manually whether prizes are owed for`);
+    console.log(`    round ${current} and pay them if so. This cycle will only open the next round.`);
+    console.log(`  ${"!".repeat(72)}`);
+  }
+
   if (r.status === ROUND_STATUS_OPEN) {
     const tx = await program.methods.closeRound()
       .accountsPartial({ authority: signer.publicKey, config: configPda, round }).transaction();
     await sendTxHttp(tx, `closeRound(${current})`);
     r = await program.account.competitionRound.fetch(round);
+    // Set ONLY here: this run genuinely closed the round.
+    summary.closedRound = current;
+    summary.entryCount = r.participantCount;
     console.log(`  ✓ round ${current} closed (${r.participantCount} entries)`);
   } else {
     console.log(`  ↪ skipping close — round already ${ROUND_STATUS_NAME[r.status]}`);
   }
-  summary.closedRound = current;
-  summary.closedEntryCount = r.participantCount;
 
+  // The round's REAL scored_count, read on every path so a skipped scoring stage reports what
+  // is actually on-chain rather than the zero-initialised per-run tally.
+  summary.scoredCount = r.scoredCount;
   const hasEntries = r.participantCount > 0;
 
   // ---------------------------------------------------------------- 2. SCORE
@@ -468,26 +1099,30 @@ async function main(): Promise<void> {
         await sleep(1000);
       }
       if (!scored) throw new Error(`entry ${short(e.player as PK)} did not reach scored=true after MPC`);
+      summary.scoredThisRun += 1;
       console.log(`    ✓ scored`);
     }
     const after: any = await program.account.competitionRound.fetch(round);
-    summary.entriesScored = after.scoredCount;
+    summary.scoredCount = after.scoredCount;
     console.log(`  ✓ all entries scored (scoredCount=${after.scoredCount})`);
   }
 
   // --------------------------------------------------------------- 3. REVEAL
+  // Always via the BRACKET (see the header). Winners are resolved to PLAYER WALLETS on every
+  // path through resolveWinnerWallets, so the summary can never again print raw entry PDAs.
   r = await program.account.competitionRound.fetch(round);
   if (r.status === ROUND_STATUS_FINALIZED) {
-    console.log(`\n[reveal] skipping — round ${current} already FINALIZED`);
-    summary.top3 = [r.top1, r.top2, r.top3].map((p: PK) => p.toBase58());
+    console.log(`\n[reveal] skipping — round ${current} already FINALIZED (see the warning above)`);
+    summary.top3 = (await resolveWinnerWallets(round, r)).map((w) => w.wallet.toBase58());
   } else if (r.scoringRevealed) {
     // Resumed run: reveal already happened previously, so prizes were (or should have been)
     // paid by that run. We do NOT auto-distribute again — there is no on-chain payout ledger,
     // so re-paying here would double-pay. Surface it for manual verification instead.
+    summary.revealedPreviously = true;
     console.log(`\n[reveal] already revealed in a prior run — reusing stored winners`);
     console.log(`  ⚠ NOT auto-distributing prizes (double-pay guard). If the prior run's payouts`);
     console.log(`    did not complete, verify on-chain and pay the affected winner(s) manually.`);
-    summary.top3 = [r.top1, r.top2, r.top3].map((p: PK) => p.toBase58());
+    summary.top3 = (await resolveWinnerWallets(round, r)).map((w) => w.wallet.toBase58());
   } else if (!hasEntries) {
     console.log(`\n[reveal] skipping — round ${current} has 0 entries (nothing to rank)`);
   } else {
@@ -499,50 +1134,24 @@ async function main(): Promise<void> {
     if (scored.length !== r.participantCount) {
       throw new Error(`found ${scored.length} scored entries but participantCount=${r.participantCount}`);
     }
-    const remaining = scored.map((e) => ({
-      pubkey: e.pubkey as PK, isWritable: false, isSigner: false,
-    }));
-    const offset = freshOffset();
-    const tx = await program.methods.queueRevealTop3(offset)
-      .accountsPartial({ authority: signer.publicKey, round, ...queueAccsFor("reveal_top3", offset) })
-      .remainingAccounts(remaining)
-      .transaction();
-    await sendTxHttp(tx, "queueRevealTop3");
-    console.log(`\n[reveal] queued; awaiting MPC finalization...`);
-    await arcium.awaitComputationFinalization(
-      provider, offset, program.programId, "confirmed", 360000);
 
-    let revealed = false;
-    let rr: any;
-    for (let k = 0; k < 180; k++) {
-      rr = await program.account.competitionRound.fetch(round);
-      if (rr.scoringRevealed) { revealed = true; break; }
-      await sleep(1000);
+    console.log(`\n[reveal] running the bracket for round ${current} (${scored.length} entries)`);
+    await runBracketReveal(round, scored.map((e) => e.pubkey as PK));
+
+    const rr: any = await program.account.competitionRound.fetch(round);
+    if (!rr.scoringRevealed) {
+      throw new Error("bracket applied but round.scoringRevealed never flipped");
     }
-    if (!revealed) throw new Error("reveal MPC finalized but round.scoringRevealed never flipped");
 
-    const byEntry = new Map(scored.map((e) => [(e.pubkey as PK).toBase58(), e.player as PK]));
-    const winner = (entry: PK) => {
-      const p = byEntry.get(entry.toBase58());
-      return p ? p.toBase58() : `(entry ${entry.toBase58()})`;
-    };
-    summary.top3 = [winner(rr.top1), winner(rr.top2), winner(rr.top3)];
+    // Resolve each filled rank to its PLAYER WALLET (round.topN holds the winning ENTRY
+    // pubkey; the prize goes to the player, not the entry account).
+    const winnerWallets = await resolveWinnerWallets(round, rr);
+    summary.top3 = winnerWallets.map((w) => w.wallet.toBase58());
     console.log(`  ✓ winners revealed:`);
-    console.log(`    1st: ${summary.top3[0]}`);
-    console.log(`    2nd: ${summary.top3[1]}`);
-    console.log(`    3rd: ${summary.top3[2]}`);
+    winnerWallets.forEach((w) => console.log(`    ${w.rank}: ${w.wallet.toBase58()}`));
     await saveResultsToSupabase(current, rr, scored);
 
     // --- PRIZE DISTRIBUTION (after a successful reveal, before finalize) ---
-    // Resolve each filled rank to its PLAYER WALLET (round.topN holds the winning ENTRY
-    // pubkey; the prize goes to the player, not the entry account). Ranks beyond
-    // participant_count are Pubkey::default and skipped.
-    const winnerWallets: { rank: number; wallet: PK }[] = [];
-    [rr.top1, rr.top2, rr.top3].forEach((entryPk: PK, idx: number) => {
-      if (entryPk.equals(PublicKey.default)) return; // unfilled rank (< idx+1 participants)
-      const player = byEntry.get(entryPk.toBase58());
-      if (player) winnerWallets.push({ rank: idx + 1, wallet: player });
-    });
     console.log(`\n[distribute] paying prize pool from treasury to ${winnerWallets.length} winner(s)...`);
     summary.prizes = await distributePrizes(winnerWallets);
   }
@@ -555,9 +1164,10 @@ async function main(): Promise<void> {
     const tx = await program.methods.finalizeRound()
       .accountsPartial({ authority: signer.publicKey, config: configPda, round }).transaction();
     await sendTxHttp(tx, `finalizeRound(${current})`);
+    // Set ONLY here: this run genuinely finalized the round.
+    summary.finalizedRound = current;
     console.log(`\n[finalize] ✓ round ${current} finalized`);
   }
-  summary.finalizedRound = current;
 
   // ----------------------------------------------------------------- 5. OPEN
   console.log(`\n[open] opening round ${current + 1}`);
@@ -599,12 +1209,24 @@ function printSummary(s: CycleSummary, operatorSol: number, treasurySol: number)
   console.log(`\n${line}`);
   console.log(`AUTO-CYCLE COMPLETE`);
   console.log(line);
-  console.log(`  Round closed       : ${s.closedRound ?? "—"}`
-    + (s.closedEntryCount === null ? "" : ` (${s.closedEntryCount} entries)`));
-  console.log(`  Entries scored     : ${s.entriesScored}`);
-  console.log(`  Top 3 revealed     : ${s.top3.length ? "" : "—"}`);
+  // Every line states what THIS RUN did. A stage the run skipped says so explicitly rather
+  // than borrowing the round's number and reading as though it had happened.
+  console.log(`  Round processed    : ${s.processedRound ?? "—"}`
+    + (s.entryCount === null ? "" : ` (${s.entryCount} entries)`));
+  console.log(`  Round closed       : ${s.closedRound === null
+    ? "— (not closed by this run)" : s.closedRound}`);
+  console.log(`  Entries scored     : ${s.scoredThisRun} by this run`
+    + ` (round total on-chain: ${s.scoredCount}${s.entryCount === null ? "" : `/${s.entryCount}`})`);
+  console.log(`  Top 3 (wallets)    : ${s.top3.length ? "" : "—"}`);
   s.top3.forEach((w, i) => console.log(`    ${i + 1}. ${w}`));
-  console.log(`  Prize distribution : ${s.prizes.length ? "" : "— (no payouts this run)"}`);
+  const noPayoutReason = s.externallyFinalized
+    ? "— NOT RUN (round finalized externally — verify prizes manually)"
+    : s.revealedPreviously
+      ? "— not run (already revealed by a prior run; double-pay guard)"
+      : s.top3.length === 0
+        ? "— (no winners to pay)"
+        : "— (no payouts this run)";
+  console.log(`  Prize distribution : ${s.prizes.length ? "" : noPayoutReason}`);
   s.prizes.forEach((p) =>
     console.log(`    rank ${p.rank}: ${p.amountSol} SOL -> ${p.wallet}  [${p.ok ? "SENT" : "FAILED"}]`
       + (p.ok || !p.error ? "" : ` (${p.error})`)));
@@ -613,16 +1235,45 @@ function printSummary(s: CycleSummary, operatorSol: number, treasurySol: number)
     console.log(`    ⚠ ${failed.length} payout(s) FAILED — retry manually: `
       + failed.map((p) => `rank ${p.rank} (${p.amountSol} SOL -> ${p.wallet})`).join(", "));
   }
-  console.log(`  Round finalized    : ${s.finalizedRound ?? "—"}`);
+  console.log(`  Round finalized    : ${s.finalizedRound === null
+    ? (s.externallyFinalized ? "— (was already finalized externally)" : "— (not finalized by this run)")
+    : s.finalizedRound}`);
   console.log(`  New round opened   : ${s.openedRound ?? "—"}`);
   console.log(`  Operator balance   : ${operatorSol.toFixed(4)} SOL`);
   console.log(`  Treasury balance   : ${treasurySol.toFixed(4)} SOL`);
+  if (s.externallyFinalized) {
+    console.log(line);
+    console.log(`  ⚠ Round ${s.processedRound} was finalized OUTSIDE auto-cycle. No prizes were`);
+    console.log(`    distributed by this cycle. Verify manually whether prizes are owed.`);
+  }
   console.log(line);
 }
 
-main()
-  .then(() => process.exit(0)) // temp key removed by the process 'exit' handler
-  .catch((e) => {
-    console.error(`\nAUTO-CYCLE FAILED: ${(e as Error).message}`);
-    process.exit(1);
-  });
+/**
+ * Run the cycle only when this file is the process ENTRY POINT.
+ *
+ * Importing it (tests/auto-cycle-bracket.ts exercises the pure partition planner against every
+ * round size the program accepts) must not launch a live cycle against devnet. Railway invokes
+ * it directly — `node --experimental-strip-types scripts/auto-cycle.ts` — which still matches.
+ */
+const isEntryPoint =
+  !!process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isEntryPoint) {
+  main()
+    .then(() => process.exit(0)) // temp key removed by the process 'exit' handler
+    .catch((e) => {
+      console.error(`\nAUTO-CYCLE FAILED: ${(e as Error).message}`);
+      process.exit(1);
+    });
+}
+
+// Exported for tests ONLY — the pure, chain-free partition planner. Nothing here touches the
+// network, a keypair or the program.
+export {
+  compareEntryKeys, sortEntriesByteWise, planShardSizes, expectedTier1Winners,
+  planBracket, describePlan, padNumbers, padKeys, BracketPlanError,
+  MAX_SHARD_SIZE, MAX_SHARDS, MAX_TIER1_SHARDS, SHARD_WINNERS,
+  SINGLE_TIER_CAPACITY, TWO_TIER_CAPACITY, FINAL_SHARD_INDEX,
+};
+export type { BracketPlan, ShardPlan };
