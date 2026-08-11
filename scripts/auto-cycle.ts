@@ -120,6 +120,53 @@ const RESULT_TIMEOUT_MS = 420_000;
 /** On resume, how long to let an already-queued-but-not-ready result land before re-queueing. */
 const RESUME_GRACE_MS = 90_000;
 
+/** How long to wait for one scoring computation's callback before treating it as hung. */
+const SCORE_FINALIZE_TIMEOUT_MS = 360_000;
+/**
+ * MIRRORS `SCORE_TIMEOUT_SECONDS` in programs/secret-garden/src/constants.rs.
+ *
+ * `cancel_stuck_score` refuses to clear an in-flight entry until this much time has elapsed
+ * since `queued_at` (ScoreNotYetTimedOut), so a recovery attempt has to wait the remainder out
+ * rather than firing as soon as our own client-side timeout expires.
+ */
+const SCORE_TIMEOUT_SECONDS = 600;
+/**
+ * Attempts per entry before the cycle gives up on it.
+ *
+ * Each attempt costs one MPC computation plus, on failure, up to SCORE_TIMEOUT_SECONDS of
+ * waiting for the on-chain cancel window — so this is deliberately small. 3 covers a transient
+ * hung computation without turning a genuinely dead cluster into an hours-long stall.
+ */
+const SCORE_ATTEMPTS = 3;
+
+/** What stuck-score recovery should do next, decided purely from the entry's on-chain state. */
+type StuckScoreAction =
+  | { kind: "scored" }      // a late callback landed — never cancel, nothing to recover
+  | { kind: "not-queued" }  // nothing in flight
+  | { kind: "wait"; seconds: number } // in flight, but the on-chain cancel window is not open yet
+  | { kind: "cancel" };     // in flight and timed out — clear it
+
+/**
+ * Decide the next recovery step for a possibly-hung scoring computation.
+ *
+ * Split out as a PURE function because the ordering is what matters and it is easy to get
+ * wrong: a late callback must beat a pending cancel (cancelling a scored entry fails with
+ * EntryAlreadyScored), and `cancel_stuck_score` refuses until SCORE_TIMEOUT_SECONDS has
+ * elapsed (ScoreNotYetTimedOut) — so a client that fires as soon as its OWN shorter timeout
+ * expires just bounces off the program. The +3s cushion absorbs clock skew between this
+ * process and the validator.
+ */
+function stuckScoreAction(
+  entry: { scored: boolean; scoreQueued: boolean; queuedAt: number },
+  nowSecs: number,
+): StuckScoreAction {
+  if (entry.scored) return { kind: "scored" };
+  if (!entry.scoreQueued) return { kind: "not-queued" };
+  const age = nowSecs - entry.queuedAt;
+  if (age >= SCORE_TIMEOUT_SECONDS) return { kind: "cancel" };
+  return { kind: "wait", seconds: SCORE_TIMEOUT_SECONDS - age + 3 };
+}
+
 /**
  * Explicit compute ceiling for a reveal queue. Solana grants 200,000 CU when a tx carries no
  * ComputeBudget instruction, and a 13-entry `queue_shard_reveal` was measured at 158,914 CU on
@@ -579,6 +626,102 @@ async function main(): Promise<void> {
   }
 
   // ======================================================================================
+  // STUCK-COMPUTATION RECOVERY (scoring)
+  //
+  // `queue_score_entry` carries `constraint = !entry.score_queued @ ScoreAlreadyQueued`, so an
+  // MPC call that never comes back permanently blocks that entry — and with it the whole
+  // round, because every reveal path requires scored_count == participant_count. The only way
+  // out is `cancel_stuck_score`, which clears the flag once SCORE_TIMEOUT_SECONDS has elapsed.
+  //
+  // Before this, that was a MANUAL step: devnet round 53 wedged at 47/53 on 2026-08-11 when
+  // Arcium stopped serving our MXE mid-cycle, and every subsequent run aborted on the same
+  // entry with ScoreAlreadyQueued until an operator ran the cancel by hand. An unattended cron
+  // has nobody to do that, so it is done here.
+  // ======================================================================================
+
+  /**
+   * Clear a hung scoring computation so its entry can be re-queued.
+   *
+   * Returns true if a cancel was actually sent. No-ops when the entry is already scored (a late
+   * callback landed while we waited) or was never queued. Waits out the remainder of the
+   * on-chain cancel window when needed, re-reading first so a late callback still wins.
+   */
+  async function recoverStuckScore(entryPk: PK, label: string): Promise<boolean> {
+    for (;;) {
+      const e: any = await program.account.competitionEntry.fetch(entryPk);
+      const action = stuckScoreAction(
+        { scored: e.scored, scoreQueued: e.scoreQueued, queuedAt: Number(e.queuedAt) },
+        Math.floor(Date.now() / 1000),
+      );
+      if (action.kind === "scored") {
+        console.log(`    ${label}: callback landed late — already scored, no cancel needed`);
+        return false;
+      }
+      if (action.kind === "not-queued") return false;
+      if (action.kind === "cancel") break;
+      // Re-read after sleeping, so a callback landing during the wait still wins.
+      console.log(`    ${label}: in flight; waiting ${action.seconds}s for the on-chain cancel window`);
+      await sleep(action.seconds * 1000);
+    }
+    console.log(`    ${label}: clearing the stuck computation (cancel_stuck_score)`);
+    const tx = await program.methods.cancelStuckScore()
+      .accountsPartial({ caller: signer.publicKey, entry: entryPk }).transaction();
+    await sendTxHttp(tx, `cancelStuckScore`);
+    return true;
+  }
+
+  /**
+   * Score one entry, recovering from a hung computation and retrying up to SCORE_ATTEMPTS.
+   *
+   * The first recovery call also cleans up after a PREVIOUS run: an entry left flagged
+   * in-flight by an aborted cycle is cleared here instead of throwing ScoreAlreadyQueued.
+   */
+  async function scoreEntryWithRecovery(entryPk: PK, flowerRecord: PK, label: string): Promise<void> {
+    for (let attempt = 1; attempt <= SCORE_ATTEMPTS; attempt++) {
+      // Clears a leftover flag from an earlier attempt OR an earlier run.
+      await recoverStuckScore(entryPk, label);
+      if ((await program.account.competitionEntry.fetch(entryPk)).scored) return;
+
+      const offset = freshOffset();
+      const tx = await program.methods.queueScoreEntry(offset)
+        .accountsPartial({
+          authority: signer.publicKey,
+          round: roundPda(current),
+          entry: entryPk,
+          flowerRecord,
+          ...queueAccsFor("score_entry_v2", offset),
+        }).transaction();
+      await sendTxHttp(tx, `queueScoreEntry ${label}`);
+
+      // A timeout here is INFORMATION, not a fatal error — the retry path handles it. Without
+      // this catch, one hung computation aborted the entire cycle.
+      try {
+        await arcium.awaitComputationFinalization(
+          provider, offset, program.programId, "confirmed", SCORE_FINALIZE_TIMEOUT_MS);
+      } catch (e) {
+        console.log(`    ${label}: computation did not finalize on attempt ${attempt}/${SCORE_ATTEMPTS}`
+          + ` (${(e as Error).message.slice(0, 70)})`);
+      }
+
+      // Poll regardless of how the wait ended: the callback may land between the two.
+      for (let k = 0; k < 120; k++) {
+        if ((await program.account.competitionEntry.fetch(entryPk)).scored) {
+          console.log(`    ✓ scored`);
+          return;
+        }
+        await sleep(1000);
+      }
+      if (attempt < SCORE_ATTEMPTS) {
+        console.log(`    ${label}: no callback — recovering and retrying`);
+      }
+    }
+    throw new Error(
+      `entry ${label} did not score after ${SCORE_ATTEMPTS} attempts. The computation is being `
+      + `accepted but never executed, which points at the Arcium cluster rather than this round — `
+      + `check whether the cluster is serving this MXE before retrying.`);
+  }
+
+  // ======================================================================================
   // BRACKET REVEAL ORCHESTRATION
   // Port of the frontend's src/program/reveal.ts — the same sequence the Operator Panel and
   // scripts/live-reveal-round.mjs run. Every step is idempotent against the chain state it
@@ -908,7 +1051,23 @@ async function main(): Promise<void> {
         await sendTxHttp(withComputeUnitLimit(tx, REVEAL_CU_LIMIT), "queueShardReveal[FINAL]");
       }
       const landed = await awaitResults([finalResult], RESULT_TIMEOUT_MS, "final reveal");
-      if (landed === 0) throw new Error("the final reveal did not come back in time — the next run resumes it");
+      if (landed === 0) {
+        // NOT auto-recoverable, unlike a shard reveal. Shard/tier-1/semifinal result PDAs are
+        // `init_if_needed` with no "already queued" constraint, so runTier just re-queues them.
+        // The FINAL reveal is gated by BracketState.final_queued, which only init_bracket and
+        // promote_tier1 reset — and both bump `generation`, invalidating EVERY shard result and
+        // forcing the whole tier to be recomputed. That is too destructive to do automatically
+        // (up to 17 shards of MPC work), and on a two-tier round re-running init_bracket would
+        // also clobber the semifinal partition promote_tier1 wrote. So this stops and says so
+        // rather than looping: a later run would skip the queue (final_queued is still set) and
+        // wait again forever.
+        throw new Error(
+          `the final reveal was queued but never came back. This does NOT self-heal: `
+          + `BracketState.final_queued is set, so re-running will wait rather than re-queue. `
+          + `Check the Arcium cluster is serving this MXE first; recovery then needs `
+          + `final_queued cleared by re-pinning the bracket, which discards every shard result `
+          + `for round ${current} and re-runs that tier.`);
+      }
     }
 
     console.log(`    applying the bracket result (writing winners on-chain)`);
@@ -1117,27 +1276,10 @@ async function main(): Promise<void> {
       const e = unscored[i];
       const entry = entryPda(round, e.player as PK);
       console.log(`  scoring ${i + 1}/${unscored.length} (wallet ${short(e.player as PK)})`);
-      const offset = freshOffset();
-      const tx = await program.methods.queueScoreEntry(offset)
-        .accountsPartial({
-          authority: signer.publicKey,
-          round,
-          entry,
-          flowerRecord: e.flowerRecord as PK,
-          ...queueAccsFor("score_entry_v2", offset),
-        }).transaction();
-      await sendTxHttp(tx, `queueScoreEntry[${i + 1}]`);
-      await arcium.awaitComputationFinalization(
-        provider, offset, program.programId, "confirmed", 360000);
-
-      let scored = false;
-      for (let k = 0; k < 120; k++) {
-        if ((await program.account.competitionEntry.fetch(entry)).scored) { scored = true; break; }
-        await sleep(1000);
-      }
-      if (!scored) throw new Error(`entry ${short(e.player as PK)} did not reach scored=true after MPC`);
+      // Retries + clears a hung computation itself; only throws once genuinely out of attempts.
+      await scoreEntryWithRecovery(
+        entry, e.flowerRecord as PK, `${i + 1}/${unscored.length} ${short(e.player as PK)}`);
       summary.scoredThisRun += 1;
-      console.log(`    ✓ scored`);
     }
     const after: any = await program.account.competitionRound.fetch(round);
     summary.scoredCount = after.scoredCount;
@@ -1317,5 +1459,6 @@ export {
   MAX_SHARD_SIZE, MAX_SHARDS, MAX_TIER1_SHARDS, SHARD_WINNERS,
   SINGLE_TIER_CAPACITY, TWO_TIER_CAPACITY, FINAL_SHARD_INDEX,
   rpcRead, rpcBackoffMs, RPC_ATTEMPTS,
+  stuckScoreAction, SCORE_TIMEOUT_SECONDS, SCORE_ATTEMPTS,
 };
-export type { BracketPlan, ShardPlan };
+export type { BracketPlan, ShardPlan, StuckScoreAction };

@@ -33,6 +33,9 @@ import {
   rpcRead,
   rpcBackoffMs,
   RPC_ATTEMPTS,
+  stuckScoreAction,
+  SCORE_TIMEOUT_SECONDS,
+  SCORE_ATTEMPTS,
 } from "../scripts/auto-cycle.ts";
 
 const { PublicKey, Keypair } = anchor.web3;
@@ -362,6 +365,144 @@ describe("auto-cycle bracket partition planner", () => {
       assert.deepEqual(
         [1, 2, 3, 4, 5].map(rpcBackoffMs), [500, 1000, 2000, 4000, 6000],
         "backoff must match the send path, including the 6s cap");
+    });
+  });
+
+  describe("stuck-computation recovery (cancel_stuck_score)", () => {
+    // The bug this guards: devnet round 53 wedged at 47/53 on 2026-08-11 when Arcium stopped
+    // serving our MXE. `queue_score_entry` carries
+    // `constraint = !entry.score_queued @ ScoreAlreadyQueued`, so the entry stayed blocked and
+    // every re-run aborted on it until an operator ran cancel_stuck_score BY HAND. These prove
+    // the cycle now decides that for itself, and in the right order.
+    const QUEUED_AT = 1_786_000_000;
+
+    it("does nothing when no computation is in flight", () => {
+      assert.deepEqual(
+        stuckScoreAction({ scored: false, scoreQueued: false, queuedAt: 0 }, QUEUED_AT),
+        { kind: "not-queued" });
+    });
+
+    it("a late callback beats a pending cancel, even long past the timeout", () => {
+      // Cancelling a scored entry fails with EntryAlreadyScored, so `scored` MUST win. This is
+      // the race that matters: the callback can land while we are sleeping out the window.
+      assert.deepEqual(
+        stuckScoreAction(
+          { scored: true, scoreQueued: true, queuedAt: QUEUED_AT },
+          QUEUED_AT + SCORE_TIMEOUT_SECONDS * 10),
+        { kind: "scored" });
+    });
+
+    it("waits rather than cancelling before the on-chain window opens", () => {
+      // Firing at our own 360s client timeout would just bounce off ScoreNotYetTimedOut.
+      const a = stuckScoreAction(
+        { scored: false, scoreQueued: true, queuedAt: QUEUED_AT }, QUEUED_AT + 360);
+      assert.equal(a.kind, "wait");
+      assert.equal((a as { kind: "wait"; seconds: number }).seconds, SCORE_TIMEOUT_SECONDS - 360 + 3);
+    });
+
+    it("cancels exactly at the timeout boundary, not one second early", () => {
+      assert.equal(
+        stuckScoreAction({ scored: false, scoreQueued: true, queuedAt: QUEUED_AT },
+          QUEUED_AT + SCORE_TIMEOUT_SECONDS - 1).kind,
+        "wait", "one second early must still wait");
+      assert.equal(
+        stuckScoreAction({ scored: false, scoreQueued: true, queuedAt: QUEUED_AT },
+          QUEUED_AT + SCORE_TIMEOUT_SECONDS).kind,
+        "cancel", "at the boundary the program allows the cancel");
+    });
+
+    it("reproduces round 53's entry: 2310s in flight -> cancel immediately", () => {
+      assert.deepEqual(
+        stuckScoreAction({ scored: false, scoreQueued: true, queuedAt: QUEUED_AT },
+          QUEUED_AT + 2310),
+        { kind: "cancel" });
+    });
+
+    it("always waits a positive, bounded time when it waits at all", () => {
+      for (let age = 0; age < SCORE_TIMEOUT_SECONDS; age++) {
+        const a = stuckScoreAction(
+          { scored: false, scoreQueued: true, queuedAt: QUEUED_AT }, QUEUED_AT + age);
+        assert.equal(a.kind, "wait", `age ${age} must wait`);
+        const s = (a as { kind: "wait"; seconds: number }).seconds;
+        assert.isAbove(s, 0, `age ${age}`);
+        assert.isAtMost(s, SCORE_TIMEOUT_SECONDS + 3, `age ${age}`);
+      }
+    });
+
+    it("drives a full stuck -> wait -> cancel -> requeue -> scored recovery", async () => {
+      // Simulates the real loop against a fake chain, using the SAME decision function the
+      // cycle uses. Attempt 1 hangs (mirroring round 53); the retry succeeds.
+      let now = QUEUED_AT + 100;
+      const entry = { scored: false, scoreQueued: true, queuedAt: QUEUED_AT };
+      const log: string[] = [];
+      let hangNext = true; // first queue hangs, second lands
+
+      for (let attempt = 1; attempt <= SCORE_ATTEMPTS; attempt++) {
+        // --- recovery phase ---
+        for (;;) {
+          const a = stuckScoreAction(entry, now);
+          if (a.kind === "scored" || a.kind === "not-queued") break;
+          if (a.kind === "cancel") {
+            entry.scoreQueued = false; // what cancel_stuck_score does on-chain
+            log.push(`cancel@${now - QUEUED_AT}s`);
+            break;
+          }
+          now += a.seconds; // sleeping out the window
+          log.push(`wait${a.seconds}`);
+        }
+        if (entry.scored) break;
+
+        // --- queue phase ---
+        entry.scoreQueued = true;
+        entry.queuedAt = now;
+        log.push(`queue@${now - QUEUED_AT}s`);
+        if (hangNext) {
+          hangNext = false;
+          now += 360; // our client timeout expires with no callback
+          log.push("timeout");
+        } else {
+          entry.scored = true;
+          entry.scoreQueued = false;
+          log.push("callback");
+          break;
+        }
+      }
+
+      assert.isTrue(entry.scored, "the entry must end up scored");
+      assert.isFalse(entry.scoreQueued, "the in-flight flag must be clear at the end");
+      assert.deepEqual(log, [
+        "wait503",            // 600 - 100 + 3
+        "cancel@603s",        // window open, clear the original stuck computation
+        "queue@603s",         // attempt 1 re-queue
+        "timeout",            // hangs again
+        "wait243",            // 600 - 360 + 3 for the NEW queuedAt
+        "cancel@1206s",
+        "queue@1206s",        // attempt 2
+        "callback",           // lands
+      ]);
+      assert.equal(log.filter((l) => l.startsWith("cancel")).length, 2,
+        "each hung computation must be cleared before its retry");
+    });
+
+    it("gives up after SCORE_ATTEMPTS rather than looping forever", () => {
+      // A genuinely dead cluster must not turn into an unbounded stall.
+      let now = QUEUED_AT;
+      const entry = { scored: false, scoreQueued: false, queuedAt: 0 };
+      let queues = 0;
+      for (let attempt = 1; attempt <= SCORE_ATTEMPTS; attempt++) {
+        for (;;) {
+          const a = stuckScoreAction(entry, now);
+          if (a.kind === "cancel") { entry.scoreQueued = false; break; }
+          if (a.kind === "wait") { now += a.seconds; continue; }
+          break;
+        }
+        entry.scoreQueued = true;
+        entry.queuedAt = now;
+        queues++;
+        now += 360; // never any callback
+      }
+      assert.equal(queues, SCORE_ATTEMPTS, "bounded number of MPC computations spent");
+      assert.isFalse(entry.scored);
     });
   });
 
