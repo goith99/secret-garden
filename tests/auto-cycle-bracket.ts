@@ -30,6 +30,9 @@ import {
   SHARD_WINNERS,
   SINGLE_TIER_CAPACITY,
   TWO_TIER_CAPACITY,
+  rpcRead,
+  rpcBackoffMs,
+  RPC_ATTEMPTS,
 } from "../scripts/auto-cycle.ts";
 
 const { PublicKey, Keypair } = anchor.web3;
@@ -302,6 +305,63 @@ describe("auto-cycle bracket partition planner", () => {
       assert.lengthOf(sizes, MAX_TIER1_SHARDS);
       assert.deepEqual(sizes.slice(0, 7), [13, 13, 13, 13, 13, 13, 13]);
       assert.deepEqual(sizes.slice(7), new Array(MAX_TIER1_SHARDS - 7).fill(0));
+    });
+  });
+
+  describe("rpcRead — transient-failure retry on the opening reads", () => {
+    // The bug this guards: a single `TypeError: fetch failed` on the cycle's first getBalance
+    // aborted the whole run (observed live 2026-08-10). Unattended, that is a silently skipped
+    // day. These use a real (tiny) backoff, so they exercise the actual sleep path.
+
+    it("returns immediately when the read succeeds first time", async () => {
+      let calls = 0;
+      const out = await rpcRead("ok", async () => { calls++; return 42; });
+      assert.equal(out, 42);
+      assert.equal(calls, 1, "a healthy read must not retry");
+    });
+
+    it("retries a transient failure and returns the eventual success", async () => {
+      let calls = 0;
+      const out = await rpcRead("flaky", async () => {
+        calls++;
+        if (calls < 3) throw new TypeError("fetch failed");
+        return "recovered";
+      });
+      assert.equal(out, "recovered");
+      assert.equal(calls, 3, "must retry until it succeeds");
+    });
+
+    it("survives the exact live failure at the last possible attempt", async () => {
+      let calls = 0;
+      const out = await rpcRead("balance", async () => {
+        calls++;
+        if (calls < RPC_ATTEMPTS) {
+          throw new TypeError(
+            "failed to get balance of account 8L9SoH5Kw4DLw32vUQY4H3PMgkRL9mm9MLDT5z2QEbTd: TypeError: fetch failed");
+        }
+        return 12_280_413;
+      });
+      assert.equal(out, 12_280_413);
+      assert.equal(calls, RPC_ATTEMPTS);
+    });
+
+    it("gives up after RPC_ATTEMPTS and names the read that failed", async () => {
+      let calls = 0;
+      try {
+        await rpcRead("treasury balance", async () => { calls++; throw new Error("ETIMEDOUT"); });
+        assert.fail("should have thrown");
+      } catch (e) {
+        assert.equal(calls, RPC_ATTEMPTS, "must stop at the attempt cap, not loop forever");
+        assert.match((e as Error).message, /treasury balance failed after 6 attempts/);
+        assert.include((e as Error).message, "ETIMEDOUT", "must preserve the underlying cause");
+      }
+    });
+
+    it("uses the same capped exponential backoff as sendTxHttp", () => {
+      // sendTxHttp: Math.min(6000, 500 * 2 ** (attempt - 1))
+      assert.deepEqual(
+        [1, 2, 3, 4, 5].map(rpcBackoffMs), [500, 1000, 2000, 4000, 6000],
+        "backoff must match the send path, including the 6s cap");
     });
   });
 

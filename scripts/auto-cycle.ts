@@ -157,6 +157,39 @@ const fatal = (msg: string): never => {
   process.exit(1);
 };
 
+/** Attempts and backoff shared by `sendTxHttp` and `rpcRead`, so a transient RPC failure is
+ *  treated the same whether it hits a send or a read. */
+const RPC_ATTEMPTS = 6;
+const rpcBackoffMs = (attempt: number) => Math.min(6000, 500 * 2 ** (attempt - 1));
+
+/**
+ * Retry a transient RPC READ, matching `sendTxHttp`'s retry pattern exactly (6 attempts, the
+ * same capped exponential backoff).
+ *
+ * The cycle's opening reads had NO retry: a single blip aborted the whole run before any work
+ * started. Observed live on 2026-08-10 —
+ *   `AUTO-CYCLE FAILED: failed to get balance of account 8L9S...: TypeError: fetch failed`
+ * on the very first call. That fails SAFE (nothing on-chain has changed yet), but for an
+ * UNATTENDED cron it means a silently skipped day, which is exactly the outcome the balance
+ * gates exist to prevent. Reads are idempotent, so retrying one is always safe.
+ *
+ * Exported for tests.
+ */
+async function rpcRead<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; attempt <= RPC_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = (e as Error).message.slice(0, 90);
+      if (attempt === RPC_ATTEMPTS) {
+        throw new Error(`${label} failed after ${RPC_ATTEMPTS} attempts: ${msg}`);
+      }
+      console.log(`    ${label} read err (attempt ${attempt}/${RPC_ATTEMPTS}): ${msg}`);
+      await sleep(rpcBackoffMs(attempt));
+    }
+  }
+  throw new Error(`${label}: unreachable`); // for the type checker
+}
 
 /**
  * Parse a Solana-CLI JSON-array secret key from `envVar`, write it to a 0600 temp file at
@@ -971,7 +1004,8 @@ async function main(): Promise<void> {
   console.log(`  operator wallet : ${signer.publicKey.toBase58()}`);
   console.log(`  treasury wallet : ${treasury.publicKey.toBase58()}`);
 
-  const startLamports = await conn.getBalance(signer.publicKey, "confirmed");
+  const startLamports = await rpcRead("operator balance",
+    () => conn.getBalance(signer.publicKey, "confirmed"));
   const startSol = startLamports / LAMPORTS_PER_SOL;
   if (startSol < MIN_BALANCE_SOL) {
     console.error(
@@ -982,7 +1016,8 @@ async function main(): Promise<void> {
   }
   console.log(`  operator balance: ${startSol.toFixed(4)} SOL (>= ${MIN_BALANCE_SOL} minimum) — proceeding`);
 
-  const treasuryStartSol = (await conn.getBalance(treasury.publicKey, "confirmed")) / LAMPORTS_PER_SOL;
+  const treasuryStartSol = (await rpcRead("treasury balance",
+    () => conn.getBalance(treasury.publicKey, "confirmed"))) / LAMPORTS_PER_SOL;
   if (treasuryStartSol < MIN_TREASURY_SOL) {
     console.error(
       `\nACTION REQUIRED — LOW TREASURY BALANCE: treasury wallet ${treasury.publicKey.toBase58()} ` +
@@ -994,7 +1029,9 @@ async function main(): Promise<void> {
   console.log(`  treasury balance: ${treasuryStartSol.toFixed(4)} SOL (>= ${MIN_TREASURY_SOL} minimum) — proceeding`);
 
   // --- authorization: wallet must be the config authority or a registered operator ------
-  const cfg: any = await program.account.gameConfig.fetch(configPda);
+  // Same retry as the balance gates: this is the third of the three opening reads, and an
+  // unretried blip here would abort the cycle for the identical reason.
+  const cfg: any = await rpcRead("GameConfig", () => program.account.gameConfig.fetch(configPda));
   const isAuthority = cfg.authority.equals(signer.publicKey);
   const operators: PK[] = (cfg.operators as PK[]).slice(0, cfg.operatorCount);
   const isOperator = operators.some((op) => op.equals(signer.publicKey));
@@ -1195,12 +1232,16 @@ async function main(): Promise<void> {
       + `(count ${opened.targetTraitCount})`);
   }
 
+  // Closing balances feed the summary only, but they run AFTER the cycle has done real work —
+  // a blip here would report the run as FAILED even though every stage succeeded.
   async function balanceSol(): Promise<number> {
-    return (await conn.getBalance(signer.publicKey, "confirmed")) / LAMPORTS_PER_SOL;
+    return (await rpcRead("operator balance",
+      () => conn.getBalance(signer.publicKey, "confirmed"))) / LAMPORTS_PER_SOL;
   }
 
   async function treasuryBalanceSol(): Promise<number> {
-    return (await conn.getBalance(treasury.publicKey, "confirmed")) / LAMPORTS_PER_SOL;
+    return (await rpcRead("treasury balance",
+      () => conn.getBalance(treasury.publicKey, "confirmed"))) / LAMPORTS_PER_SOL;
   }
 }
 
@@ -1275,5 +1316,6 @@ export {
   planBracket, describePlan, padNumbers, padKeys, BracketPlanError,
   MAX_SHARD_SIZE, MAX_SHARDS, MAX_TIER1_SHARDS, SHARD_WINNERS,
   SINGLE_TIER_CAPACITY, TWO_TIER_CAPACITY, FINAL_SHARD_INDEX,
+  rpcRead, rpcBackoffMs, RPC_ATTEMPTS,
 };
 export type { BracketPlan, ShardPlan };
