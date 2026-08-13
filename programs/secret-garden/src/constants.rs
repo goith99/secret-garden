@@ -272,9 +272,10 @@ pub const TRAIT_TABLE: [TraitDef; TRAIT_TABLE_LEN as usize] = [
 pub const TARGET_TRAIT_MIN: u8 = 2;
 pub const TARGET_TRAIT_MAX: u8 = 4;
 
-/// Generation bonus added to a flower's score: +5 per generation above 1, capped so the
-/// total score never exceeds `MAX_SCORE`. Mirrors the `score_entry` circuit.
-pub const GENERATION_BONUS_PER_GEN: u8 = 5;
+// No generation-bonus constant lives here. The bonus is `min(2 * (generation - 1), 30)`
+// scaled by the trait-match ratio (the synergy multiplier), which is not expressible as a
+// per-generation constant — and the genome is encrypted, so the term is only ever evaluated
+// inside `score_entry_v2`. That circuit is its sole definition; see encrypted-ixs.
 
 /// Maximum possible score (a perfect, capped match percentage).
 pub const MAX_SCORE: u8 = 100;

@@ -308,8 +308,12 @@ mod circuits {
     /// evaluated only here — the genome is encrypted, so they can never run in plaintext
     /// on-chain; this closure is therefore the canonical definition of each condition.
     ///
-    /// Score = the synergy multiplier below: `(matched / count) * (70 + gen_bonus_raw)`,
-    /// where `gen_bonus_raw = min(2 * (generation - 1), 30)`. Reaches exactly 100 when every
+    /// Score = the synergy multiplier below, as TWO separately-floored terms summed:
+    /// `floor(matched * 70 / count) + floor(matched * gen_bonus_raw / count)`, where
+    /// `gen_bonus_raw = min(2 * (generation - 1), 30)`. The two floors are NOT
+    /// interchangeable with one combined `floor(matched * (70 + gen_bonus_raw) / count)`:
+    /// the combined form reads 1 point HIGH wherever both terms leave a fractional part
+    /// (2 of 3 traits at generation 2 scores 47, not 48). Reaches exactly 100 when every
     /// target trait matches at generation >= 16, and is ZERO at any generation with no
     /// matches. Returned ENCRYPTED so it stays hidden until reveal_top3.
     ///

@@ -142,8 +142,12 @@ instructions + stub callbacks); persistence is Stage 4B.
   which is fine — traits are intentionally public (strategizing around them is the game).
   `CompetitionRound` gains `target_traits[4]`, `target_trait_count`, `top1/2/3`,
   `scoring_revealed`, `scored_count` (all appended; Stage 2 offsets unchanged).
-- **score_entry circuit** → `Enc<Mxe, u8>`: match% = `(matched / count) * 100` over the
-  active target traits, plus `+5 per generation above 1`, capped at 100. The score stays
+- **score_entry circuit** → `Enc<Mxe, u8>`: the **synergy multiplier** over the active
+  target traits — `floor(matched * 70 / count) + floor(matched * gen_bonus / count)`, where
+  `gen_bonus = min(2 * (generation - 1), 30)`. The two terms are floored **separately** and
+  then summed (combining them into one division reads 1 point high). Generation *amplifies*
+  matched traits rather than being added flat, so a flower matching nothing scores **zero at
+  any generation**, and only a clean sweep at generation >= 16 reaches 100. The score stays
   **encrypted**.
 - **reveal_top3 circuit** → plaintext `(idx,score)×3`: takes one `Enc<Mxe,[u8;16]>` of
   scores + a plaintext `entry_indices[16]` + `participant_count`; ranks each slot by how
