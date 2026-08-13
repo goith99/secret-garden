@@ -52,6 +52,8 @@ const s=createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
 // regardless of which writer produced them.
 const SPECIES_NAMES=["Sunpetal Marigold","Tideglass Bluebell","Duskwisp Lavender","Emberfern Rose","Mossheart Mint","Moonsilk Lily"];
 const flowerName=(id,idx)=> id===255 ? `Hybrid #${idx}` : (SPECIES_NAMES[id] ?? `Flower #${idx}`);
+/** Shown for a winner whose FlowerRecord was closed after the round — see operator.ts. */
+const CLOSED_FLOWER_NAME="Retired Bloom";
 
 const rounds=(process.env.ROUNDS||'').split(',').filter(Boolean).map(Number);
 for(const n of rounds){
@@ -74,9 +76,14 @@ for(const n of rounds){
     if(top[i].equals(PublicKey.default)) continue;
     const entry=byEntry.get(top[i].toBase58());
     if(!entry){ console.log(`  round ${n} rank ${i+1}: entry not found — skip`); continue; }
-    const flower=await program.account.flowerRecord.fetch(entry.flowerRecord);
+    // fetchNullable, NOT fetch: fetch() throws on a closed account, and an owner may close a
+    // winning flower after the round to reclaim its rent. Backfilling a round that contains
+    // one is precisely when this script is needed, so it must not die on it. Same fallback
+    // operator.ts and the set-round-results edge function use, so all writers agree.
+    const flower=await program.account.flowerRecord.fetchNullable(entry.flowerRecord);
     winnerRows.push({round_number:n,rank:i+1,wallet_address:entry.player.toBase58(),
-      flower_name:flowerName(flower.visualSpeciesId,flower.flowerIndex),generation:flower.generation});
+      flower_name:flower?flowerName(flower.visualSpeciesId,flower.flowerIndex):CLOSED_FLOWER_NAME,
+      generation:flower?flower.generation:0});
   }
   const resultRow={round_number:n,target_traits:JSON.stringify(targetTraits),
     total_entrants:round.participantCount,completed_at:new Date().toISOString()};
