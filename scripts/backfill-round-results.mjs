@@ -13,9 +13,17 @@
  * getProgramAccounts, which `.all()` needs); Supabase writes use the SERVICE key, which
  * bypasses RLS, so this must only ever run server-side — never in a browser.
  *
- * IDEMPOTENT. Rows present in EITHER table abort that round, so a re-run cannot duplicate
- * winners (round_winners has no natural unique key) and a half-written round is never "topped
- * up" into an inconsistent state. Re-running a completed backfill is a safe no-op.
+ * IDEMPOTENT. Rows present in EITHER table abort that round, so a half-written round is never
+ * "topped up" into an inconsistent state and re-running a completed backfill is a safe no-op.
+ *
+ * That check is now belt-and-braces rather than the only defence. Both tables were migrated on
+ * 2026-08-13 to the schema in secret-garden-frontend-dev/supabase/round_results.sql:
+ * `round_results` is keyed by `round_number` and `round_winners` by the composite
+ * `(round_number, rank)`, with a foreign key tying a podium to its summary row. A duplicate
+ * write is therefore rejected by the database (23505) rather than silently landing a second
+ * podium — which is exactly what the previous surrogate `id` primary key allowed. The pre-check
+ * still earns its place: it turns that conflict into a clean skip with a clear message instead
+ * of a logged write error, and it inspects BOTH tables before anything is attempted.
  *
  * Rows match operator.ts's saveResultsToSupabase byte-for-byte in shape, including its
  * flowerName spelling, so a row is identical no matter which writer produced it.
