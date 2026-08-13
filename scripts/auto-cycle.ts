@@ -167,6 +167,50 @@ function stuckScoreAction(
   return { kind: "wait", seconds: SCORE_TIMEOUT_SECONDS - age + 3 };
 }
 
+/** What the close stage should do, decided purely from round state + wall clock. */
+type CloseAction =
+  | { kind: "close" }                              // OPEN and its scheduled window has elapsed
+  | { kind: "not-open" }                           // CLOSED/FINALIZED — later stages handle it
+  | { kind: "too-early"; remainingSeconds: number }; // OPEN but still live — must NOT be closed
+
+/**
+ * Decide whether the round may be closed, from its status AND its scheduled end.
+ *
+ * STATUS ALONE IS NOT ENOUGH, and assuming it was is what this fixes. The close stage used to
+ * be `if (status === OPEN) closeRound()`, which is only correct if the script runs exactly once
+ * a day. It does not: `railway.json` sets `startCommand: npm run auto-cycle`, so EVERY deploy
+ * runs a full cycle immediately. On 2026-08-13 two redeploys minutes after round 54 opened each
+ * tried to close it ~5 minutes into its 24h window; both were rejected on-chain with 6032
+ * RoundTooRecentToClose only because the cycle signs as an OPERATOR, and
+ * `MIN_OPERATOR_CLOSE_DELAY_SECONDS` (1h) covered us. That guard is a backstop against a leaked
+ * key, not a scheduler — it expires an hour in, and it does not apply at all when the signer is
+ * the authority. So the script must decide this itself.
+ *
+ * Pure and exported so the boundary is unit-testable without a validator: closing a live round
+ * early destroys it (0 entries, no winners, players locked out for the rest of the day), and
+ * that is not a case to discover in production.
+ */
+function closeRoundAction(
+  round: { status: number; endTime: number },
+  nowSecs: number,
+): CloseAction {
+  if (round.status !== ROUND_STATUS_OPEN) return { kind: "not-open" };
+  const remaining = round.endTime - nowSecs;
+  // `>= end_time` closes; one second early is still early.
+  if (remaining > 0) return { kind: "too-early", remainingSeconds: remaining };
+  return { kind: "close" };
+}
+
+/** "23h 47m" / "47m 12s" / "12s" — for the skip message. */
+function formatRemaining(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m`;
+  if (m > 0) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
 /**
  * Explicit compute ceiling for a reveal queue. Solana grants 200,000 CU when a tx carries no
  * ComputeBudget instruction, and a 13-entry `queue_shard_reveal` was measured at 158,914 CU on
@@ -1245,7 +1289,15 @@ async function main(): Promise<void> {
     console.log(`  ${"!".repeat(72)}`);
   }
 
-  if (r.status === ROUND_STATUS_OPEN) {
+  // Anchor hands back i64 as a BN; tolerate a plain number too.
+  const roundEndTime =
+    typeof r.endTime?.toNumber === "function" ? r.endTime.toNumber() : Number(r.endTime);
+  const closeAction = closeRoundAction(
+    { status: r.status, endTime: roundEndTime },
+    Math.floor(Date.now() / 1000),
+  );
+
+  if (closeAction.kind === "close") {
     const tx = await program.methods.closeRound()
       .accountsPartial({ authority: signer.publicKey, config: configPda, round }).transaction();
     await sendTxHttp(tx, `closeRound(${current})`);
@@ -1254,6 +1306,20 @@ async function main(): Promise<void> {
     summary.closedRound = current;
     summary.entryCount = r.participantCount;
     console.log(`  ✓ round ${current} closed (${r.participantCount} entries)`);
+  } else if (closeAction.kind === "too-early") {
+    // The round is still LIVE. Closing it now would end the day early with whatever entries
+    // happen to be in — on a freshly opened round, that is zero: no winners, no prizes, and
+    // players locked out until the next round. There is nothing else this cycle can legally do
+    // either (queue_score_entry requires CLOSED), so stop here rather than fall through.
+    console.log(
+      `  ↪ skipping close — round ${current} is still live, ` +
+      `${formatRemaining(closeAction.remainingSeconds)} remaining ` +
+      `(ends ${new Date(roundEndTime * 1000).toISOString()}).`,
+    );
+    console.log(`     Nothing to do until then. This run was off-schedule (a redeploy runs a`);
+    console.log(`     full cycle immediately), and an off-schedule run must never close a live round.`);
+    printSummary(summary, await balanceSol(), await treasuryBalanceSol());
+    return;
   } else {
     console.log(`  ↪ skipping close — round already ${ROUND_STATUS_NAME[r.status]}`);
   }
@@ -1460,5 +1526,6 @@ export {
   SINGLE_TIER_CAPACITY, TWO_TIER_CAPACITY, FINAL_SHARD_INDEX,
   rpcRead, rpcBackoffMs, RPC_ATTEMPTS,
   stuckScoreAction, SCORE_TIMEOUT_SECONDS, SCORE_ATTEMPTS,
+  closeRoundAction, formatRemaining,
 };
-export type { BracketPlan, ShardPlan, StuckScoreAction };
+export type { BracketPlan, ShardPlan, StuckScoreAction, CloseAction };
