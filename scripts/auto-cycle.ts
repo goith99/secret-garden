@@ -211,6 +211,121 @@ function formatRemaining(seconds: number): string {
   return `${s}s`;
 }
 
+// --- single-instance lock -------------------------------------------------------------------
+//
+// Nothing stopped two cycles running at once. On 2026-08-13 two deploy-triggered runs each
+// attempted close_round on round 54, 2m06s apart — they serialised by luck, not design. A
+// file lock in /tmp is the right scope: Railway runs one container, so per-container state is
+// exactly the boundary we need, and no distributed lock is warranted.
+
+/** Lock file. /tmp is per-container and is already where the temp keypairs live. */
+const LOCK_PATH = path.join("/tmp", "secret-garden-auto-cycle.lock");
+
+/**
+ * How old a lock must be before it is presumed abandoned rather than held.
+ *
+ * DELIBERATELY GENEROUS. The obvious instinct is "a cycle takes a few minutes, so a few
+ * minutes is plenty" — that is true of a quiet round and badly wrong of a busy one. Scoring is
+ * one MPC computation per entry (round 53 had 53 of them), and a single hung entry costs up to
+ * SCORE_ATTEMPTS x (SCORE_FINALIZE_TIMEOUT_MS + SCORE_TIMEOUT_SECONDS) ≈ 48 minutes of
+ * legitimate waiting on its own. A short threshold would let a second run declare a healthy
+ * long cycle "stale" and steal its lock — reintroducing exactly the race this prevents.
+ *
+ * One hour errs the safe way: runs are normally ~24h apart, so a crashed run blocking the next
+ * one for an hour costs nothing, while stealing from a live run could double-submit
+ * transactions.
+ */
+const LOCK_STALE_SECONDS = 3_600;
+
+interface LockFile {
+  pid: number;
+  startedAt: number;
+}
+
+/** What to do about a lock we found. */
+type LockAction =
+  | { kind: "acquire" }                                  // nothing there — take it
+  | { kind: "steal"; ageSeconds: number }                // abandoned — clear and take it
+  | { kind: "abort"; ageSeconds: number; pid: number };  // live run holds it — stand down
+
+/**
+ * Decide from the lock's contents alone. Pure, so the boundary is unit-testable without
+ * spawning processes — the same reason `stuckScoreAction` and `closeRoundAction` are pure.
+ *
+ * A lock whose timestamp is in the FUTURE (clock skew, or a corrupt file read as startedAt 0's
+ * opposite) yields a negative age and is treated as held, not stale: refusing to run is always
+ * recoverable, stealing from a live run is not.
+ */
+function lockAction(existing: LockFile | null, nowSecs: number): LockAction {
+  if (!existing) return { kind: "acquire" };
+  const age = nowSecs - existing.startedAt;
+  if (age >= LOCK_STALE_SECONDS) return { kind: "steal", ageSeconds: age };
+  return { kind: "abort", ageSeconds: age, pid: existing.pid };
+}
+
+/**
+ * Take the lock, or report that another run holds it.
+ *
+ * Uses `open(..., "wx")` — create-exclusively — which is ATOMIC at the filesystem level, so two
+ * runs starting in the same instant cannot both believe they won. Only when that fails with
+ * EEXIST do we look at the existing lock and decide. A corrupt or unreadable lock is treated as
+ * ancient (startedAt 0) and stolen: it cannot represent a live run's honest state.
+ */
+function acquireLock(nowSecs: number = Math.floor(Date.now() / 1000)): boolean {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(LOCK_PATH, "wx", 0o600);
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: nowSecs }));
+      fs.closeSync(fd);
+      return true;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    }
+
+    let existing: LockFile;
+    try {
+      const raw = JSON.parse(fs.readFileSync(LOCK_PATH, "utf8"));
+      existing = typeof raw?.startedAt === "number"
+        ? { pid: Number(raw.pid) || 0, startedAt: raw.startedAt }
+        : { pid: 0, startedAt: 0 };
+    } catch {
+      existing = { pid: 0, startedAt: 0 }; // unreadable → ancient → steal
+    }
+
+    const action = lockAction(existing, nowSecs);
+    if (action.kind === "abort") {
+      console.log(
+        `\n↪ another auto-cycle run appears to be in progress ` +
+        `(pid ${action.pid}, started ${formatRemaining(action.ageSeconds)} ago) — exiting.`,
+      );
+      return false;
+    }
+    if (action.kind === "steal") {
+      console.log(
+        `  (clearing a stale lock — ${formatRemaining(action.ageSeconds)} old, past the ` +
+        `${formatRemaining(LOCK_STALE_SECONDS)} threshold; a previous run exited without cleanup)`,
+      );
+      try { fs.unlinkSync(LOCK_PATH); } catch { /* another run cleared it first */ }
+    }
+    // `acquire` cannot arise here — we only reach this branch on EEXIST, so a lock existed.
+    // Looping to retry the atomic create is the correct response either way.
+    // Loop once more: if a third run won the re-create race, its lock is fresh and we abort.
+  }
+  console.log(`\n↪ another auto-cycle run took the lock while this one cleared a stale one — exiting.`);
+  return false;
+}
+
+/** Release the lock, but ONLY if it is ours — never delete a lock another run now holds. */
+function releaseLock(): void {
+  try {
+    const raw = JSON.parse(fs.readFileSync(LOCK_PATH, "utf8"));
+    if (Number(raw?.pid) !== process.pid) return;
+  } catch {
+    return; // already gone, or not ours to reason about
+  }
+  try { fs.unlinkSync(LOCK_PATH); } catch { /* already gone */ }
+}
+
 /**
  * Explicit compute ceiling for a reveal queue. Solana grants 200,000 CU when a tx carries no
  * ComputeBudget instruction, and a 13-entry `queue_shard_reveal` was measured at 158,914 CU on
@@ -225,12 +340,18 @@ const REVEAL_CU_LIMIT = 250_000;
 const OPERATOR_KEYPAIR_PATH = path.join("/tmp", "operator-keypair.json");
 const TREASURY_KEYPAIR_PATH = path.join("/tmp", "treasury-keypair.json");
 
-// Remove BOTH temp keys on ANY exit — including the early process.exit() paths (low balance,
-// fatal validation) that never reach main()'s catch. Synchronous, best-effort.
+// Remove BOTH temp keys AND the single-instance lock on ANY exit — including the early
+// process.exit() paths (low balance, fatal validation) that never reach main()'s catch, and
+// the too-early close skip that returns before the cycle body. Registering the release here
+// rather than in a try/finally around main() is deliberate: this fires for every one of those
+// exits, so no path can leave a lock behind that would block the next legitimate run.
+// Synchronous, best-effort. (SIGKILL is the one case nothing can clean up — that is precisely
+// what LOCK_STALE_SECONDS exists for.)
 process.on("exit", () => {
   for (const p of [OPERATOR_KEYPAIR_PATH, TREASURY_KEYPAIR_PATH]) {
     try { fs.unlinkSync(p); } catch { /* never written, or already gone */ }
   }
+  releaseLock();
 });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -1509,12 +1630,19 @@ const isEntryPoint =
   !!process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 
 if (isEntryPoint) {
-  main()
-    .then(() => process.exit(0)) // temp key removed by the process 'exit' handler
-    .catch((e) => {
-      console.error(`\nAUTO-CYCLE FAILED: ${(e as Error).message}`);
-      process.exit(1);
-    });
+  // Single-instance gate, BEFORE any chain reads or key material is written: a run that is not
+  // going to proceed should touch nothing at all. Exit 0, not 1 — standing down because another
+  // run holds the lock is correct behaviour, not a failure, and Railway should not flag it.
+  if (!acquireLock()) {
+    process.exit(0);
+  } else {
+    main()
+      .then(() => process.exit(0)) // temp keys + lock removed by the process 'exit' handler
+      .catch((e) => {
+        console.error(`\nAUTO-CYCLE FAILED: ${(e as Error).message}`);
+        process.exit(1);
+      });
+  }
 }
 
 // Exported for tests ONLY — the pure, chain-free partition planner. Nothing here touches the
@@ -1527,5 +1655,6 @@ export {
   rpcRead, rpcBackoffMs, RPC_ATTEMPTS,
   stuckScoreAction, SCORE_TIMEOUT_SECONDS, SCORE_ATTEMPTS,
   closeRoundAction, formatRemaining,
+  lockAction, acquireLock, releaseLock, LOCK_PATH, LOCK_STALE_SECONDS,
 };
-export type { BracketPlan, ShardPlan, StuckScoreAction, CloseAction };
+export type { BracketPlan, ShardPlan, StuckScoreAction, CloseAction, LockAction, LockFile };

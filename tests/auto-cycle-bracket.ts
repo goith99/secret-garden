@@ -14,6 +14,7 @@
  *   npx mocha --no-config tests/auto-cycle-bracket.ts
  */
 import { assert } from "chai";
+import * as fs from "node:fs";
 import * as anchor from "@anchor-lang/core";
 import {
   compareEntryKeys,
@@ -36,6 +37,11 @@ import {
   stuckScoreAction,
   SCORE_TIMEOUT_SECONDS,
   SCORE_ATTEMPTS,
+  lockAction,
+  acquireLock,
+  releaseLock,
+  LOCK_PATH,
+  LOCK_STALE_SECONDS,
 } from "../scripts/auto-cycle.ts";
 
 const { PublicKey, Keypair } = anchor.web3;
@@ -510,6 +516,106 @@ describe("auto-cycle bracket partition planner", () => {
     it("counts min(3, size) per shard", () => {
       assert.equal(expectedTier1Winners([13, 13, 13]), 9);
       assert.equal(expectedTier1Winners([2, 1, 13]), 2 + 1 + SHARD_WINNERS);
+    });
+  });
+});
+
+/**
+ * Single-instance lock (scripts/auto-cycle.ts).
+ *
+ * Two deploy-triggered runs each attempted close_round on round 54 on 2026-08-13, 2m06s apart,
+ * with no lock of any kind in place; they serialised by luck. `lockAction` is the pure decision
+ * and is tested exhaustively here; `acquireLock`/`releaseLock` are exercised against a real
+ * file, since the property that matters — two runs cannot both hold it — lives in the atomic
+ * create, not in the predicate.
+ */
+describe("auto-cycle single-instance lock", () => {
+  const NOW = 1_786_600_000;
+
+  const clearLock = () => { try { fs.unlinkSync(LOCK_PATH); } catch { /* not there */ } };
+  const writeLock = (pid: number, startedAt: number) =>
+    fs.writeFileSync(LOCK_PATH, JSON.stringify({ pid, startedAt }));
+
+  beforeEach(clearLock);
+  afterEach(clearLock);
+
+  describe("lockAction — the pure decision", () => {
+    it("acquires when no lock is present", () => {
+      assert.deepEqual(lockAction(null, NOW), { kind: "acquire" });
+    });
+
+    it("aborts when a lock is fresh — another run is live", () => {
+      const a = lockAction({ pid: 4242, startedAt: NOW - 30 }, NOW);
+      assert.equal(a.kind, "abort");
+      assert.equal((a as { pid: number }).pid, 4242);
+      assert.equal((a as { ageSeconds: number }).ageSeconds, 30);
+    });
+
+    it("still aborts just BEFORE the staleness threshold", () => {
+      assert.equal(lockAction({ pid: 1, startedAt: NOW - (LOCK_STALE_SECONDS - 1) }, NOW).kind, "abort");
+    });
+
+    it("steals exactly AT the threshold, and beyond", () => {
+      assert.equal(lockAction({ pid: 1, startedAt: NOW - LOCK_STALE_SECONDS }, NOW).kind, "steal");
+      assert.equal(lockAction({ pid: 1, startedAt: NOW - LOCK_STALE_SECONDS * 10 }, NOW).kind, "steal");
+    });
+
+    it("treats a future-dated lock as HELD, not stale (clock skew must not steal)", () => {
+      assert.equal(lockAction({ pid: 9, startedAt: NOW + 5_000 }, NOW).kind, "abort");
+    });
+
+    it("does not steal from a long-but-legitimate cycle", () => {
+      // 53 entries scoring + one hung entry's recovery is ~48 min of honest waiting.
+      assert.equal(lockAction({ pid: 7, startedAt: NOW - 45 * 60 }, NOW).kind, "abort");
+    });
+  });
+
+  describe("acquireLock / releaseLock — against a real file", () => {
+    it("acquires when clear, and writes this process's pid", () => {
+      assert.isTrue(acquireLock(NOW));
+      const written = JSON.parse(fs.readFileSync(LOCK_PATH, "utf8"));
+      assert.equal(written.pid, process.pid);
+      assert.equal(written.startedAt, NOW);
+    });
+
+    it("refuses when a fresh lock from another pid is held", () => {
+      writeLock(process.pid + 1, NOW - 10);
+      assert.isFalse(acquireLock(NOW));
+      // the other run's lock must survive our refusal
+      assert.equal(JSON.parse(fs.readFileSync(LOCK_PATH, "utf8")).pid, process.pid + 1);
+    });
+
+    it("steals a stale lock and takes ownership", () => {
+      writeLock(process.pid + 1, NOW - LOCK_STALE_SECONDS - 1);
+      assert.isTrue(acquireLock(NOW));
+      assert.equal(JSON.parse(fs.readFileSync(LOCK_PATH, "utf8")).pid, process.pid);
+    });
+
+    it("treats a corrupt lock as ancient and steals it", () => {
+      fs.writeFileSync(LOCK_PATH, "{ not json at all");
+      assert.isTrue(acquireLock(NOW));
+      assert.equal(JSON.parse(fs.readFileSync(LOCK_PATH, "utf8")).pid, process.pid);
+    });
+
+    it("releases only OUR lock, leaving another run's untouched", () => {
+      writeLock(process.pid + 1, NOW - 10);
+      releaseLock();
+      assert.isTrue(fs.existsSync(LOCK_PATH), "another run's lock must not be deleted");
+
+      clearLock();
+      assert.isTrue(acquireLock(NOW));
+      releaseLock();
+      assert.isFalse(fs.existsSync(LOCK_PATH), "our own lock must be removed");
+    });
+
+    it("release is safe when no lock exists", () => {
+      assert.doesNotThrow(() => releaseLock());
+    });
+
+    it("a second acquire succeeds after the first releases (no stale block)", () => {
+      assert.isTrue(acquireLock(NOW));
+      releaseLock();
+      assert.isTrue(acquireLock(NOW + 5), "a legitimate later run must not be blocked");
     });
   });
 });
