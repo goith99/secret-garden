@@ -1243,8 +1243,17 @@ async function main(): Promise<void> {
     return plan;
   }
 
+  // Player-facing name for a winner whose FlowerRecord no longer exists — see operator.ts.
+  const CLOSED_FLOWER_NAME = "Retired Bloom";
+
   // Persist a finished round's results to Supabase (same pattern as operator.ts). Skipped
   // silently when SUPABASE_URL/SERVICE_KEY aren't set; never fatal to the cycle.
+  //
+  // NOTHING IN HERE MAY THROW. This runs unattended on Railway between the reveal and prize
+  // distribution (see the call site), and main() has no try/catch around that sequence — the
+  // only handler is the top-level .catch(process.exit(1)). A throw here would exit with the
+  // winners revealed but the prizes unpaid, the round never finalized and the next round never
+  // opened: it would cost that day's round outright.
   async function saveResultsToSupabase(roundNumber: number, round: any, scored: any[]) {
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_KEY;
@@ -1269,13 +1278,18 @@ async function main(): Promise<void> {
     for (let i = 0; i < top.length; i++) {
       const entry = byEntry.get(top[i].toBase58());
       if (!entry) continue;
-      const flower: any = await program.account.flowerRecord.fetch(entry.flowerRecord);
+      // fetchNullable, NOT fetch: fetch() THROWS on a closed account, and a winner may have
+      // closed their flower after the round to reclaim its rent — the exact unattended crash
+      // this function must not have. Devnet round 24 already has such a winner.
+      const flower: any = await program.account.flowerRecord.fetchNullable(entry.flowerRecord);
       winnerRows.push({
         round_number: roundNumber,
         rank: i + 1,
         wallet_address: (entry.player as PK).toBase58(),
-        flower_name: flowerName(flower.visualSpeciesId, flower.flowerIndex),
-        generation: flower.generation,
+        flower_name: flower
+          ? flowerName(flower.visualSpeciesId, flower.flowerIndex)
+          : CLOSED_FLOWER_NAME,
+        generation: flower ? flower.generation : 0,
       });
     }
     const winnersErr = winnerRows.length

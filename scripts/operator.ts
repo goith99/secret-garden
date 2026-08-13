@@ -171,6 +171,13 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
     generation: number;
   }
 
+  // Player-facing name for a winner whose FlowerRecord no longer exists. Owners may close a
+  // flower after the round and reclaim its rent, which deletes the only source of its species
+  // and generation. Rank and wallet — what the podium is actually about — are still known, so
+  // the winner is recorded rather than dropped. Matches the set-round-results edge function,
+  // which resolves the same case the same way, so the two writers agree on what they store.
+  const CLOSED_FLOWER_NAME = "Retired Bloom";
+
   // Persist a finished round's results to Supabase so the frontend Daily Winners panel can show
   // them. Server-side write with the SERVICE key (bypasses RLS). Skipped silently when
   // SUPABASE_URL/SERVICE_KEY aren't configured, and never fatal to the reveal itself.
@@ -209,13 +216,21 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
     for (let i = 0; i < top.length; i++) {
       const entry = byEntry.get(top[i].toBase58());
       if (!entry) continue;
-      const flower: any = await program.account.flowerRecord.fetch(entry.flowerRecord);
+      // fetchNullable, NOT fetch: fetch() THROWS on a closed account, and a winner may have
+      // closed their flower after the round. Thrown from here it would abort the caller
+      // mid-sequence, with the reveal already landed on-chain but the results never written —
+      // and this is now one of two writers for these tables, so a crash leaves the Daily
+      // Winners row missing while the edge-function path would have published it. Devnet
+      // round 24 already has exactly this: a winning entry whose FlowerRecord is gone.
+      const flower: any = await program.account.flowerRecord.fetchNullable(entry.flowerRecord);
       winnerRows.push({
         round_number: roundNumber,
         rank: i + 1,
         wallet_address: (entry.player as PK).toBase58(),
-        flower_name: flowerName(flower.visualSpeciesId, flower.flowerIndex),
-        generation: flower.generation,
+        flower_name: flower
+          ? flowerName(flower.visualSpeciesId, flower.flowerIndex)
+          : CLOSED_FLOWER_NAME,
+        generation: flower ? flower.generation : 0,
       });
     }
     const winnersErr = winnerRows.length
