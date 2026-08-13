@@ -181,6 +181,14 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
   // Persist a finished round's results to Supabase so the frontend Daily Winners panel can show
   // them. Server-side write with the SERVICE key (bypasses RLS). Skipped silently when
   // SUPABASE_URL/SERVICE_KEY aren't configured, and never fatal to the reveal itself.
+  //
+  // Writes are ON CONFLICT DO NOTHING (upsert + ignoreDuplicates). This is about handling a
+  // re-run gracefully, NOT about preventing duplication — that is already impossible since the
+  // 2026-08-13 migration keyed round_results by round_number and round_winners by the composite
+  // (round_number, rank); both are declared in the frontend's supabase/round_results.sql. What
+  // it changes is the report: a second write would otherwise raise 23505 and log a scary
+  // failure for what is really a no-op. That now matters routinely, because set-round-results
+  // may already have published this round from the Operator Panel.
   async function saveResultsToSupabase(roundNumber: number, round: any, scored: any[]) {
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_KEY;
@@ -199,15 +207,20 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
 
     const targetTraits: number[] = (round.targetTraits as number[]).slice(0, round.targetTraitCount);
 
-    // round_results — one summary row for the round.
-    const resultsErr = (
-      await supabase.from("round_results").insert({
-        round_number: roundNumber,
-        target_traits: JSON.stringify(targetTraits),
-        total_entrants: round.participantCount,
-        completed_at: new Date().toISOString(),
-      })
-    ).error;
+    // round_results — one summary row for the round. `.select()` reports what was actually
+    // written: an empty array means the row already existed and the conflict was ignored.
+    const results = await supabase
+      .from("round_results")
+      .upsert(
+        {
+          round_number: roundNumber,
+          target_traits: JSON.stringify(targetTraits),
+          total_entrants: round.participantCount,
+          completed_at: new Date().toISOString(),
+        },
+        { onConflict: "round_number", ignoreDuplicates: true },
+      )
+      .select("round_number");
 
     // round_winners — one row per top-3 winner, with the flower's player-facing name + gen.
     const byEntry = new Map<string, any>(scored.map((e) => [(e.pubkey as PK).toBase58(), e]));
@@ -233,15 +246,19 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
         generation: flower ? flower.generation : 0,
       });
     }
-    const winnersErr = winnerRows.length
-      ? (await supabase.from("round_winners").insert(winnerRows)).error
+    const winners = winnerRows.length
+      ? await supabase
+          .from("round_winners")
+          .upsert(winnerRows, { onConflict: "round_number,rank", ignoreDuplicates: true })
+          .select("rank")
       : null;
 
-    if (resultsErr || winnersErr) {
-      console.log(`  (Supabase write error: ${(resultsErr ?? winnersErr)!.message})`);
+    if (results.error || winners?.error) {
+      console.log(`  (Supabase write error: ${(results.error ?? winners!.error)!.message})`);
       return;
     }
-    console.log(`Results saved to Supabase`);
+    const wrote = (results.data?.length ?? 0) > 0 || (winners?.data?.length ?? 0) > 0;
+    console.log(wrote ? `Results saved to Supabase` : `Results were already published to Supabase`);
   }
 
   // Commands that ONLY the config authority may run (operators are barred).

@@ -1254,6 +1254,13 @@ async function main(): Promise<void> {
   // only handler is the top-level .catch(process.exit(1)). A throw here would exit with the
   // winners revealed but the prizes unpaid, the round never finalized and the next round never
   // opened: it would cost that day's round outright.
+  //
+  // Writes are ON CONFLICT DO NOTHING (upsert + ignoreDuplicates). True duplication is already
+  // impossible since the 2026-08-13 migration gave round_results a round_number key and
+  // round_winners the composite (round_number, rank) key, both declared in the frontend's
+  // supabase/round_results.sql; this just turns a re-run — or a round the set-round-results
+  // edge function already published from the Operator Panel — into a quiet no-op instead of a
+  // logged 23505.
   async function saveResultsToSupabase(roundNumber: number, round: any, scored: any[]) {
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_KEY;
@@ -1263,14 +1270,19 @@ async function main(): Promise<void> {
     const supabase = createClient(url, key);
     const targetTraits: number[] = (round.targetTraits as number[]).slice(0, round.targetTraitCount);
 
-    const resultsErr = (
-      await supabase.from("round_results").insert({
-        round_number: roundNumber,
-        target_traits: JSON.stringify(targetTraits),
-        total_entrants: round.participantCount,
-        completed_at: new Date().toISOString(),
-      })
-    ).error;
+    // `.select()` reports what was actually written: empty means the conflict was ignored.
+    const results = await supabase
+      .from("round_results")
+      .upsert(
+        {
+          round_number: roundNumber,
+          target_traits: JSON.stringify(targetTraits),
+          total_entrants: round.participantCount,
+          completed_at: new Date().toISOString(),
+        },
+        { onConflict: "round_number", ignoreDuplicates: true },
+      )
+      .select("round_number");
 
     const byEntry = new Map<string, any>(scored.map((e) => [(e.pubkey as PK).toBase58(), e]));
     const top: PK[] = [round.top1, round.top2, round.top3];
@@ -1292,15 +1304,19 @@ async function main(): Promise<void> {
         generation: flower ? flower.generation : 0,
       });
     }
-    const winnersErr = winnerRows.length
-      ? (await supabase.from("round_winners").insert(winnerRows)).error
+    const winners = winnerRows.length
+      ? await supabase
+          .from("round_winners")
+          .upsert(winnerRows, { onConflict: "round_number,rank", ignoreDuplicates: true })
+          .select("rank")
       : null;
 
-    if (resultsErr || winnersErr) {
-      console.log(`  (Supabase write error: ${(resultsErr ?? winnersErr)!.message})`);
+    if (results.error || winners?.error) {
+      console.log(`  (Supabase write error: ${(results.error ?? winners!.error)!.message})`);
       return;
     }
-    console.log(`  Results saved to Supabase`);
+    const wrote = (results.data?.length ?? 0) > 0 || (winners?.data?.length ?? 0) > 0;
+    console.log(wrote ? `  Results saved to Supabase` : `  Results were already published to Supabase`);
   }
 
   // Pay the SOL prize pool from the Treasury to each winner wallet, sequentially (rank 1, then
