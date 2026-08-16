@@ -50,7 +50,8 @@ const MAX_EMBIGGEN_IX_PER_TX = 18;
 const RAW_HEADER = 9; // 8-byte discriminator + 1-byte bump
 
 const CIRCUIT = (process.env.CIRCUIT ?? "breed") as
-  | "breed" | "score_entry_v2" | "reveal_top3" | "private_hint" | "reveal_top3_v3";
+  | "breed" | "score_entry_v2" | "reveal_top3" | "private_hint" | "reveal_top3_v3"
+  | "breed_v3" | "reveal_top3_v5";
 const EXECUTE = process.env.UPLOAD_EXECUTE === "yes";
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? "8");
 const INTER_BATCH_DELAY_MS = Number(process.env.INTER_BATCH_DELAY_MS ?? "250");
@@ -89,6 +90,11 @@ describe(`secret-garden DEVNET resilient upload: ${CIRCUIT} (execute=${EXECUTE})
     reveal_top3: "initRevealTop3CompDef",
     private_hint: "initPrivateHintCompDef",
     reveal_top3_v3: "initRevealTop3V3CompDef",
+    // The Anchor init instructions kept their original names across the circuit renames —
+    // COMP_DEF_OFFSET_BREED is comp_def_offset("breed_v3") and COMP_DEF_OFFSET_REVEAL_TOP3_V3
+    // is comp_def_offset("reveal_top3_v5"), so these two reuse the same instructions.
+    breed_v3: "initBreedingCompDef",
+    reveal_top3_v5: "initRevealTop3V3CompDef",
   };
 
   it(`uploads/repairs ${CIRCUIT} circuit and finalizes`, async function () {
@@ -101,7 +107,20 @@ describe(`secret-garden DEVNET resilient upload: ${CIRCUIT} (execute=${EXECUTE})
 
     // --- comp-def: register if missing (HTTP); skip if already finalized ---
     const compDefInfo = { pubkey: compDefPda, offset: offsetNum };
-    let cdInfo = await conn.getAccountInfo(compDefPda);
+    // The FIRST RPC call of a fresh process intermittently dies with an undici
+    // "fetch failed" (cold DNS/TLS), which aborted three upload runs before any bytes were
+    // sent. Retry it rather than burning a whole run on a connection warm-up.
+    let cdInfo = null;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try {
+        cdInfo = await conn.getAccountInfo(compDefPda);
+        break;
+      } catch (e) {
+        if (attempt === 5) throw e;
+        console.log(`  comp-def read failed (attempt ${attempt}): ${String((e as Error).message).slice(0, 60)} — retrying`);
+        await sleep(1500 * attempt);
+      }
+    }
     if (!cdInfo) {
       const method = INIT_METHOD[CIRCUIT];
       console.log(`comp-def NOT registered -> ${EXECUTE ? "registering" : "would register"} via ${method}`);
