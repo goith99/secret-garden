@@ -142,7 +142,9 @@ pub mod secret_garden {
         let count = config.operator_count as usize;
         require!(count < 3, SecretGardenError::OperatorSlotsFull);
         require!(
-            !config.operators[..count].iter().any(|op| *op == new_operator),
+            !config.operators[..count]
+                .iter()
+                .any(|op| *op == new_operator),
             SecretGardenError::OperatorAlreadyExists
         );
         config.operators[count] = new_operator;
@@ -576,7 +578,13 @@ pub mod secret_garden {
                 offspring.genome_commitment = commitment;
                 // Stage 3C: the four packed visual classes (was always 0 before). Public,
                 // MPC-random — see the circuit's mask comment; it does NOT leak the genome.
-                offspring.revealed_trait_mask = revealed_trait_mask;
+                //
+                // The circuit also packs the cosmetic rarity tier into bits 19-21 of the
+                // same u32. Unpack it into `rarity`, then store the mask with those bits
+                // CLEARED: the frontend decoder reads whole bytes (`(mask >> 8k) & 0xff`)
+                // and never strips, so leaving them set would corrupt the leaf class.
+                offspring.rarity = ((revealed_trait_mask >> RARITY_SHIFT) & 0x7) as u8;
+                offspring.revealed_trait_mask = revealed_trait_mask & RARITY_STRIP_MASK;
                 offspring.status = FLOWER_STATUS_ACTIVE;
 
                 ctx.accounts.flower_a.status = FLOWER_STATUS_ACTIVE;
@@ -846,15 +854,14 @@ pub mod secret_garden {
             (1..=MAX_PARTICIPANTS as usize).contains(&participant_count),
             SecretGardenError::ScoringIncomplete
         );
-        // remaining_accounts is now TWO runs: the `participant_count` entries, then their
-        // FlowerRecords in the SAME order. The second run feeds `reveal_top3_v5`'s rarity
-        // tiebreak; each is matched against the `flower_record` its own entry recorded at
-        // submission, so the caller cannot pair an entry with a richer flower.
+        // remaining_accounts is ONE run: the `participant_count` entries. `reveal_top3_v5`'s
+        // rarity tiebreak reads `entry.rarity_snapshot`, taken from the flower by
+        // `submit_entry`, so the flowers no longer have to be passed here at all.
         require!(
-            ctx.remaining_accounts.len() == participant_count * 2,
+            ctx.remaining_accounts.len() == participant_count,
             SecretGardenError::WrongEntryCount
         );
-        let (entry_infos, flower_infos) = ctx.remaining_accounts.split_at(participant_count);
+        let entry_infos = ctx.remaining_accounts;
 
         let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
         let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
@@ -865,7 +872,7 @@ pub mod secret_garden {
             require!(entry.scored, SecretGardenError::ScoringIncomplete);
             entry_keys[i] = info.key();
             entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
-            rarities[i] = read_flower_rarity(&flower_infos[i], &entry.flower_record)?;
+            rarities[i] = entry.rarity_snapshot;
         }
         for i in participant_count..MAX_PARTICIPANTS as usize {
             entry_keys[i] = entry_keys[0];
@@ -1068,7 +1075,7 @@ pub mod secret_garden {
             SecretGardenError::InvalidShardLayout
         );
         require!(
-            ctx.remaining_accounts.len() == n * 2,
+            ctx.remaining_accounts.len() == n,
             SecretGardenError::WrongEntryCount
         );
 
@@ -1083,12 +1090,10 @@ pub mod secret_garden {
         // For the FINAL every account must be one of the recorded shard winners, which
         // with the exact count and the no-duplicates ordering proves the supplied set IS
         // the recorded finalist set, merely reordered into pubkey order.
-        // remaining_accounts is TWO runs: the entries, then their FlowerRecords in the SAME
-        // order, for `reveal_top3_v5`'s rarity tiebreak. Each flower is matched against the
-        // `flower_record` its own entry recorded, so a caller cannot pair an entry with a
-        // richer flower. Flowers are plain reads, NOT `ArgBuilder::account()` refs, so this
-        // does not touch MAX_REVEAL_ACCOUNT_REFS.
-        let (entry_infos, flower_infos) = ctx.remaining_accounts.split_at(n);
+        // remaining_accounts is ONE run: just the entries. `reveal_top3_v5`'s rarity
+        // tiebreak reads `entry.rarity_snapshot`, which `submit_entry` copied from the
+        // flower, so no second run of FlowerRecords is needed.
+        let entry_infos = ctx.remaining_accounts;
         let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
         let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
         let mut rarities = [0u8; MAX_PARTICIPANTS as usize];
@@ -1123,7 +1128,7 @@ pub mod secret_garden {
             prev = key;
             entry_keys[i] = key;
             entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
-            rarities[i] = read_flower_rarity(&flower_infos[i], &entry.flower_record)?;
+            rarities[i] = entry.rarity_snapshot;
         }
         // Pad the circuit's unused slots with the first entry (masked to 0 by the circuit).
         for i in n..MAX_PARTICIPANTS as usize {
@@ -1540,7 +1545,10 @@ pub mod secret_garden {
         );
         let round_key = ctx.accounts.round.key();
         let t = ctx.accounts.tier1.load()?;
-        require!(t.round == round_key, SecretGardenError::BracketRoundMismatch);
+        require!(
+            t.round == round_key,
+            SecretGardenError::BracketRoundMismatch
+        );
         require!(t.promoted == 0, SecretGardenError::Tier1AlreadyPromoted);
         require!(
             !ctx.accounts.round.scoring_revealed,
@@ -1554,16 +1562,14 @@ pub mod secret_garden {
         let k = shard_index as usize;
         let size = t.shard_sizes[k] as usize;
         require!(
-            ctx.remaining_accounts.len() == size * 2,
+            ctx.remaining_accounts.len() == size,
             SecretGardenError::WrongEntryCount
         );
 
-        // remaining_accounts is TWO runs: the entries, then their FlowerRecords in the SAME
-        // order, for `reveal_top3_v5`'s rarity tiebreak. Each flower is matched against the
-        // `flower_record` its own entry recorded, so a caller cannot pair an entry with a
-        // richer flower. Flowers are plain reads, NOT `ArgBuilder::account()` refs, so this
-        // does not touch MAX_REVEAL_ACCOUNT_REFS.
-        let (entry_infos, flower_infos) = ctx.remaining_accounts.split_at(size);
+        // remaining_accounts is ONE run: just the entries. `reveal_top3_v5`'s rarity
+        // tiebreak reads `entry.rarity_snapshot`, which `submit_entry` copied from the
+        // flower, so no second run of FlowerRecords is needed.
+        let entry_infos = ctx.remaining_accounts;
         let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
         let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
         let mut rarities = [0u8; MAX_PARTICIPANTS as usize];
@@ -1590,7 +1596,7 @@ pub mod secret_garden {
             prev = key;
             entry_keys[i] = key;
             entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
-            rarities[i] = read_flower_rarity(&flower_infos[i], &entry.flower_record)?;
+            rarities[i] = entry.rarity_snapshot;
         }
         for i in size..MAX_PARTICIPANTS as usize {
             entry_keys[i] = entry_keys[0];
@@ -1662,7 +1668,10 @@ pub mod secret_garden {
         );
         let k = shard_index as usize;
         let mut t = ctx.accounts.tier1.load_mut()?;
-        require!(t.round == round_key, SecretGardenError::BracketRoundMismatch);
+        require!(
+            t.round == round_key,
+            SecretGardenError::BracketRoundMismatch
+        );
         require!(t.promoted == 0, SecretGardenError::Tier1AlreadyPromoted);
         // Reject a tier-1 shard result queued under a superseded Tier1State (a re-init after
         // close_tier1_bracket produces a fresh generation from a later slot).
@@ -1745,7 +1754,10 @@ pub mod secret_garden {
         // and `&mut ctx.accounts.bracket` would conflict at the `ctx.accounts` level.
         let (n, count, sizes, bounds) = {
             let t = ctx.accounts.tier1.load()?;
-            require!(t.round == round_key, SecretGardenError::BracketRoundMismatch);
+            require!(
+                t.round == round_key,
+                SecretGardenError::BracketRoundMismatch
+            );
             require!(t.promoted == 0, SecretGardenError::Tier1AlreadyPromoted);
             require!(t.all_shards_collected(), SecretGardenError::Tier1NotReady);
 
@@ -1829,16 +1841,14 @@ pub mod secret_garden {
             .map(|s| *s as usize)
             .sum();
         require!(
-            ctx.remaining_accounts.len() == size * 2,
+            ctx.remaining_accounts.len() == size,
             SecretGardenError::WrongEntryCount
         );
 
-        // remaining_accounts is TWO runs: the entries, then their FlowerRecords in the SAME
-        // order, for `reveal_top3_v5`'s rarity tiebreak. Each flower is matched against the
-        // `flower_record` its own entry recorded, so a caller cannot pair an entry with a
-        // richer flower. Flowers are plain reads, NOT `ArgBuilder::account()` refs, so this
-        // does not touch MAX_REVEAL_ACCOUNT_REFS.
-        let (entry_infos, flower_infos) = ctx.remaining_accounts.split_at(size);
+        // remaining_accounts is ONE run: just the entries. `reveal_top3_v5`'s rarity
+        // tiebreak reads `entry.rarity_snapshot`, which `submit_entry` copied from the
+        // flower, so no second run of FlowerRecords is needed.
+        let entry_infos = ctx.remaining_accounts;
         let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
         let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
         let mut rarities = [0u8; MAX_PARTICIPANTS as usize];
@@ -1852,7 +1862,7 @@ pub mod secret_garden {
             );
             entry_keys[i] = info.key();
             entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
-            rarities[i] = read_flower_rarity(&flower_infos[i], &entry.flower_record)?;
+            rarities[i] = entry.rarity_snapshot;
         }
         for i in size..MAX_PARTICIPANTS as usize {
             entry_keys[i] = entry_keys[0];
@@ -2393,6 +2403,80 @@ pub mod secret_garden {
         // Grow in place; `resize` zero-initializes the appended byte, so
         // times_bred_as_parent = 0.
         info.resize(new_len)?;
+        Ok(())
+    }
+
+    /// Grows a pre-5E `CompetitionEntry` by the one appended `rarity_snapshot` byte and
+    /// BACKFILLS it from the flower that entry submitted.
+    ///
+    /// Unlike `migrate_flower`, resizing alone is not enough here: a zero-initialised
+    /// snapshot would rank every pre-existing entry as rarity 0 in `reveal_top3_v5`'s
+    /// tiebreak. So this re-derives the value the same way `submit_entry` would have, using
+    /// `read_flower_rarity`'s validation one final time — `expected` is the `flower_record`
+    /// read out of the entry's own data, so the operator cannot pair an entry with a richer
+    /// flower any more than the old reveal path could.
+    ///
+    /// WRITE-ONCE, like the field itself. The whole handler is gated on the account still
+    /// being the old size, so a migrated entry is an immediate no-op and the snapshot can
+    /// never be rewritten afterwards. That also makes it safely idempotent to re-run over
+    /// the population.
+    pub fn migrate_entry(ctx: Context<MigrateEntry>) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+
+        let info = ctx.accounts.entry.to_account_info();
+        let new_len = 8 + CompetitionEntry::INIT_SPACE;
+        let old_len = info.data_len();
+
+        // Already migrated (or larger): nothing to do, and the snapshot stays untouched.
+        if old_len >= new_len {
+            return Ok(());
+        }
+
+        // Prove this really is a CompetitionEntry before trusting any offset into it. The
+        // seeds and `owner = crate::ID` on the account already pin it to this program; the
+        // discriminator rules out a different account type at the same address shape.
+        let expected_flower = {
+            let data = info.try_borrow_data()?;
+            require!(
+                data.len() >= ENTRY_FLOWER_OFFSET + 32,
+                SecretGardenError::WrongEntryCount
+            );
+            require!(
+                &data[..8] == CompetitionEntry::DISCRIMINATOR,
+                SecretGardenError::WrongEntryCount
+            );
+            Pubkey::try_from(&data[ENTRY_FLOWER_OFFSET..ENTRY_FLOWER_OFFSET + 32])
+                .map_err(|_| error!(SecretGardenError::WrongEntryCount))?
+        };
+
+        // Validate the supplied flower against the one the entry recorded, and read its
+        // rarity — the same check the reveal used to perform per entry, per shard.
+        let rarity = read_flower_rarity(&ctx.accounts.flower.to_account_info(), &expected_flower)?;
+
+        // Top up rent so the larger account stays rent-exempt — from the OPERATOR.
+        let required = Rent::get()?.minimum_balance(new_len);
+        let current = info.lamports();
+        if required > current {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.authority.to_account_info(),
+                        to: info.clone(),
+                    },
+                ),
+                required - current,
+            )?;
+        }
+
+        // Grow, then write the snapshot into the byte `resize` just zero-filled. It is the
+        // LAST field of the struct, so it is the last byte of the account.
+        info.resize(new_len)?;
+        let mut data = info.try_borrow_mut_data()?;
+        data[new_len - 1] = rarity;
         Ok(())
     }
 }
@@ -3765,6 +3849,39 @@ pub struct MigrateFlower<'info> {
         bump,
         owner = crate::ID,
     )]
+    pub flower: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Operator-signed entry migration (see `migrate_entry`). Neither `round` nor `player`
+/// signs: both are bare accounts supplied only so the entry PDA can be derived, which is
+/// what lets one operator wallet migrate the whole population. The seeds constraint is what
+/// makes that safe — a fabricated `round`/`player` pair simply derives an address that is
+/// not the entry being passed, and the account would fail `owner = crate::ID` besides.
+#[derive(Accounts)]
+pub struct MigrateEntry<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, GameConfig>,
+    /// CHECK: not a signer and never written — supplied only to derive the entry PDA below.
+    pub round: UncheckedAccount<'info>,
+    /// CHECK: not a signer and never written — supplied only to derive the entry PDA below.
+    pub player: UncheckedAccount<'info>,
+    /// CHECK: deserialized/realloc'd manually; a pre-5E entry is 1 byte short of
+    /// `CompetitionEntry`, so it cannot be loaded as a typed `Account`. The seeds bind it to
+    /// `round` and `player`, `owner = crate::ID` proves it is one of this program's
+    /// accounts, and the handler checks its discriminator before reading any offset.
+    #[account(
+        mut,
+        seeds = [ENTRY_SEED, round.key().as_ref(), player.key().as_ref()],
+        bump,
+        owner = crate::ID,
+    )]
+    pub entry: UncheckedAccount<'info>,
+    /// CHECK: validated by `read_flower_rarity` against the `flower_record` stored in the
+    /// entry itself — key match, program ownership and discriminator are all re-checked
+    /// there, so a substituted flower is rejected.
     pub flower: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }

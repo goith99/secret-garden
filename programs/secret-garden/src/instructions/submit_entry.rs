@@ -99,6 +99,12 @@ pub(crate) fn handler(ctx: Context<SubmitEntry>) -> Result<()> {
         // Stage 5A: no scoring computation queued at submission time.
         score_queued: false,
         queued_at: 0,
+        // Stage 5E: snapshot the flower's rarity for `reveal_top3_v5`'s tiebreak. Read from
+        // the typed `Account<FlowerRecord>` above, which Anchor has already proven is
+        // program-owned with the right discriminator, and which this handler has just
+        // checked is Active and owned by the signer. Taking it here rather than at reveal
+        // time is what keeps the reveal's remaining accounts at n instead of 2n.
+        rarity_snapshot: ctx.accounts.flower_record.rarity,
     });
 
     // Mark the flower used and bump the counters. `participant_count` is guarded above

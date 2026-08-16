@@ -17,7 +17,7 @@ import type { SecretGarden } from "../target/types/secret_garden";
 
 const { PublicKey } = anchor.web3;
 const RAW_HEADER = 9; // 8-byte discriminator + 1-byte bump
-const CIRCUIT = (process.env.CIRCUIT ?? "breed") as string;
+const CIRCUIT = (process.env.CIRCUIT ?? "breed_v3") as string;
 const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
 
 describe(`verify on-chain circuit bytes: ${CIRCUIT}`, () => {

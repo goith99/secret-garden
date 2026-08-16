@@ -90,7 +90,7 @@ describe("secret-garden Stage 3B: encrypted breeding (live cluster)", () => {
     ),
     compDefAccount: arcium.getCompDefAccAddress(
       program.programId,
-      Buffer.from(arcium.getCompDefAccOffset("breed")).readUInt32LE(),
+      Buffer.from(arcium.getCompDefAccOffset("breed_v3")).readUInt32LE(),
     ),
   });
 
@@ -187,7 +187,7 @@ describe("secret-garden Stage 3B: encrypted breeding (live cluster)", () => {
 
     // Register the breed computation definition and upload the compiled circuit.
     const arciumProgram = arcium.getArciumProgram(provider);
-    const compDefOffset = arcium.getCompDefAccOffset("breed");
+    const compDefOffset = arcium.getCompDefAccOffset("breed_v3");
     const compDefPda = PublicKey.findProgramAddressSync(
       [
         arcium.getArciumAccountBaseSeed("ComputationDefinitionAccount"),
@@ -214,7 +214,7 @@ describe("secret-garden Stage 3B: encrypted breeding (live cluster)", () => {
       .rpc({ commitment: "confirmed" });
     await arcium.uploadCircuit(
       provider,
-      "breed",
+      "breed_v3",
       program.programId,
       fs.readFileSync("build/breed.arcis"),
       true,

@@ -2,8 +2,8 @@ use anchor_lang::prelude::*;
 
 use crate::constants::{
     ENCRYPTED_GENOME_LEN, ENCRYPTION_METADATA_LEN, ENTRY_SCORE_LEN, ENTRY_SCORE_NONCE_LEN,
-    FLOWER_RARITY_OFFSET,
-    GENOME_COMMITMENT_LEN, HINT_CIPHERTEXT_LEN, HINT_ENCRYPTION_KEY_LEN, HINT_NONCE_LEN,
+    FLOWER_RARITY_OFFSET, GENOME_COMMITMENT_LEN, HINT_CIPHERTEXT_LEN, HINT_ENCRYPTION_KEY_LEN,
+    HINT_NONCE_LEN,
 };
 
 /// Singleton game configuration. PDA seeds: `[b"config"]`.
@@ -267,7 +267,6 @@ impl FlowerRecord {
     }
 }
 
-
 /// A daily competition round. PDA seeds: `[b"round", round_id_le]`.
 #[account]
 #[derive(InitSpace)]
@@ -350,6 +349,35 @@ pub struct CompetitionEntry {
     /// Unix timestamp of the most recent `queue_score_entry` for this entry (0 until first
     /// queued). Drives the `cancel_stuck_score` timeout.
     pub queued_at: i64,
+
+    // --- Stage 5E: rarity snapshot (appended LAST; every prior offset is unchanged) ---
+    /// The submitted flower's `rarity`, copied here by `submit_entry` at the moment of
+    /// submission, for `reveal_top3_v5`'s composite ranking key (`score * 8 + rarity`).
+    ///
+    /// WHY SNAPSHOT RATHER THAN READ THE FLOWER AT REVEAL TIME. The reveal used to take a
+    /// SECOND run of remaining accounts — the FlowerRecord behind every entry — purely to
+    /// read this one byte. At `MAX_SHARD_SIZE` (13) that is 26 account references, and the
+    /// queue transaction reached 1580 bytes against Solana's 1232-byte packet limit, so the
+    /// largest shards became unsendable. Shrinking the shard was not available either: the
+    /// `MAX_TIER1_WINNERS <= MAX_SHARDS * MAX_SHARD_SIZE` assert in `constants.rs` fails at
+    /// any smaller shard size, and the `MAX_FINALISTS <= MAX_REVEAL_ACCOUNT_REFS` assert
+    /// caps `MAX_SHARDS` at 4, so the bracket cannot absorb the extra shards. Carrying the
+    /// byte on the entry removes the second account run outright: the reveal already
+    /// deserializes every entry, so rarity now costs ZERO additional accounts.
+    ///
+    /// EQUALLY TRUSTLESS, AND WRITE-ONCE. `submit_entry` reads it from a typed, validated
+    /// `Account<FlowerRecord>` that Anchor has already proven is program-owned with the
+    /// right discriminator, and which the handler checks is Active and owned by the signer —
+    /// the same guarantees `read_flower_rarity` reconstructs by hand from a raw AccountInfo.
+    /// The entry is created with `init` and no instruction ever rewrites this field, so it
+    /// cannot be re-snapshotted later. Nothing can change the value behind its back either:
+    /// `rarity` is only ever written when a flower is CREATED (starters in `claim_starters`,
+    /// offspring in `start_breeding`/`breed_v3_callback`) and never mutated afterwards, and
+    /// a Submitted flower cannot be bred (breeding requires Active), released (that requires
+    /// the round Finalized) or closed while the round is live.
+    ///
+    /// 0 for entries created before this field existed; `migrate_entry` backfills them.
+    pub rarity_snapshot: u8,
 }
 
 /// A breeding experiment: one queued (and later resolved) MPC computation.
@@ -646,7 +674,73 @@ mod tests {
     //! the `start_breeding` body that wraps it cannot run under bankrun (its Arcium
     //! accounts don't exist) and only fully runs against a live cluster.
     use super::*;
-    use crate::constants::MAX_BREEDS_PER_ROUND;
+    use crate::constants::{ENTRY_FLOWER_OFFSET, MAX_BREEDS_PER_ROUND};
+
+    /// `migrate_entry` writes the backfilled snapshot at `8 + INIT_SPACE - 1`, i.e. it
+    /// assumes `rarity_snapshot` is the LAST byte of a CompetitionEntry. Appending any field
+    /// after it would silently redirect that write into the new field and leave every
+    /// migrated entry ranking at rarity 0. Serialize a record with a recognisable value and
+    /// prove the byte really does land last.
+    #[test]
+    fn rarity_snapshot_is_the_final_byte_of_an_entry() {
+        let entry = CompetitionEntry {
+            round: Pubkey::new_unique(),
+            player: Pubkey::new_unique(),
+            flower_record: Pubkey::new_unique(),
+            submitted_at: 0,
+            status: 0,
+            bump: 0,
+            encrypted_score: [0u8; crate::constants::ENTRY_SCORE_LEN],
+            score_nonce: [0u8; crate::constants::ENTRY_SCORE_NONCE_LEN],
+            scored: false,
+            score_error_code: 0,
+            score_queued: false,
+            queued_at: 0,
+            rarity_snapshot: 0xAB,
+        };
+        let mut buf = Vec::new();
+        entry.serialize(&mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            CompetitionEntry::INIT_SPACE,
+            "INIT_SPACE drifted"
+        );
+        assert_eq!(
+            *buf.last().unwrap(),
+            0xAB,
+            "rarity_snapshot is no longer the last byte — migrate_entry writes the wrong one"
+        );
+    }
+
+    /// The other raw offset `migrate_entry` depends on: it reads `flower_record` out of a
+    /// pre-migration entry before the account can be typed. Includes the 8-byte
+    /// discriminator, which the serialized struct above does not.
+    #[test]
+    fn entry_flower_offset_matches_the_layout() {
+        let flower = Pubkey::new_unique();
+        let entry = CompetitionEntry {
+            round: Pubkey::new_unique(),
+            player: Pubkey::new_unique(),
+            flower_record: flower,
+            submitted_at: 0,
+            status: 0,
+            bump: 0,
+            encrypted_score: [0u8; crate::constants::ENTRY_SCORE_LEN],
+            score_nonce: [0u8; crate::constants::ENTRY_SCORE_NONCE_LEN],
+            scored: false,
+            score_error_code: 0,
+            score_queued: false,
+            queued_at: 0,
+            rarity_snapshot: 0,
+        };
+        let mut buf = vec![0u8; 8]; // discriminator
+        entry.serialize(&mut buf).unwrap();
+        assert_eq!(
+            &buf[ENTRY_FLOWER_OFFSET..ENTRY_FLOWER_OFFSET + 32],
+            flower.as_ref(),
+            "ENTRY_FLOWER_OFFSET no longer points at flower_record"
+        );
+    }
 
     fn blank_profile() -> PlayerProfile {
         PlayerProfile {
@@ -722,7 +816,11 @@ mod tests {
         }
         assert_eq!(t.winner_count, 5);
         let got: Vec<u8> = (0..5).map(|i| t.winners[i].to_bytes()[31]).collect();
-        assert_eq!(got, vec![1, 3, 5, 7, 9], "winners must be ascending by pubkey");
+        assert_eq!(
+            got,
+            vec![1, 3, 5, 7, 9],
+            "winners must be ascending by pubkey"
+        );
     }
 
     #[test]
@@ -741,7 +839,10 @@ mod tests {
             assert!(t.insert_winner_sorted(pk(i as u8)));
         }
         assert_eq!(t.winner_count as usize, crate::constants::MAX_TIER1_WINNERS);
-        assert!(!t.insert_winner_sorted(pk(200)), "must refuse past capacity");
+        assert!(
+            !t.insert_winner_sorted(pk(200)),
+            "must refuse past capacity"
+        );
     }
 
     #[test]

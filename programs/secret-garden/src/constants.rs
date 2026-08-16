@@ -343,6 +343,12 @@ pub const ENTRY_SCORE_NONCE_LEN: usize = 16;
 /// flower_record(32) + submitted_at(8) + status(1) + bump(1) = 114.
 pub const ENTRY_SCORE_OFFSET: u32 = 114;
 
+/// Byte offset of `CompetitionEntry::flower_record`, used by `migrate_entry` to recover
+/// which flower an existing entry submitted before it can be loaded as a typed `Account`
+/// (a pre-5E entry is one byte short of the current layout). Same prefix as above:
+/// 8 (discriminator) + round(32) + player(32) = 72.
+pub const ENTRY_FLOWER_OFFSET: usize = 72;
+
 /// Byte offset of `FlowerRecord::rarity` within the account data, used by the reveal
 /// queue instructions to read each entry's rarity for `reveal_top3_v5`'s composite
 /// ranking key. Read as a single byte rather than deserialising the whole record: a

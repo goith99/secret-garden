@@ -112,7 +112,7 @@ describe("secret-garden Stage 4B: scoring (live cluster)", () => {
 
   /** Initialize a comp def and upload its compiled circuit. */
   async function initCompDef(
-    circuit: "breed" | "score_entry_v2" | "reveal_top3",
+    circuit: "breed_v3" | "score_entry_v2" | "reveal_top3",
     method: "initBreedingCompDef" | "initScoreEntryCompDef" | "initRevealTop3CompDef",
   ): Promise<void> {
     const offset = arcium.getCompDefAccOffset(circuit);
@@ -192,7 +192,7 @@ describe("secret-garden Stage 4B: scoring (live cluster)", () => {
         flowerB: flowerPda(player.publicKey, 1),
         experiment,
         offspring,
-        ...queueAccsFor("breed", offset),
+        ...queueAccsFor("breed_v3", offset),
       })
       .signers([player])
       .rpc({ skipPreflight: true, commitment: "confirmed" });
@@ -330,7 +330,7 @@ describe("secret-garden Stage 4B: scoring (live cluster)", () => {
       .signers([authority])
       .rpc({ commitment: "confirmed" });
 
-    await initCompDef("breed", "initBreedingCompDef");
+    await initCompDef("breed_v3", "initBreedingCompDef");
     await initCompDef("score_entry_v2", "initScoreEntryCompDef");
     await initCompDef("reveal_top3", "initRevealTop3CompDef");
 

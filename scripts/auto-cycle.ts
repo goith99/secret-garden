@@ -1037,7 +1037,7 @@ async function main(): Promise<void> {
           .accountsPartial({
             authority: signer.publicKey, config: configPda, round, bracket,
             result: shardResultPda(round, k),
-            ...queueAccsFor("reveal_top3_v3", offset),
+            ...queueAccsFor("reveal_top3_v5", offset),
           })
           .remainingAccounts(metas(plan.shards[k].entries))
           .transaction();
@@ -1107,7 +1107,7 @@ async function main(): Promise<void> {
             .accountsPartial({
               authority: signer.publicKey, config: configPda, round, tier1,
               result: shardResultPda(round, k),
-              ...queueAccsFor("reveal_top3_v3", offset),
+              ...queueAccsFor("reveal_top3_v5", offset),
             })
             .remainingAccounts(metas(plan.shards[k].entries))
             .transaction();
@@ -1155,7 +1155,7 @@ async function main(): Promise<void> {
           .accountsPartial({
             authority: signer.publicKey, config: configPda, round, tier1, bracket,
             result: semiResultPda(round, k),
-            ...queueAccsFor("reveal_top3_v3", offset),
+            ...queueAccsFor("reveal_top3_v5", offset),
           })
           .remainingAccounts(metas(sliceFor(k)))
           .transaction();
@@ -1209,7 +1209,7 @@ async function main(): Promise<void> {
           .accountsPartial({
             authority: signer.publicKey, config: configPda, round, bracket,
             result: finalResult,
-            ...queueAccsFor("reveal_top3_v3", offset),
+            ...queueAccsFor("reveal_top3_v5", offset),
           })
           .remainingAccounts(metas(finalists))
           .transaction();
