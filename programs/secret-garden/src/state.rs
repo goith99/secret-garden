@@ -2,6 +2,7 @@ use anchor_lang::prelude::*;
 
 use crate::constants::{
     ENCRYPTED_GENOME_LEN, ENCRYPTION_METADATA_LEN, ENTRY_SCORE_LEN, ENTRY_SCORE_NONCE_LEN,
+    FLOWER_RARITY_OFFSET,
     GENOME_COMMITMENT_LEN, HINT_CIPHERTEXT_LEN, HINT_ENCRYPTION_KEY_LEN, HINT_NONCE_LEN,
 };
 
@@ -43,6 +44,41 @@ pub fn is_operator_or_authority(config: &GameConfig, signer: &Pubkey) -> bool {
     config.operators[..config.operator_count as usize]
         .iter()
         .any(|op| op == signer)
+}
+
+/// Reads `FlowerRecord::rarity` out of a raw `AccountInfo`, for the reveal queue
+/// instructions' `reveal_top3_v5` composite ranking key.
+///
+/// TRUSTLESS, NOT OPERATOR-SUPPLIED. `expected` is the `flower_record` pubkey stored on the
+/// CompetitionEntry being ranked, so the caller cannot substitute a different (higher-rarity)
+/// flower for someone else's entry: the key must match the one the entry itself recorded at
+/// submission. Ownership and the account discriminator are both checked, so a look-alike
+/// account of another type is rejected too.
+///
+/// Reads ONE byte rather than deserialising. A FlowerRecord is 529 bytes, 320 of which are
+/// the encrypted genome, and a full-round reveal ranks up to 16 of them — deserialising each
+/// one would burn compute to obtain a single `u8` that sits at a fixed offset.
+pub fn read_flower_rarity(info: &AccountInfo, expected: &Pubkey) -> Result<u8> {
+    require_keys_eq!(
+        *info.key,
+        *expected,
+        crate::error::SecretGardenError::FlowerNotOwned
+    );
+    require_keys_eq!(
+        *info.owner,
+        crate::ID,
+        crate::error::SecretGardenError::FlowerNotOwned
+    );
+    let data = info.try_borrow_data()?;
+    require!(
+        data.len() > FLOWER_RARITY_OFFSET,
+        crate::error::SecretGardenError::FlowerNotOwned
+    );
+    require!(
+        &data[..8] == FlowerRecord::DISCRIMINATOR,
+        crate::error::SecretGardenError::FlowerNotOwned
+    );
+    Ok(data[FLOWER_RARITY_OFFSET])
 }
 
 /// Per-wallet player profile. PDA seeds: `[b"profile", owner]`.
@@ -181,7 +217,56 @@ pub struct FlowerRecord {
     pub encrypted_genome: [u8; ENCRYPTED_GENOME_LEN],
     /// MXE nonce for `encrypted_genome` (little-endian u128 = 16 bytes).
     pub encryption_metadata: [u8; ENCRYPTION_METADATA_LEN],
+    /// Appended LAST so every existing field offset is unchanged — but the account still
+    /// grows by one byte, so a pre-5E FlowerRecord (528 bytes) cannot be read as this struct
+    /// (529 bytes) until `migrate_flower` reallocs it. See that instruction.
+    pub times_bred_as_parent: u8,
 }
+
+impl FlowerRecord {
+    /// Stage 5E per-flower breeding-parent budget. Returns `Err(FlowerParentLimitReached)`
+    /// once this flower has already been a parent `MAX_BREEDS_AS_PARENT` times, and
+    /// otherwise spends one use.
+    ///
+    /// The spend happens at QUEUE time (`start_breeding`), not in the callback: a callback
+    /// can fail, expire, or never arrive, and the parent is genuinely committed (Locked)
+    /// from the queue onward. It is deliberately NOT refunded by
+    /// `cancel_expired_experiment` — refunding would make the cap gameable by queueing and
+    /// immediately cancelling.
+    ///
+    /// The cap is permanent and per flower, unlike `MAX_BREEDS_PER_ROUND`, which is a
+    /// per-player budget that resets each round. An exhausted flower stays fully usable for
+    /// everything else — submit, score, hint, release, close.
+    ///
+    /// Pure (no Anchor context), so it is unit-testable in isolation like
+    /// `register_breed_attempt` and `check_collection_cap`; the `start_breeding` body that
+    /// calls it is unreachable under bankrun (its Arcium accounts don't exist) and only
+    /// fully runs against a live cluster.
+    pub fn register_breed_as_parent(&mut self) -> Result<()> {
+        require!(
+            self.times_bred_as_parent < crate::constants::MAX_BREEDS_AS_PARENT,
+            crate::error::SecretGardenError::FlowerParentLimitReached
+        );
+        self.times_bred_as_parent = self.times_bred_as_parent.saturating_add(1);
+        Ok(())
+    }
+
+    /// Read-only form of the same check, for callers that must validate BOTH parents before
+    /// spending either one's budget (so a rejected breed consumes nothing).
+    pub fn check_breed_as_parent(&self) -> Result<()> {
+        require!(
+            self.times_bred_as_parent < crate::constants::MAX_BREEDS_AS_PARENT,
+            crate::error::SecretGardenError::FlowerParentLimitReached
+        );
+        Ok(())
+    }
+
+    /// Remaining breeding uses, for clients rendering "X/3 uses left".
+    pub fn breeds_as_parent_remaining(&self) -> u8 {
+        crate::constants::MAX_BREEDS_AS_PARENT.saturating_sub(self.times_bred_as_parent)
+    }
+}
+
 
 /// A daily competition round. PDA seeds: `[b"round", round_id_le]`.
 #[account]

@@ -76,6 +76,53 @@ pub const RARITY_RARE: u8 = 3;
 pub const RARITY_EPIC: u8 = 4;
 pub const RARITY_LEGENDARY: u8 = 5; // reserved for non-starter species in later stages
 
+/// Bred-hybrid rarity is rolled inside the `breed_v3` MPC circuit and packed into the
+/// revealed u32 trait mask at bits 19-21, keeping the proven 2-tuple circuit output.
+/// `breed_v3_callback` unpacks it into `FlowerRecord::rarity` and stores a rarity-STRIPPED
+/// mask, so the frontend's petal/color/leaf/stem decoder never sees these bits.
+///
+/// Bits 19-21 and NOT 27-29: the live Arcium output path truncates a revealed u32 at
+/// ~27 bits, so a tier packed at 27-29 reads back as 0 on-chain.
+///
+/// CANONICAL SOURCE for the roll itself: the rarity block in `breed_v3`
+/// (`encrypted-ixs/src/lib.rs`). `tools/rarity-difftest` transcribes the boundary math
+/// and fails if this mirror and the circuit ever disagree.
+pub const RARITY_SHIFT: u32 = 19;
+/// Clears bits 19-21 — `!(0x7 << RARITY_SHIFT)` as a literal.
+pub const RARITY_STRIP_MASK: u32 = 0xFFC7_FFFF;
+
+/// Base tier boundaries over the 256 uniform `u8` roll outcomes, at lift 0.
+/// Lift lowers each of these (see the circuit), making better lineage clear tiers sooner.
+pub const RARITY_BASE_UNCOMMON: u16 = 115;
+pub const RARITY_BASE_RARE: u16 = 192;
+pub const RARITY_BASE_EPIC: u16 = 230;
+pub const RARITY_BASE_LEGENDARY: u16 = 251;
+
+/// How fast each boundary FALLS per unit of lift, as a divisor: boundary = base - lift/DIV.
+/// Uncommon and Rare fall at full rate (lift/1); the top two are deliberately flatter.
+///
+/// Stage 5F rebalance — these were `(lift * 3) / 4` and `lift / 2`. Both had to change
+/// together: Epic's band is `b_legendary - b_epic`, so flattening only Legendary widens
+/// Epic by exactly what it takes from Legendary, relocating the inflation rather than
+/// removing it. See the boundary comment in `breed_v3` for the full derivation.
+pub const RARITY_EPIC_LIFT_DIV: u16 = 4;
+pub const RARITY_LEGENDARY_LIFT_DIV: u16 = 8;
+
+/// Generation stops contributing to the rarity lift beyond this many generations.
+pub const RARITY_GENERATION_CAP: u8 = 10;
+/// Weight applied to the (capped) generation before it enters the lift.
+///
+/// Stage 5F: was 2. At 2 the generation term spanned 2..20 — a third of the whole lift
+/// budget — and accrues with NO player decision, which is what made ordinary play drift to
+/// ~10% Legendary. At 1 it spans 1..10 and the lift ceiling drops 63 -> 53.
+pub const RARITY_GENERATION_WEIGHT: u8 = 1;
+
+/// How many times a single flower may be used as a breeding parent, ever. Counted per
+/// flower in `FlowerRecord::times_bred_as_parent` and enforced for BOTH parent slots in
+/// `start_breeding`. A flower that reaches this cap stays fully usable for everything else
+/// — it can still be submitted to rounds, scored, hinted and closed; only breeding is shut.
+pub const MAX_BREEDS_AS_PARENT: u8 = 3;
+
 /// Visible-trait bit flags packed into `FlowerRecord::revealed_trait_mask`. A set bit
 /// means that cosmetic trait is publicly known. (Stage 3 keeps the remaining traits
 /// hidden inside the encrypted genome.)
@@ -295,6 +342,15 @@ pub const ENTRY_SCORE_NONCE_LEN: usize = 16;
 /// after the original Stage 2 layout: 8 (discriminator) + round(32) + player(32) +
 /// flower_record(32) + submitted_at(8) + status(1) + bump(1) = 114.
 pub const ENTRY_SCORE_OFFSET: u32 = 114;
+
+/// Byte offset of `FlowerRecord::rarity` within the account data, used by the reveal
+/// queue instructions to read each entry's rarity for `reveal_top3_v5`'s composite
+/// ranking key. Read as a single byte rather than deserialising the whole record: a
+/// FlowerRecord is 529 bytes (320 of them the encrypted genome) and a reveal reads up to
+/// 16 of them, so a full `Account::try_from` per slot would be a large, pointless compute
+/// cost. Layout: 8 (discriminator) + owner(32) + flower_index(4) + visual_species_id(1)
+/// + generation(2) = 47.
+pub const FLOWER_RARITY_OFFSET: usize = 47;
 
 /// `CompetitionEntry::score_error_code` set by the callback on a failed score computation.
 /// As with breeding, Arcium 0.10.4's callback only exposes Success vs Failure, so this is

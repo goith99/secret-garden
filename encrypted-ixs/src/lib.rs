@@ -40,8 +40,35 @@ mod circuits {
     /// Parent-kind tag (matches `FlowerRecord.genome_status` on-chain).
     const KIND_STARTER: u8 = 0;
 
+    /// NAMED `_v2` FOR A DEPLOYMENT REASON, NOT A LOGIC ONE — the same reason
+    /// `score_entry_v2` carries its suffix. Stage 5E added three PLAINTEXT parameters
+    /// (`parent_a_rarity`, `parent_b_rarity`, `offspring_generation`) for the cosmetic
+    /// rarity roll. A computation definition stores its circuit's ARGUMENT SIGNATURE, so
+    /// the old `breed` definition — registered against the 7-argument shape — rejects the
+    /// new 10-argument payload with Arcium's `InvalidArguments` (6301). The definition
+    /// cannot be re-uploaded in place either: it is already finalized, and closing it
+    /// requires the CLUSTER EXECPOOL to be EMPTY. On shared devnet cluster 456 that pool
+    /// still holds another MXE's wedged computations from 2026-08-02 (25 of 100 slots as
+    /// of 2026-08-14), and only their payer can reclaim them. Renaming yields a fresh
+    /// comp-def offset that needs no close.
+    ///
+    /// The Anchor instruction names are deliberately UNCHANGED (`start_breeding`,
+    /// `init_breeding_comp_def`), so operator tooling and the frontend are unaffected —
+    /// exactly as with `score_entry_v2`.
+    ///
+    /// `_v3` (Stage 5F) IS A REBALANCE, NOT A SIGNATURE CHANGE. Measured over 45 real
+    /// devnet breeds plus a steady-state model, `_v2`'s lift curve made Legendary reachable
+    /// far more often than the 2% headline implied: the floor is lift 14 (not 0, which is
+    /// unreachable — every flower has rarity >= 1 and every offspring generation >= 1), and
+    /// ordinary "breed your newest" play reached ~10% Legendary by breed 10, ~2.8 expected
+    /// Legendaries per 30 breeds. Two changes, together: the generation term is halved
+    /// (`* 1`, cap unchanged at 10) so lineage depth stops supplying a third of the lift
+    /// budget automatically, and the top-two boundaries are flattened (below) so the tail
+    /// compresses instead of relocating. Result: ~0.95 expected Legendaries per 30 breeds.
+    /// `_v2` cannot be re-uploaded in place for the same execpool reason as above, so the
+    /// rebalance needs a fresh offset regardless.
     #[instruction]
-    pub fn breed(
+    pub fn breed_v3(
         // Parent A: `kind`/`species` are public; `genome` is the parent's stored
         // ciphertext (zeroed and ignored when the parent is a Starter).
         parent_a_kind: u8,
@@ -51,6 +78,12 @@ mod circuits {
         parent_b_kind: u8,
         parent_b_species: u8,
         parent_b_genome: Enc<Mxe, Genome>,
+        // Public lineage inputs for the cosmetic rarity roll. All three are PUBLIC
+        // `FlowerRecord` fields on-chain, so passing them as plaintext leaks nothing new
+        // and their arithmetic runs in the clear (see the rarity block below).
+        parent_a_rarity: u8,
+        parent_b_rarity: u8,
+        offspring_generation: u8,
         // Player's private environment choices.
         env: Enc<Shared, Environment>,
     ) -> (Enc<Mxe, Genome>, u32) {
@@ -292,10 +325,76 @@ mod circuits {
         // Arithmetic packing — NOT bitwise (`<<`/`|` are unsupported on secret values in
         // Arcis). Each class < 5 < 256, so `* 256^k` places it in byte-slot k, exactly
         // matching the documented bit layout above.
+        // --- Cosmetic rarity roll, packed into the mask at bits 19-21 ---
+        //
+        // PURELY COSMETIC. The tier is a display label only: `score_entry_v2` never reads
+        // `rarity`, so this cannot influence Daily Challenge scoring. Only the TIER is ever
+        // revealed — the roll, the lift and the boundaries all stay inside MPC.
+        //
+        // Bits 19-21, NOT 27-29: the live Arcium output path truncates a revealed u32 at
+        // ~27 bits, so a tier packed at 27-29 reads back as 0 on-chain. 19-21 sits below
+        // that cliff (empirically proven on devnet; see tests/rarity.ts).
+        //
+        // PUBLIC lift — parent rarity and generation are public FlowerRecord fields, so
+        // this arithmetic is computed in the clear and costs nothing in MPC (same trick as
+        // `species_nudge_r` above). Parent rarity dominates (x4) because it is the choice
+        // the player actually makes; generation contributes a QUARTER as much (x1, Stage 5F
+        // — was x2) and is still capped at 10. The cap alone was not enough: at x2 the
+        // generation term spanned 2..20, a third of the whole 0..63 lift budget, and it
+        // accrues with no player decision at all, so ordinary play drifted to ~10%
+        // Legendary. At x1 it spans 1..10 and the lift ceiling drops 63 -> 53.
+        let gen_c: u8 = if offspring_generation > 10 {
+            10
+        } else {
+            offspring_generation
+        };
+        let public_lift: u8 = (parent_a_rarity + parent_b_rarity) * 4 + gen_c * 1; // 0..=50
+
+        // SECRET lift — deliberately quantised to FOUR levels, not 256. The tier is a
+        // revealed output, so any dependence on the secret dial is a statistical channel:
+        // each unit of `env_lift` moves a boundary by 1/256 (~0.39pp), which needs on the
+        // order of 10^4 breeds against identical public parents to distinguish. Breeding
+        // costs SOL and MAX_BREEDS_PER_ROUND is 5, so that is out of reach. DO NOT widen
+        // this without redoing that bound — a raw dial here would leak the player's
+        // private cultivation strategy outright.
+        let env_lift: u8 = (((e.light as u16 + e.water as u16 + e.soil as u16) / 3) as u8) / 64;
+
+        let lift: u16 = (public_lift + env_lift) as u16; // 0..=63
+
+        // Lineage LOWERS each boundary, so a better line clears each tier more often.
+        // Rarer tiers fall more slowly (x1, x1, x1/4, x1/8 — Stage 5F flattened the top two
+        // from x3/4 and x1/2). Boundaries stay strictly ordered at every lift: at the new
+        // max lift 53 they are 62 < 139 < 217 < 245. No underflow — the minimum is 245.
+        //
+        // WHY BOTH top slopes moved, not just Legendary's. Epic's band is `b_legendary -
+        // b_epic`, so flattening ONLY b_legendary widens Epic by exactly what it takes from
+        // Legendary — relocating the inflation one tier down rather than removing it (at
+        // x3/4 + x1/8, Epic would reach 23.8% at max lift and OVERTAKE Rare). Flattening
+        // b_epic to x1/4 as well compresses Epic+Legendary together: 10.2% -> 15.2% across
+        // the full range, versus 10.2% -> 28.5% before. The mass Common sheds as lift rises
+        // is conserved (Rare+Epic+Leg = 64 + lift, always), so it lands in Rare instead —
+        // Rare peaks at 30.5%, which is the deliberate trade.
+        let b_uncommon: u16 = 115 - lift;
+        let b_rare: u16 = 192 - lift;
+        let b_epic: u16 = 230 - lift / 4;
+        let b_legendary: u16 = 251 - lift / 8;
+
+        // Branchless carry extraction: for r,b in 0..=255, (r + 256 - b) / 256 == [r >= b].
+        // Max operand 255 + 256 - 52 = 459, so u16 never overflows. This is attempt 4's
+        // proven form, generalised from constant boundaries to lifted ones.
+        let rarity_roll = ArcisRNG::gen_uniform::<u8>();
+        let r16 = rarity_roll as u16;
+        let tier: u8 = 1
+            + ((r16 + 256 - b_uncommon) / 256) as u8
+            + ((r16 + 256 - b_rare) / 256) as u8
+            + ((r16 + 256 - b_epic) / 256) as u8
+            + ((r16 + 256 - b_legendary) / 256) as u8;
+
         let mask: u32 = petal_class as u32
             + (color_class as u32) * 256
             + (leaf_class as u32) * 65_536
-            + (stem_class as u32) * 16_777_216;
+            + (stem_class as u32) * 16_777_216
+            + (tier as u32) * 524_288; // 2^19 -> bits 19-21
 
         // Genome re-encrypted to the MXE (unchanged); mask revealed as public plaintext.
         (Mxe::get().from_arcis(child), mask.reveal())
@@ -612,7 +711,7 @@ mod circuits {
     /// parallel layer, as before), and the rank sums are linear. Only the width shrinks.
     #[allow(clippy::too_many_arguments)]
     #[instruction]
-    pub fn reveal_top3_v3(
+    pub fn reveal_top3_v5(
         s0: Enc<Mxe, u8>,
         s1: Enc<Mxe, u8>,
         s2: Enc<Mxe, u8>,
@@ -630,6 +729,11 @@ mod circuits {
         s14: Enc<Mxe, u8>,
         s15: Enc<Mxe, u8>,
         participant_count: u8,
+        // PUBLIC per-slot rarity, in the SAME slot order as s0..s15. `FlowerRecord::rarity`
+        // is already plaintext on-chain, so passing it in the clear leaks nothing new and
+        // its arithmetic costs nothing in MPC — only the widened compare below does.
+        r0: u8, r1: u8, r2: u8, r3: u8, r4: u8, r5: u8, r6: u8, r7: u8,
+        r8: u8, r9: u8, r10: u8, r11: u8, r12: u8, r13: u8, r14: u8, r15: u8,
     ) -> (u16, u8, u16, u8, u16, u8) {
         let raw = [
             s0.to_arcis(),
@@ -657,6 +761,35 @@ mod circuits {
             s[i] = if active { raw[i] } else { 0u8 };
         }
 
+        // --- composite ranking key: score dominates, rarity breaks ties ------------------
+        //
+        // k = score * 8 + rarity. Rarity is 0..=5 (3 bits) and score is 0..=100, so k <= 805
+        // fits u16 and no rarity value can bridge two score bands: a higher score always
+        // outranks a lower one, exactly as before. Rarity ONLY decides pairs that were
+        // previously settled by slot index alone.
+        //
+        // The key is PER SLOT, deliberately, and that is what keeps the ranking sound. The
+        // intuitive alternative — "if either side is unranked, compare that pair on raw
+        // score only" — is non-transitive and must NOT be used: three entries all scoring
+        // 50 with rarities 1 / 0 / 5 at slots 0 / 1 / 2 give A>B and B>C (both neutral, so
+        // lower slot wins) but C>A (405 > 401), a cycle. `rank` then stops being a
+        // permutation, no slot holds rank 0, and the podium is undefined — measured at
+        // ~2.25% of random rankings. Any per-slot key induces a total order and cannot.
+        //
+        // rarity 0 (unranked) is taken at face value and therefore loses every rarity
+        // tiebreak. Legacy hybrids bred before the rarity roll shipped, and any whose breed
+        // callback never landed, sit at 0 permanently; they rank below a genuine Common on
+        // an equal score. That is a deliberate simplification, not an oversight.
+        let rar = [r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15];
+        let mut k = [0u16; 16];
+        for i in 0..16 {
+            let active = (i as u8) < participant_count;
+            // Padding is forced to rarity 0 as well as score 0, so it can never outrank a
+            // real entry: a real slot tying at k = 0 wins on the lower slot index.
+            let r_used: u16 = if active { rar[i] as u16 } else { 0u16 };
+            k[i] = (s[i] as u16) * 8 + r_used;
+        }
+
         // --- ONE parallel comparison layer: upper triangle only (120 comparisons) ---
         // `a < b` is a compile-time predicate over unrolled loop indices, so the compiler
         // emits comparisons for the upper triangle only; the lower triangle and the
@@ -665,14 +798,16 @@ mod circuits {
         for a in 0..16 {
             for b in 0..16 {
                 if a < b {
-                    g[a * 16 + b] = if s[b] > s[a] { 1u16 } else { 0u16 };
+                    g[a * 16 + b] = if k[b] > k[a] { 1u16 } else { 0u16 };
                 }
             }
         }
 
         // --- rank by summation: purely local, adds no depth ---
-        // j < i : beats(j,i) = s[j] >= s[i] = 1 - G[j][i]
-        // j > i : beats(j,i) = s[j] >  s[i] =     G[i][j]
+        // j < i : beats(j,i) = k[j] >= k[i] = 1 - G[j][i]
+        // j > i : beats(j,i) = k[j] >  k[i] =     G[i][j]
+        // Ranking is on the COMPOSITE key; slot index still settles a full k-tie, so the
+        // fallback chain is score -> rarity -> slot order (byte-wise entry-PDA order).
         // j = i : never beats.
         let mut rank = [0u16; 16];
         for i in 0..16 {

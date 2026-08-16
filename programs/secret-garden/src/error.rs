@@ -226,4 +226,10 @@ pub enum SecretGardenError {
     /// entry would otherwise pull a flower out of a LIVE later round.
     #[msg("That entry has already released its flower")]
     EntryAlreadyReleased,
+    /// A parent has already been bred `MAX_BREEDS_AS_PARENT` times. The cap is per flower
+    /// and permanent — it is not refunded by cancelling or by a failed callback, and it is
+    /// not reset between rounds (unlike `MAX_BREEDS_PER_ROUND`, which is a per-player,
+    /// per-round budget). The flower remains usable for everything except breeding.
+    #[msg("That flower has been used as a breeding parent the maximum number of times")]
+    FlowerParentLimitReached,
 }

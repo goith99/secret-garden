@@ -1,0 +1,14 @@
+[package]
+name = "reveal-top3-difftest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its OWN workspace root on purpose. This crate sits inside the secret-garden directory
+# tree but must NOT join the root workspace: it is a host-only verification tool with no
+# arcis dependency, and pulling it into the workspace would put it in the path of
+# `arcium build` / `anchor build`. An empty [workspace] table makes cargo treat this
+# directory as an independent workspace, so the parent ignores it entirely.
+[workspace]
+
+[dependencies]

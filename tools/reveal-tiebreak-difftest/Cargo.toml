@@ -1,0 +1,11 @@
+[package]
+name = "reveal-tiebreak-difftest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Own workspace root, same rationale as the other tools/*-difftest crates: host-only
+# verification with no arcis dependency, kept out of `arcium build` / `anchor build`.
+[workspace]
+
+[dependencies]

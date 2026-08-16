@@ -1,0 +1,12 @@
+[package]
+name = "trait-satisfied-difftest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its OWN workspace root on purpose — same rationale as tools/reveal-top3-difftest:
+# a host-only verification crate with no arcis dependency, which must stay out of the
+# path of `arcium build` / `anchor build`.
+[workspace]
+
+[dependencies]

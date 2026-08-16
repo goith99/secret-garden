@@ -16,20 +16,20 @@ declare_id!("7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo");
 
 /// Computation-definition offset for the `breed` circuit (must match the circuit's
 /// `#[instruction] fn breed` name across all Arcium macros).
-const COMP_DEF_OFFSET_BREED: u32 = comp_def_offset("breed");
+const COMP_DEF_OFFSET_BREED: u32 = comp_def_offset("breed_v3");
 /// Stage 4A scoring circuits.
 const COMP_DEF_OFFSET_SCORE_ENTRY: u32 = comp_def_offset("score_entry_v2");
 const COMP_DEF_OFFSET_REVEAL_TOP3: u32 = comp_def_offset("reveal_top3");
 /// ADDITIVE, VERIFICATION-ONLY. Own offset for the `reveal_top3_v3` candidate (the
 /// upper-triangle rewrite: 603,016,496 ACU vs the original's 702,629,424 at identical
 /// network depth). Registered alongside — never replacing — `reveal_top3`.
-const COMP_DEF_OFFSET_REVEAL_TOP3_V3: u32 = comp_def_offset("reveal_top3_v3");
+const COMP_DEF_OFFSET_REVEAL_TOP3_V3: u32 = comp_def_offset("reveal_top3_v5");
 /// Private Hint circuit (sealed per-player trait-satisfaction check).
 const COMP_DEF_OFFSET_PRIVATE_HINT: u32 = comp_def_offset("private_hint");
 
 /// Compute-unit budget for Arcium callback transactions. Required from Arcium v0.11.0 onward
 /// (`queue_computation`'s 7th parameter; it did not exist in v0.10.4). Sized from a MEASURED
-/// successful `breed_callback` on devnet, which consumed 94,301 CU on its heaviest path
+/// successful `breed_v3_callback` on devnet, which consumed 94,301 CU on its heaviest path
 /// (flatten 10 genome ciphertexts + SHA-256 commitment + ~400-byte account write). 200,000 is
 /// Solana's default per-instruction budget and leaves >2x headroom over that worst case; every
 /// other callback in this program (score/reveal/hint) writes far less.
@@ -286,6 +286,20 @@ pub mod secret_garden {
         // the cap (`total_flowers - STARTER_COUNT` live hybrids). See `check_collection_cap`.
         ctx.accounts.profile.check_collection_cap()?;
 
+        // Stage 5E: enforce the per-flower breeding-parent budget, in the same fail-fast
+        // spot and for BOTH slots. Checked before either increment so a breed that would
+        // push one parent over the cap is rejected without having consumed the other's
+        // budget. Self-breeding is impossible (`flower_a`/`flower_b` are distinct PDAs and
+        // the existing guards reject a Locked parent), so the two increments below cannot
+        // target the same account and double-count.
+        ctx.accounts.flower_a.check_breed_as_parent()?;
+        ctx.accounts.flower_b.check_breed_as_parent()?;
+        // Both validated, so neither spend can leave the other's budget consumed by a
+        // rejected breed. Spent at QUEUE time, not in the callback, and never refunded —
+        // see `register_breed_as_parent`.
+        ctx.accounts.flower_a.register_breed_as_parent()?;
+        ctx.accounts.flower_b.register_breed_as_parent()?;
+
         // Read both parents' public kind/species and their stored genome nonces.
         let flower_a_key = ctx.accounts.flower_a.key();
         let flower_b_key = ctx.accounts.flower_b.key();
@@ -302,6 +316,17 @@ pub mod secret_garden {
         let b_generation = ctx.accounts.flower_b.generation;
         let a_stability = ctx.accounts.flower_a.stability;
         let b_stability = ctx.accounts.flower_b.stability;
+
+        // Public lineage inputs for the circuit's cosmetic rarity roll. Both parents'
+        // rarity is already public account data, so passing it as plaintext reveals
+        // nothing new and lets the circuit do that arithmetic in the clear.
+        let a_rarity = ctx.accounts.flower_a.rarity;
+        let b_rarity = ctx.accounts.flower_b.rarity;
+        // The offspring's generation, computed here (it is also written to the record
+        // below) and saturated into a u8 for the circuit. The circuit clamps it again to
+        // RARITY_GENERATION_CAP, so the saturation point never affects the roll.
+        let offspring_generation = a_generation.max(b_generation) + 1;
+        let rarity_generation_arg = offspring_generation.min(u8::MAX as u16) as u8;
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
 
@@ -326,6 +351,9 @@ pub mod secret_garden {
                 FLOWER_ENCRYPTED_GENOME_OFFSET,
                 ENCRYPTED_GENOME_LEN as u32,
             )
+            .plaintext_u8(a_rarity)
+            .plaintext_u8(b_rarity)
+            .plaintext_u8(rarity_generation_arg)
             .x25519_pubkey(env_pubkey)
             .plaintext_u128(env_nonce)
             .encrypted_u8(light_ciphertext)
@@ -341,7 +369,7 @@ pub mod secret_garden {
             ctx.accounts,
             computation_offset,
             args,
-            vec![BreedCallback::callback_ix(
+            vec![BreedV3Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &[
@@ -377,10 +405,9 @@ pub mod secret_garden {
         ctx.accounts.flower_b.status = FLOWER_STATUS_LOCKED;
 
         // Pre-create the offspring with its PUBLIC metadata only. Arcium callbacks cannot
-        // init accounts, so the genome is written later by `breed_callback`; the flower
+        // init accounts, so the genome is written later by `breed_v3_callback`; the flower
         // starts Locked and is flipped to Active only on a successful callback.
         let offspring_index = ctx.accounts.profile.next_flower_index;
-        let offspring_generation = a_generation.max(b_generation) + 1;
         let offspring_stability = (((a_stability as u16 + b_stability as u16) / 2) as u8)
             .saturating_sub(BREEDING_STABILITY_PENALTY);
         ctx.accounts.offspring.set_inner(FlowerRecord {
@@ -388,7 +415,10 @@ pub mod secret_garden {
             flower_index: offspring_index,
             visual_species_id: HYBRID_VISUAL_SPECIES_ID,
             generation: offspring_generation,
-            rarity: 0, // rarity scoring is a Stage 4/5 concern; unranked for now
+            // Unranked until the MPC roll lands. `breed_v3_callback` overwrites this with the
+            // rolled tier; a failed or expired breed never reaches the callback, so its
+            // offspring correctly keeps rarity 0 alongside its zeroed mask and genome.
+            rarity: 0,
             stability: offspring_stability,
             revealed_trait_mask: 0, // nothing revealed yet (Stage 4/5)
             parent_a: flower_a_key,
@@ -401,6 +431,8 @@ pub mod secret_garden {
             genome_commitment: [0u8; GENOME_COMMITMENT_LEN],
             encrypted_genome: [0u8; ENCRYPTED_GENOME_LEN],
             encryption_metadata: [0u8; ENCRYPTION_METADATA_LEN],
+            // Stage 5E: a newly bred offspring has never itself been a parent.
+            times_bred_as_parent: 0,
         });
 
         // Record the experiment (Queued) and advance the profile counters.
@@ -429,7 +461,7 @@ pub mod secret_garden {
     /// Permissionless recovery: after `EXPERIMENT_TIMEOUT_SECONDS`, anyone can expire a
     /// stuck Queued/Processing experiment to unlock the player's parents. This touches no
     /// Arcium/MPC state. It sets `callback_processed = true`, so if the MPC computation
-    /// later completes anyway, `breed_callback`'s idempotency guard makes it a no-op —
+    /// later completes anyway, `breed_v3_callback`'s idempotency guard makes it a no-op —
     /// preventing a double `active_experiment_count` decrement or a second resolution.
     /// (Trade-off: a successful-but-late computation is discarded; the pre-created
     /// offspring stays Locked. The priority is recovering the player's parent flowers.)
@@ -502,10 +534,10 @@ pub mod secret_garden {
     /// it, flips it Active, unlocks both parents, and Completes the experiment. On failure:
     /// unlocks both parents and marks the experiment Failed (the offspring stays Locked).
     /// Idempotent via `experiment.callback_processed` — a retried callback no-ops.
-    #[arcium_callback(encrypted_ix = "breed")]
-    pub fn breed_callback(
-        ctx: Context<BreedCallback>,
-        output: SignedComputationOutputs<BreedOutput>,
+    #[arcium_callback(encrypted_ix = "breed_v3")]
+    pub fn breed_v3_callback(
+        ctx: Context<BreedV3Callback>,
+        output: SignedComputationOutputs<BreedV3Output>,
     ) -> Result<()> {
         // A retried callback (or one racing a cancel) must not double-process.
         if ctx.accounts.experiment.callback_processed {
@@ -520,11 +552,11 @@ pub mod secret_garden {
 
         match verified {
             // Stage 3C: `breed` now returns a tuple `(Enc<Mxe, Genome>, u32)`. Per Arcium's
-            // codegen, a tuple return becomes a single `field_0` (BreedOutputStruct0) whose
+            // codegen, a tuple return becomes a single `field_0` (BreedV3OutputStruct0) whose
             // inner `field_0` is the encrypted genome and inner `field_1` is the public
             // `revealed_trait_mask`. The genome handling below is byte-for-byte the same as
             // Stage 3A/3B (the proven Enc<Mxe> path) — only the mask write is added.
-            Ok(BreedOutput { field_0: result }) => {
+            Ok(BreedV3Output { field_0: result }) => {
                 let genome = result.field_0;
                 let revealed_trait_mask = result.field_1;
 
@@ -814,23 +846,33 @@ pub mod secret_garden {
             (1..=MAX_PARTICIPANTS as usize).contains(&participant_count),
             SecretGardenError::ScoringIncomplete
         );
+        // remaining_accounts is now TWO runs: the `participant_count` entries, then their
+        // FlowerRecords in the SAME order. The second run feeds `reveal_top3_v5`'s rarity
+        // tiebreak; each is matched against the `flower_record` its own entry recorded at
+        // submission, so the caller cannot pair an entry with a richer flower.
         require!(
-            ctx.remaining_accounts.len() == participant_count,
+            ctx.remaining_accounts.len() == participant_count * 2,
             SecretGardenError::WrongEntryCount
         );
+        let (entry_infos, flower_infos) = ctx.remaining_accounts.split_at(participant_count);
 
         let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
         let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
-        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+        let mut rarities = [0u8; MAX_PARTICIPANTS as usize];
+        for (i, info) in entry_infos.iter().enumerate() {
             let entry = Account::<CompetitionEntry>::try_from(info)?;
             require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
             require!(entry.scored, SecretGardenError::ScoringIncomplete);
             entry_keys[i] = info.key();
             entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
+            rarities[i] = read_flower_rarity(&flower_infos[i], &entry.flower_record)?;
         }
         for i in participant_count..MAX_PARTICIPANTS as usize {
             entry_keys[i] = entry_keys[0];
             entry_nonces[i] = entry_nonces[0];
+            // Padding rarity is irrelevant — the circuit masks slots >= participant_count
+            // to rarity 0 — but mirror slot 0 for consistency with the other pad arrays.
+            rarities[i] = rarities[0];
         }
 
         ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
@@ -850,7 +892,12 @@ pub mod secret_garden {
                 ENTRY_SCORE_LEN as u32,
             );
         }
-        let args = builder.plaintext_u8(participant_count as u8).build();
+        // Order MUST match `reveal_top3_v5(s0..s15, participant_count, r0..r15)`.
+        let mut builder = builder.plaintext_u8(participant_count as u8);
+        for i in 0..MAX_PARTICIPANTS as usize {
+            builder = builder.plaintext_u8(rarities[i]);
+        }
+        let args = builder.build();
 
         let callback_accs = vec![CallbackAccount {
             pubkey: ctx.accounts.result.key(),
@@ -861,7 +908,7 @@ pub mod secret_garden {
             ctx.accounts,
             computation_offset,
             args,
-            vec![RevealTop3V3Callback::callback_ix(
+            vec![RevealTop3V5Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &callback_accs,
@@ -971,7 +1018,7 @@ pub mod secret_garden {
     /// reads at `ENTRY_SCORE_OFFSET`, same first-entry padding of the unused slots.
     ///
     /// The result lands in a PER-SHARD `RevealTop3V3Result` PDA, so the existing
-    /// `reveal_top3_v3_callback` is reused verbatim and the callback carries a CONSTANT 7
+    /// `reveal_top3_v5_callback` is reused verbatim and the callback carries a CONSTANT 7
     /// accounts regardless of round size.
     pub fn queue_shard_reveal(
         ctx: Context<QueueShardReveal>,
@@ -1021,7 +1068,7 @@ pub mod secret_garden {
             SecretGardenError::InvalidShardLayout
         );
         require!(
-            ctx.remaining_accounts.len() == n,
+            ctx.remaining_accounts.len() == n * 2,
             SecretGardenError::WrongEntryCount
         );
 
@@ -1036,10 +1083,17 @@ pub mod secret_garden {
         // For the FINAL every account must be one of the recorded shard winners, which
         // with the exact count and the no-duplicates ordering proves the supplied set IS
         // the recorded finalist set, merely reordered into pubkey order.
+        // remaining_accounts is TWO runs: the entries, then their FlowerRecords in the SAME
+        // order, for `reveal_top3_v5`'s rarity tiebreak. Each flower is matched against the
+        // `flower_record` its own entry recorded, so a caller cannot pair an entry with a
+        // richer flower. Flowers are plain reads, NOT `ArgBuilder::account()` refs, so this
+        // does not touch MAX_REVEAL_ACCOUNT_REFS.
+        let (entry_infos, flower_infos) = ctx.remaining_accounts.split_at(n);
         let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
         let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
+        let mut rarities = [0u8; MAX_PARTICIPANTS as usize];
         let mut prev = Pubkey::default();
-        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+        for (i, info) in entry_infos.iter().enumerate() {
             let entry = Account::<CompetitionEntry>::try_from(info)?;
             require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
             require!(entry.scored, SecretGardenError::ScoringIncomplete);
@@ -1069,11 +1123,13 @@ pub mod secret_garden {
             prev = key;
             entry_keys[i] = key;
             entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
+            rarities[i] = read_flower_rarity(&flower_infos[i], &entry.flower_record)?;
         }
         // Pad the circuit's unused slots with the first entry (masked to 0 by the circuit).
         for i in n..MAX_PARTICIPANTS as usize {
             entry_keys[i] = entry_keys[0];
             entry_nonces[i] = entry_nonces[0];
+            rarities[i] = rarities[0];
         }
         let shard_size = n;
 
@@ -1096,7 +1152,12 @@ pub mod secret_garden {
             );
         }
         // The circuit masks slots >= this to 0, so it ranks only the shard's real entries.
-        let args = builder.plaintext_u8(shard_size as u8).build();
+        // Order MUST match `reveal_top3_v5(s0..s15, participant_count, r0..r15)`.
+        let mut builder = builder.plaintext_u8(shard_size as u8);
+        for i in 0..MAX_PARTICIPANTS as usize {
+            builder = builder.plaintext_u8(rarities[i]);
+        }
+        let args = builder.build();
 
         let callback_accs = vec![CallbackAccount {
             pubkey: ctx.accounts.result.key(),
@@ -1107,7 +1168,7 @@ pub mod secret_garden {
             ctx.accounts,
             computation_offset,
             args,
-            vec![RevealTop3V3Callback::callback_ix(
+            vec![RevealTop3V5Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &callback_accs,
@@ -1493,14 +1554,21 @@ pub mod secret_garden {
         let k = shard_index as usize;
         let size = t.shard_sizes[k] as usize;
         require!(
-            ctx.remaining_accounts.len() == size,
+            ctx.remaining_accounts.len() == size * 2,
             SecretGardenError::WrongEntryCount
         );
 
+        // remaining_accounts is TWO runs: the entries, then their FlowerRecords in the SAME
+        // order, for `reveal_top3_v5`'s rarity tiebreak. Each flower is matched against the
+        // `flower_record` its own entry recorded, so a caller cannot pair an entry with a
+        // richer flower. Flowers are plain reads, NOT `ArgBuilder::account()` refs, so this
+        // does not touch MAX_REVEAL_ACCOUNT_REFS.
+        let (entry_infos, flower_infos) = ctx.remaining_accounts.split_at(size);
         let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
         let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
+        let mut rarities = [0u8; MAX_PARTICIPANTS as usize];
         let mut prev = Pubkey::default();
-        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+        for (i, info) in entry_infos.iter().enumerate() {
             let entry = Account::<CompetitionEntry>::try_from(info)?;
             require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
             require!(entry.scored, SecretGardenError::ScoringIncomplete);
@@ -1522,10 +1590,12 @@ pub mod secret_garden {
             prev = key;
             entry_keys[i] = key;
             entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
+            rarities[i] = read_flower_rarity(&flower_infos[i], &entry.flower_record)?;
         }
         for i in size..MAX_PARTICIPANTS as usize {
             entry_keys[i] = entry_keys[0];
             entry_nonces[i] = entry_nonces[0];
+            rarities[i] = rarities[0];
         }
         // Release the zero-copy borrow before touching `ctx.accounts` mutably below.
         drop(t);
@@ -1547,13 +1617,18 @@ pub mod secret_garden {
                 ENTRY_SCORE_LEN as u32,
             );
         }
-        let args = builder.plaintext_u8(size as u8).build();
+        // Order MUST match `reveal_top3_v5(s0..s15, participant_count, r0..r15)`.
+        let mut builder = builder.plaintext_u8(size as u8);
+        for i in 0..MAX_PARTICIPANTS as usize {
+            builder = builder.plaintext_u8(rarities[i]);
+        }
+        let args = builder.build();
 
         queue_computation(
             ctx.accounts,
             computation_offset,
             args,
-            vec![RevealTop3V3Callback::callback_ix(
+            vec![RevealTop3V5Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &[CallbackAccount {
@@ -1754,13 +1829,20 @@ pub mod secret_garden {
             .map(|s| *s as usize)
             .sum();
         require!(
-            ctx.remaining_accounts.len() == size,
+            ctx.remaining_accounts.len() == size * 2,
             SecretGardenError::WrongEntryCount
         );
 
+        // remaining_accounts is TWO runs: the entries, then their FlowerRecords in the SAME
+        // order, for `reveal_top3_v5`'s rarity tiebreak. Each flower is matched against the
+        // `flower_record` its own entry recorded, so a caller cannot pair an entry with a
+        // richer flower. Flowers are plain reads, NOT `ArgBuilder::account()` refs, so this
+        // does not touch MAX_REVEAL_ACCOUNT_REFS.
+        let (entry_infos, flower_infos) = ctx.remaining_accounts.split_at(size);
         let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
         let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
-        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
+        let mut rarities = [0u8; MAX_PARTICIPANTS as usize];
+        for (i, info) in entry_infos.iter().enumerate() {
             let entry = Account::<CompetitionEntry>::try_from(info)?;
             require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
             require!(entry.scored, SecretGardenError::ScoringIncomplete);
@@ -1770,10 +1852,12 @@ pub mod secret_garden {
             );
             entry_keys[i] = info.key();
             entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
+            rarities[i] = read_flower_rarity(&flower_infos[i], &entry.flower_record)?;
         }
         for i in size..MAX_PARTICIPANTS as usize {
             entry_keys[i] = entry_keys[0];
             entry_nonces[i] = entry_nonces[0];
+            rarities[i] = rarities[0];
         }
         // Release the zero-copy borrow before touching `ctx.accounts` mutably below.
         drop(t);
@@ -1795,13 +1879,18 @@ pub mod secret_garden {
                 ENTRY_SCORE_LEN as u32,
             );
         }
-        let args = builder.plaintext_u8(size as u8).build();
+        // Order MUST match `reveal_top3_v5(s0..s15, participant_count, r0..r15)`.
+        let mut builder = builder.plaintext_u8(size as u8);
+        for i in 0..MAX_PARTICIPANTS as usize {
+            builder = builder.plaintext_u8(rarities[i]);
+        }
+        let args = builder.build();
 
         queue_computation(
             ctx.accounts,
             computation_offset,
             args,
-            vec![RevealTop3V3Callback::callback_ix(
+            vec![RevealTop3V5Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &[CallbackAccount {
@@ -2031,12 +2120,12 @@ pub mod secret_garden {
     /// output into `RevealTop3V3Result`. It deliberately does NOT
     /// touch `CompetitionRound` — not `top1/2/3`, not `scoring_revealed` — so it can run on
     /// the same round as the live reveal without disturbing it.
-    #[arcium_callback(encrypted_ix = "reveal_top3_v3")]
-    pub fn reveal_top3_v3_callback(
-        ctx: Context<RevealTop3V3Callback>,
-        output: SignedComputationOutputs<RevealTop3V3Output>,
+    #[arcium_callback(encrypted_ix = "reveal_top3_v5")]
+    pub fn reveal_top3_v5_callback(
+        ctx: Context<RevealTop3V5Callback>,
+        output: SignedComputationOutputs<RevealTop3V5Output>,
     ) -> Result<()> {
-        let RevealTop3V3Output { field_0: top } = output
+        let RevealTop3V5Output { field_0: top } = output
             .verify_output(
                 &ctx.accounts.cluster_account,
                 &ctx.accounts.computation_account,
@@ -2199,6 +2288,113 @@ pub mod secret_garden {
         }
         Ok(())
     }
+
+    /// Stage 5E migration: grows a pre-5E `FlowerRecord` (created before
+    /// `times_bred_as_parent` was appended) by 1 byte so the current program can read it.
+    /// Exactly the `migrate_profile` pattern, retargeted: the flower is taken as a RAW
+    /// account because a 528-byte pre-5E record is one byte short of the current 529-byte
+    /// layout, so `Account<FlowerRecord>` would fail with `AccountDidNotDeserialize` before
+    /// any realloc constraint could run. Grows in place, preserving the discriminator and
+    /// every existing field, and zero-fills the appended byte (so a migrated flower starts
+    /// at `times_bred_as_parent = 0` — correct: pre-5E breeds were never counted).
+    ///
+    /// SELF-SERVICE and owner-signed: the PDA seeds bind the flower to the signing owner,
+    /// and the owner funds the ~6960-lamport rent top-up themselves. That means it can only
+    /// migrate flowers whose key the caller holds. For production, where players' keys are
+    /// not available, an operator-signed variant is needed instead — this one is sufficient
+    /// for dev, where the wallets in use are our own.
+    ///
+    /// Idempotent (a flower already at the new size is a no-op). Runs regardless of the
+    /// pause kill-switch — it is a recovery/maintenance op.
+    pub fn migrate_flower(ctx: Context<MigrateFlower>, _flower_index: u32) -> Result<()> {
+        let info = ctx.accounts.flower.to_account_info();
+        let new_len = 8 + FlowerRecord::INIT_SPACE;
+        let old_len = info.data_len();
+
+        // Already migrated (or larger): nothing to do.
+        if old_len >= new_len {
+            return Ok(());
+        }
+
+        // Top up rent so the larger account stays rent-exempt.
+        let required = Rent::get()?.minimum_balance(new_len);
+        let current = info.lamports();
+        if required > current {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.owner.to_account_info(),
+                        to: info.clone(),
+                    },
+                ),
+                required - current,
+            )?;
+        }
+
+        // Grow in place; `resize` zero-initializes the appended byte, so
+        // times_bred_as_parent = 0.
+        info.resize(new_len)?;
+        Ok(())
+    }
+
+    /// Operator-signed counterpart to `migrate_flower`, for migrating flowers whose owner's
+    /// key is not available — i.e. every real player's flower in production, and every
+    /// throwaway test wallet in dev.
+    ///
+    /// The realloc logic is IDENTICAL to `migrate_flower` (same size check, same rent top-up,
+    /// same `resize`, same idempotent early return). Exactly two things differ:
+    ///   1. `owner` is an `UncheckedAccount` used ONLY to derive the flower PDA — the owner
+    ///      does not sign, and their pubkey is never written anywhere;
+    ///   2. the rent top-up is paid by the signing operator, so one funded wallet can migrate
+    ///      the whole population in a batch.
+    ///
+    /// This grants the operator NO power over flower CONTENTS. The account is taken as a raw
+    /// `UncheckedAccount` and this handler only ever calls `resize`, which appends
+    /// zero-initialized bytes and cannot alter existing ones; no field is read, decoded or
+    /// written. The PDA seeds still bind the account to `owner`, so an operator cannot point
+    /// this at some other account, and `owner = crate::ID` proves it is one of this program's.
+    /// The worst an operator can do is grow an already-correct account (a no-op) or pay rent
+    /// for someone else.
+    pub fn operator_migrate_flower(
+        ctx: Context<OperatorMigrateFlower>,
+        _flower_index: u32,
+    ) -> Result<()> {
+        require!(
+            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
+            SecretGardenError::NotAuthority
+        );
+
+        let info = ctx.accounts.flower.to_account_info();
+        let new_len = 8 + FlowerRecord::INIT_SPACE;
+        let old_len = info.data_len();
+
+        // Already migrated (or larger): nothing to do.
+        if old_len >= new_len {
+            return Ok(());
+        }
+
+        // Top up rent so the larger account stays rent-exempt — from the OPERATOR.
+        let required = Rent::get()?.minimum_balance(new_len);
+        let current = info.lamports();
+        if required > current {
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.authority.to_account_info(),
+                        to: info.clone(),
+                    },
+                ),
+                required - current,
+            )?;
+        }
+
+        // Grow in place; `resize` zero-initializes the appended byte, so
+        // times_bred_as_parent = 0.
+        info.resize(new_len)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2281,7 +2477,7 @@ pub struct ManageOperator<'info> {
 }
 
 /// Registers the `breed` computation definition. Restricted to `config.authority`.
-#[init_computation_definition_accounts("breed", authority)]
+#[init_computation_definition_accounts("breed_v3", authority)]
 #[derive(Accounts)]
 pub struct InitBreedingCompDef<'info> {
     #[account(mut)]
@@ -2309,7 +2505,7 @@ pub struct InitBreedingCompDef<'info> {
 
 /// Queues a `breed` computation. The signer (`player`) funds the new accounts and must
 /// own both Active parents; the two parents must be distinct flowers.
-#[queue_computation_accounts("breed", player)]
+#[queue_computation_accounts("breed_v3", player)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
 pub struct StartBreeding<'info> {
@@ -2342,7 +2538,7 @@ pub struct StartBreeding<'info> {
         mut,
         constraint = flower_a.owner == player.key() @ SecretGardenError::FlowerNotOwned,
         // MUST be `== ACTIVE`, not `!= LOCKED`. The old negative form admitted a SUBMITTED
-        // parent, and `breed_callback` unconditionally writes both parents back to ACTIVE on
+        // parent, and `breed_v3_callback` unconditionally writes both parents back to ACTIVE on
         // completion — so breeding mid-round silently laundered a Submitted flower back into
         // an Active one regardless of round state, bypassing the round gate that
         // `release_flower` exists to enforce.
@@ -2371,7 +2567,7 @@ pub struct StartBreeding<'info> {
     pub experiment: Box<Account<'info, Experiment>>,
     /// Offspring flower, pre-created here (Arcium callbacks cannot init accounts). Its
     /// index is the wallet's running `total_flowers` (starters occupy 0..=5). The genome
-    /// is written by `breed_callback`.
+    /// is written by `breed_v3_callback`.
     #[account(
         init,
         payer = player,
@@ -2426,9 +2622,9 @@ pub struct StartBreeding<'info> {
 /// required by `#[callback_accounts]`); the writable game accounts follow in the SAME
 /// order they are registered in `start_breeding`'s `callback_ix` extra-accounts list.
 /// They are bound to the experiment so the callback can only touch the right records.
-#[callback_accounts("breed")]
+#[callback_accounts("breed_v3")]
 #[derive(Accounts)]
-pub struct BreedCallback<'info> {
+pub struct BreedV3Callback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_BREED))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
@@ -2583,7 +2779,7 @@ pub struct CancelStuckScore<'info> {
     pub entry: Box<Account<'info, CompetitionEntry>>,
 }
 
-/// Emitted by `breed_callback` when a breeding computation succeeds.
+/// Emitted by `breed_v3_callback` when a breeding computation succeeds.
 #[event]
 pub struct BreedingComputedEvent {
     /// The offspring genome ciphertext (10 scalars * 32 bytes).
@@ -2811,7 +3007,7 @@ pub struct ScoreEntryV2Callback<'info> {
 /// Mirrors `InitRevealTop3CompDef`, bound to the `reveal_top3_v3` circuit name. NOT optional:
 /// every bracket shard/semifinal/final reveal runs on this comp def, so it must be
 /// initialized before the bracket can be used.
-#[init_computation_definition_accounts("reveal_top3_v3", authority)]
+#[init_computation_definition_accounts("reveal_top3_v5", authority)]
 #[derive(Accounts)]
 pub struct InitRevealTop3V3CompDef<'info> {
     #[account(mut)]
@@ -2841,7 +3037,7 @@ pub struct InitRevealTop3V3CompDef<'info> {
 /// structural differences are the `result` PDA (which replaces writing to `round`) and the
 /// comp-def offset. Retained as a single-shot differential-test path; the BRACKET does not go
 /// through here — it queues the same comp def via `QueueShardReveal` and friends.
-#[queue_computation_accounts("reveal_top3_v3", authority)]
+#[queue_computation_accounts("reveal_top3_v5", authority)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
 pub struct QueueRevealTop3V3<'info> {
@@ -2906,9 +3102,9 @@ pub struct QueueRevealTop3V3<'info> {
 
 /// Callback context for `reveal_top3_v3`. ADDITIVE, VERIFICATION-ONLY. The writable
 /// `result` receives the raw output; `CompetitionRound` is deliberately absent.
-#[callback_accounts("reveal_top3_v3")]
+#[callback_accounts("reveal_top3_v5")]
 #[derive(Accounts)]
-pub struct RevealTop3V3Callback<'info> {
+pub struct RevealTop3V5Callback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3_V3))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
@@ -2960,7 +3156,7 @@ pub struct InitBracket<'info> {
 /// Queues ONE shard's `reveal_top3_v3`. Mirrors `QueueRevealTop3V3` exactly, except the
 /// result PDA is per-shard and a `bracket` account is carried. 16 context accounts + the
 /// program id + <=13 entries = <=30 keys, which is 1143 bytes — inside the 1232 limit.
-#[queue_computation_accounts("reveal_top3_v3", authority)]
+#[queue_computation_accounts("reveal_top3_v5", authority)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64, shard_index: u8)]
 pub struct QueueShardReveal<'info> {
@@ -2988,7 +3184,7 @@ pub struct QueueShardReveal<'info> {
     pub bracket: Box<Account<'info, BracketState>>,
 
     /// Per-shard result. Typed `RevealTop3V3Result` so the EXISTING
-    /// `reveal_top3_v3_callback` writes it with no new circuit or callback.
+    /// `reveal_top3_v5_callback` writes it with no new circuit or callback.
     #[account(
         init_if_needed,
         payer = authority,
@@ -3146,7 +3342,7 @@ pub struct CloseTier1Bracket<'info> {
 
 /// Queues ONE tier-1 shard. Mirrors `QueueShardReveal` but carries `Tier1State` instead of
 /// `BracketState` — which does not exist yet at this stage.
-#[queue_computation_accounts("reveal_top3_v3", authority)]
+#[queue_computation_accounts("reveal_top3_v5", authority)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64, shard_index: u8)]
 pub struct QueueTier1ShardReveal<'info> {
@@ -3270,7 +3466,7 @@ pub struct PromoteTier1<'info> {
 
 /// Queues ONE semifinal. Result lands under the SEPARATE `SEMI_RESULT_SEED` namespace so it
 /// can never collide with tier-1 shard k's result.
-#[queue_computation_accounts("reveal_top3_v3", authority)]
+#[queue_computation_accounts("reveal_top3_v5", authority)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64, semi_index: u8)]
 pub struct QueueSemifinalReveal<'info> {
@@ -3549,4 +3745,53 @@ pub struct PrivateHintCallback<'info> {
 pub struct HintComputedEvent {
     pub player: Pubkey,
     pub round_id: u64,
+}
+
+/// Grows a pre-5E `FlowerRecord` by 1 byte (see `migrate_flower`). The flower is taken as a
+/// raw account because the old (shorter) layout cannot be deserialized as `FlowerRecord`;
+/// the PDA seeds bind it to the signing owner and to `flower_index`, and the `owner`
+/// constraint ensures the account is actually one of this program's flowers.
+#[derive(Accounts)]
+#[instruction(flower_index: u32)]
+pub struct MigrateFlower<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    /// CHECK: deserialized/realloc'd manually; a pre-5E record is 1 byte short of
+    /// `FlowerRecord`, so it cannot be loaded as a typed `Account`. The seeds bind it to the
+    /// signing owner, and `owner = crate::ID` proves it is one of this program's accounts.
+    #[account(
+        mut,
+        seeds = [FLOWER_SEED, owner.key().as_ref(), &flower_index.to_le_bytes()],
+        bump,
+        owner = crate::ID,
+    )]
+    pub flower: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+/// Operator-signed flower migration (see `operator_migrate_flower`). `owner` does NOT sign
+/// here — it is a bare account supplied purely so the flower PDA can be derived, which is
+/// what lets one operator wallet migrate the whole population. The signing `authority` is
+/// checked against `config` in the handler, and pays the rent top-up.
+#[derive(Accounts)]
+#[instruction(flower_index: u32)]
+pub struct OperatorMigrateFlower<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, GameConfig>,
+    /// CHECK: not a signer and never written — supplied only to derive the flower PDA below.
+    pub owner: UncheckedAccount<'info>,
+    /// CHECK: deserialized/realloc'd manually; a pre-5E record is 1 byte short of
+    /// `FlowerRecord`, so it cannot be loaded as a typed `Account`. The seeds bind it to
+    /// `owner` and `flower_index`, and `owner = crate::ID` proves it is one of this
+    /// program's accounts. The handler only ever calls `resize` on it.
+    #[account(
+        mut,
+        seeds = [FLOWER_SEED, owner.key().as_ref(), &flower_index.to_le_bytes()],
+        bump,
+        owner = crate::ID,
+    )]
+    pub flower: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
 }

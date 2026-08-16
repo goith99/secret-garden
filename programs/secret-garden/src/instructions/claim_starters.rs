@@ -122,6 +122,8 @@ fn populate_flower(
         genome_commitment: [0u8; GENOME_COMMITMENT_LEN],
         encrypted_genome: [0u8; ENCRYPTED_GENOME_LEN],
         encryption_metadata: [0u8; ENCRYPTION_METADATA_LEN],
+        // Stage 5F: starters begin with zero uses as a breeding parent.
+        times_bred_as_parent: 0,
     });
     Ok(())
 }
