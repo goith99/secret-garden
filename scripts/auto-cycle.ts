@@ -67,6 +67,7 @@ import * as anchor from "@anchor-lang/core";
 import BN from "bn.js";
 import * as arcium from "@arcium-hq/client";
 import { randomBytes } from "crypto";
+import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import { fileURLToPath } from "url";
@@ -364,6 +365,32 @@ const short = (pk: PK | string) => {
   const s = typeof pk === "string" ? pk : pk.toBase58();
   return `${s.slice(0, 4)}...${s.slice(-4)}`;
 };
+/**
+ * The git revision this process is actually running, logged at startup.
+ *
+ * WHY IT MATTERS. Railway builds from the GitHub default branch, so the code running here can
+ * be older than the working tree it was written in. Production round 57 stalled for exactly
+ * that reason: the reveal fix was committed locally but never pushed, Railway kept building
+ * the previous revision, and the logs gave no way to tell which code was live. Printing the
+ * revision makes that class of failure legible from the log alone.
+ *
+ * Railway injects RAILWAY_GIT_COMMIT_SHA, which is authoritative for what it built; git is the
+ * fallback for local runs. Neither is guaranteed (the container has no .git), so this never
+ * throws — an unknown revision is a logging gap, not a reason to refuse to run.
+ */
+function runningRevision(): string {
+  const fromRailway = process.env.RAILWAY_GIT_COMMIT_SHA;
+  if (fromRailway && fromRailway.trim() !== "") return `${fromRailway.trim().slice(0, 12)} (RAILWAY_GIT_COMMIT_SHA)`;
+  try {
+    // Static import, not require(): this package is "type": "module", so require is not
+    // defined here and the git fallback would silently never fire.
+    const sha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return `${sha.trim().slice(0, 12)} (git rev-parse HEAD)`;
+  } catch {
+    return "unknown (no RAILWAY_GIT_COMMIT_SHA and no usable git)";
+  }
+}
+
 const fatal = (msg: string): never => {
   console.error(`FATAL: ${msg}`);
   process.exit(1);
@@ -1355,6 +1382,8 @@ async function main(): Promise<void> {
   // Both checked BEFORE any cycle work so a low balance skips the day cleanly rather than
   // closing a round and then stalling.
   console.log(`\n=== Secret Garden — AUTO-CYCLE (cluster ${arciumEnv.arciumClusterOffset}) ===`);
+  console.log(`  revision        : ${runningRevision()}`);
+  console.log(`  program         : ${program.programId.toBase58()}`);
   console.log(`  operator wallet : ${signer.publicKey.toBase58()}`);
   console.log(`  treasury wallet : ${treasury.publicKey.toBase58()}`);
 
@@ -1395,6 +1424,94 @@ async function main(): Promise<void> {
       `nor a registered operator — it cannot run the cycle.`);
   }
   console.log(`  authorized as   : ${isAuthority ? "AUTHORITY" : "OPERATOR"}`);
+
+  // --- comp-def pre-flight --------------------------------------------------------------
+  // Every circuit this cycle will queue, verified against the DEPLOYED PROGRAM before any
+  // state changes.
+  //
+  // WHY EXISTENCE IS NOT ENOUGH. The obvious check — derive the comp-def PDA and confirm it
+  // exists and is finalized — does not work here, and believing it does is how round 57
+  // stranded six players. On shared cluster 456 a superseded comp def can NEVER be closed (the
+  // on-chain close needs an empty execpool, and another MXE's expired computations have squatted
+  // it since 2026-08-02), so `reveal_top3_v3` and `breed` are both still registered and still
+  // finalized right now. A stale name therefore passes an existence check and then fails
+  // ConstraintAddress (2012) at queue time anyway.
+  //
+  // WHAT ACTUALLY DISCRIMINATES. `comp_def_offset(..)` is a const evaluated at compile time, so
+  // each offset is embedded in the program binary as 4 little-endian bytes. Scanning the
+  // deployed programdata for them answers the only question that matters: does the program
+  // THIS SCRIPT IS TALKING TO actually know the circuit names this script is about to send?
+  // That is the exact gap a push gap opens — Railway running an older revision than the chain —
+  // and it is invisible to every account-level check.
+  //
+  // The timing is the point. The reveal is the LAST stage, so without this the cycle closes the
+  // round and scores every entry before failing, leaving the round closed-and-scored and
+  // unrevealable until someone intervenes by hand.
+  {
+    const needed = ["score_entry_v2", "reveal_top3_v5"] as const;
+    console.log(`  comp-defs       : verifying ${needed.length} circuit(s) against the deployed program…`);
+
+    const [programDataPda] = PublicKey.findProgramAddressSync(
+      [program.programId.toBuffer()],
+      new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111"));
+    const programData = await rpcRead("deployed programdata",
+      () => conn.getAccountInfo(programDataPda, "confirmed"));
+    if (!programData) {
+      fatal(`could not read programdata at ${programDataPda.toBase58()} — cannot verify circuit names.`);
+    }
+
+    for (const circuit of needed) {
+      const offsetLe = Buffer.from(arcium.getCompDefAccOffset(circuit)).subarray(0, 4);
+      const pda = compDefAccOf(circuit);
+      const embedded = programData!.data.indexOf(offsetLe) >= 0;
+
+      if (!embedded) {
+        fatal(
+          `circuit "${circuit}" is NOT known to the deployed program.\n` +
+          `  Its comp-def offset (0x${offsetLe.toString("hex")}) does not appear in the deployed\n` +
+          `  binary, so the program never references this name and every queue using it would\n` +
+          `  fail ConstraintAddress (2012) on comp_def_account.\n` +
+          `  This is the signature of a REVISION MISMATCH: the circuit was renamed and this\n` +
+          `  script is older (or newer) than the program actually deployed on chain. Note the\n` +
+          `  comp-def account itself may well still exist and be finalized — superseded comp\n` +
+          `  defs cannot be closed on cluster 456 — so its presence proves nothing.\n` +
+          `  Running revision: ${runningRevision()}\n` +
+          `  Aborting BEFORE any round state changes.`);
+      }
+
+      // Secondary, and genuinely additive: the name is right, but was the circuit ever
+      // uploaded and finalized? Catches a fresh circuit registered but not yet complete.
+      // Deliberately asymmetric — a missing account is fatal, an unreadable finalization flag
+      // only warns, because the SDK's account shape has moved between versions and refusing to
+      // run production over a renamed field would be a worse failure than the one prevented.
+      const info = await rpcRead(`comp-def ${circuit}`, () => conn.getAccountInfo(pda, "confirmed"));
+      if (!info) {
+        fatal(
+          `circuit "${circuit}" is known to the program but its comp def does not exist at\n` +
+          `  ${pda.toBase58()} — it was never registered. Run the uploader for this circuit.\n` +
+          `  Aborting BEFORE any round state changes.`);
+      }
+      let finalized: boolean | null = null;
+      try {
+        const arciumProgram = arcium.getArciumProgram(provider);
+        const cd: any = await arciumProgram.account.computationDefinitionAccount.fetch(pda);
+        const flag = cd?.circuitSource?.onChain?.[0]?.isCompleted;
+        if (typeof flag === "boolean") finalized = flag;
+      } catch {
+        finalized = null;
+      }
+      if (finalized === false) {
+        fatal(
+          `circuit "${circuit}" exists at ${pda.toBase58()} but is NOT finalized — its upload\n` +
+          `  never completed, so the cluster cannot execute it. Re-run the uploader.\n` +
+          `  Aborting BEFORE any round state changes.`);
+      }
+
+      console.log(
+        `    ${circuit.padEnd(16)} in-binary OK  ${pda.toBase58()}  ` +
+        `${finalized === true ? "finalized" : "exists (finalization flag unreadable)"}`);
+    }
+  }
 
   const current = cfg.currentRound.toNumber();
   const summary: CycleSummary = {
