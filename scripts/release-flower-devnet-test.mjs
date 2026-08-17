@@ -328,7 +328,7 @@ async function breed(parentA, parentB, label) {
         flowerB: parentB,
         experiment,
         offspring,
-        ...queueAccsFor("breed", off),
+        ...queueAccsFor("breed_v3", off),
       })
       .transaction(),
     label,
@@ -366,7 +366,7 @@ async function breedTx(parentA, parentB) {
       flowerB: parentB,
       experiment: experimentPda(player.publicKey, prof.totalExperiments),
       offspring: flowerPda(player.publicKey, prof.nextFlowerIndex),
-      ...queueAccsFor("breed", off),
+      ...queueAccsFor("breed_v3", off),
     })
     .transaction();
 }
@@ -531,7 +531,7 @@ async function runRoundCycle(stateKey, phaseLabel, onOpen, onClosed) {
             round,
             bracket,
             result: shardResPda(round, 0),
-            ...queueAccsFor("reveal_top3_v3", off),
+            ...queueAccsFor("reveal_top3_v5", off),
           })
           .remainingAccounts(rem)
           .transaction(),
