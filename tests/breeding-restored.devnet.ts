@@ -67,7 +67,7 @@ describe("secret-garden DEVNET: breeding restored after rollback (cluster 456)",
     mempoolAccount: arcium.getMempoolAccAddress(arciumEnv.arciumClusterOffset),
     executingPool: arcium.getExecutingPoolAccAddress(arciumEnv.arciumClusterOffset),
     compDefAccount: arcium.getCompDefAccAddress(
-      program.programId, Buffer.from(arcium.getCompDefAccOffset("breed")).readUInt32LE()),
+      program.programId, Buffer.from(arcium.getCompDefAccOffset("breed_v3")).readUInt32LE()),
   });
 
   let cipher: arcium.RescueCipher;
@@ -165,7 +165,7 @@ describe("secret-garden DEVNET: breeding restored after rollback (cluster 456)",
     const arciumProgram = arcium.getArciumProgram(provider);
     const compDefPda = PublicKey.findProgramAddressSync(
       [arcium.getArciumAccountBaseSeed("ComputationDefinitionAccount"),
-        program.programId.toBuffer(), arcium.getCompDefAccOffset("breed")],
+        program.programId.toBuffer(), arcium.getCompDefAccOffset("breed_v3")],
       arcium.getArciumProgramId())[0];
     const cd: any = await arciumProgram.account.computationDefinitionAccount.fetch(compDefPda);
     if (!cd.circuitSource?.onChain?.[0]?.isCompleted) throw new Error("breed comp-def NOT finalized");

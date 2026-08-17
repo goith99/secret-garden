@@ -112,7 +112,7 @@ describe("secret-garden DEVNET: encrypted breeding gate (cluster 456)", () => {
     ),
     compDefAccount: arcium.getCompDefAccAddress(
       program.programId,
-      Buffer.from(arcium.getCompDefAccOffset("breed")).readUInt32LE(),
+      Buffer.from(arcium.getCompDefAccOffset("breed_v3")).readUInt32LE(),
     ),
   });
 
@@ -261,7 +261,7 @@ describe("secret-garden DEVNET: encrypted breeding gate (cluster 456)", () => {
     const arciumProgram = arcium.getArciumProgram(provider);
     const compDefPda = PublicKey.findProgramAddressSync(
       [arcium.getArciumAccountBaseSeed("ComputationDefinitionAccount"),
-        program.programId.toBuffer(), arcium.getCompDefAccOffset("breed")],
+        program.programId.toBuffer(), arcium.getCompDefAccOffset("breed_v3")],
       arcium.getArciumProgramId(),
     )[0];
     const cd: any = await arciumProgram.account.computationDefinitionAccount.fetch(compDefPda);
