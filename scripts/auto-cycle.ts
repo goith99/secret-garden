@@ -97,6 +97,20 @@ const PRIZE_SOL = [0.5, 0.5, 0.5];
 // logged for retry.
 const MIN_TREASURY_SOL = 1.6;
 
+// The ONLY treasury this script may ever spend from — PRODUCTION's live wallet.
+//
+// WHY THIS EXISTS. The treasury key arrives at runtime through TREASURY_PRIVATE_KEY, and this
+// script is byte-identical in the dev and production repos. Nothing else pins, names or checks
+// which wallet that env var holds, so the two environments were separated only by whichever
+// value happened to be exported in the invoking shell. This constant makes a cross-environment
+// mixup impossible rather than merely unlikely — in BOTH directions: it equally refuses a dev
+// key here, which would otherwise pay real winners from a test wallet and silently under-fund
+// or fail the payout.
+//
+// If you are deliberately rotating the production treasury, change THIS value — do not remove
+// the check.
+const TREASURY_PUBKEY = "Dp9E6VLzcDM8gWuieJuGChBDsnEDWH71HiEXeYsgB9rJ";
+
 // --- bracket-reveal constants (mirror programs/secret-garden/src/constants.rs) ----------
 // Changing one here without changing it there produces a partition the program rejects.
 /** Entries per shard. One under the measured 14-account reveal ceiling. */
@@ -658,6 +672,17 @@ async function main(): Promise<void> {
   // THEN discover the treasury key is missing/invalid. Separate vars, separate temp files.
   const signer = loadKeypairFromEnv("OPERATOR_PRIVATE_KEY", OPERATOR_KEYPAIR_PATH);
   const treasury = loadKeypairFromEnv("TREASURY_PRIVATE_KEY", TREASURY_KEYPAIR_PATH);
+  // Prove the supplied key is THIS environment's treasury before anything can be spent. Runs
+  // before any RPC, any round state change and any transfer, so a wrong key costs nothing.
+  if (treasury.publicKey.toBase58() !== TREASURY_PUBKEY) {
+    fatal(
+      `TREASURY_PRIVATE_KEY is the WRONG WALLET for this environment.\n` +
+        `  supplied: ${treasury.publicKey.toBase58()}\n` +
+        `  expected: ${TREASURY_PUBKEY}  (production)\n` +
+        `Refusing to run. This is the PRODUCTION repo — check you have not exported the dev ` +
+        `treasury key into this shell.`,
+    );
+  }
 
   const heliusUrl = process.env.HELIUS_RPC_URL;
   if (!heliusUrl || heliusUrl.trim() === "") {
