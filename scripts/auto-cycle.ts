@@ -66,7 +66,7 @@
 import * as anchor from "@anchor-lang/core";
 import BN from "bn.js";
 import * as arcium from "@arcium-hq/client";
-import { randomBytes } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
@@ -234,6 +234,19 @@ function formatRemaining(seconds: number): string {
 // exactly the boundary we need, and no distributed lock is warranted.
 
 /** Lock file. /tmp is per-container and is already where the temp keypairs live. */
+/* --- circuit byte-freshness support (see the comp-def pre-flight in main) ----------------- */
+
+/** Repo root, resolved from this file rather than cwd: the cycle is started by a service
+ *  manager whose working directory is not guaranteed to be the checkout. */
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+/** Raw-circuit account header: 8-byte discriminator + 1-byte bump, ahead of the payload.
+ *  Mirrors RAW_HEADER in scripts/devnet-upload-circuit.ts — the two must agree. */
+const RAW_CIRCUIT_HEADER = 9;
+
+const sha256Hex = (b: Buffer | Uint8Array): string =>
+  createHash("sha256").update(Buffer.from(b)).digest("hex");
+
 const LOCK_PATH = path.join("/tmp", "secret-garden-auto-cycle.lock");
 
 /**
@@ -671,10 +684,19 @@ async function main(): Promise<void> {
   // the cycle is effectively atomic, so we never want to close/score/reveal a round and only
   // THEN discover the treasury key is missing/invalid. Separate vars, separate temp files.
   const signer = loadKeypairFromEnv("OPERATOR_PRIVATE_KEY", OPERATOR_KEYPAIR_PATH);
-  const treasury = loadKeypairFromEnv("TREASURY_PRIVATE_KEY", TREASURY_KEYPAIR_PATH);
+  // A PREFLIGHT_ONLY run reads chain state and spends nothing, so it has no spending
+  // preconditions and does not need spending credentials. Demanding the treasury key would put
+  // the circuit-freshness check out of reach of everyone except whoever holds it — the opposite
+  // of making staleness visible. The pin below still runs whenever a key IS supplied, so this
+  // relaxes who may RUN the check, never which wallet may be paid from.
+  const preflightOnly = process.env.PREFLIGHT_ONLY === "1";
+  const treasuryUnused = preflightOnly && !process.env.TREASURY_PRIVATE_KEY;
+  const treasury = treasuryUnused
+    ? signer
+    : loadKeypairFromEnv("TREASURY_PRIVATE_KEY", TREASURY_KEYPAIR_PATH);
   // Prove the supplied key is THIS environment's treasury before anything can be spent. Runs
   // before any RPC, any round state change and any transfer, so a wrong key costs nothing.
-  if (treasury.publicKey.toBase58() !== TREASURY_PUBKEY) {
+  if (!treasuryUnused && treasury.publicKey.toBase58() !== TREASURY_PUBKEY) {
     fatal(
       `TREASURY_PRIVATE_KEY is the WRONG WALLET for this environment.\n` +
         `  supplied: ${treasury.publicKey.toBase58()}\n` +
@@ -1410,23 +1432,26 @@ async function main(): Promise<void> {
   console.log(`  revision        : ${runningRevision()}`);
   console.log(`  program         : ${program.programId.toBase58()}`);
   console.log(`  operator wallet : ${signer.publicKey.toBase58()}`);
-  console.log(`  treasury wallet : ${treasury.publicKey.toBase58()}`);
+  console.log(`  treasury wallet : ${treasuryUnused ? "(not supplied — pre-flight only)" : treasury.publicKey.toBase58()}`);
 
-  const startLamports = await rpcRead("operator balance",
+  // Both balance gates ask "can this wallet afford a cycle?", which a pre-flight never runs.
+  // Skipping them keeps the check usable on an under-funded or read-only checkout — the point
+  // of the mode is to answer a question about the chain, not to be gated on paying for one.
+  const startLamports = preflightOnly ? 0 : await rpcRead("operator balance",
     () => conn.getBalance(signer.publicKey, "confirmed"));
   const startSol = startLamports / LAMPORTS_PER_SOL;
-  if (startSol < MIN_BALANCE_SOL) {
+  if (!preflightOnly && startSol < MIN_BALANCE_SOL) {
     console.error(
       `\nACTION REQUIRED — LOW BALANCE: operator wallet ${signer.publicKey.toBase58()} ` +
       `holds ${startSol.toFixed(4)} SOL, below the ${MIN_BALANCE_SOL} SOL minimum.`);
     console.error(`Top up this wallet, then the next scheduled run will proceed. Skipping the cycle.`);
     process.exit(1);
   }
-  console.log(`  operator balance: ${startSol.toFixed(4)} SOL (>= ${MIN_BALANCE_SOL} minimum) — proceeding`);
+  if (!preflightOnly) console.log(`  operator balance: ${startSol.toFixed(4)} SOL (>= ${MIN_BALANCE_SOL} minimum) — proceeding`);
 
-  const treasuryStartSol = (await rpcRead("treasury balance",
+  const treasuryStartSol = preflightOnly ? 0 : (await rpcRead("treasury balance",
     () => conn.getBalance(treasury.publicKey, "confirmed"))) / LAMPORTS_PER_SOL;
-  if (treasuryStartSol < MIN_TREASURY_SOL) {
+  if (!preflightOnly && treasuryStartSol < MIN_TREASURY_SOL) {
     console.error(
       `\nACTION REQUIRED — LOW TREASURY BALANCE: treasury wallet ${treasury.publicKey.toBase58()} ` +
       `holds ${treasuryStartSol.toFixed(4)} SOL, below the ${MIN_TREASURY_SOL} SOL minimum ` +
@@ -1434,7 +1459,7 @@ async function main(): Promise<void> {
     console.error(`Top up the treasury, then the next scheduled run will proceed. Skipping the cycle.`);
     process.exit(1);
   }
-  console.log(`  treasury balance: ${treasuryStartSol.toFixed(4)} SOL (>= ${MIN_TREASURY_SOL} minimum) — proceeding`);
+  if (!preflightOnly) console.log(`  treasury balance: ${treasuryStartSol.toFixed(4)} SOL (>= ${MIN_TREASURY_SOL} minimum) — proceeding`);
 
   // --- authorization: wallet must be the config authority or a registered operator ------
   // Same retry as the balance gates: this is the third of the three opening reads, and an
@@ -1473,8 +1498,18 @@ async function main(): Promise<void> {
   // round and scores every entry before failing, leaving the round closed-and-scored and
   // unrevealable until someone intervenes by hand.
   {
-    const needed = ["score_entry_v2", "reveal_top3_v5"] as const;
-    console.log(`  comp-defs       : verifying ${needed.length} circuit(s) against the deployed program…`);
+    // `queued` marks the circuits THIS SCRIPT sends during a cycle. For those an unknown name
+    // is fatal, because the failure it prevents strands a round mid-flight. The rest are
+    // queued by the frontend (breeding) or by the operator (hints), so this script has no
+    // business refusing to rotate a round over them — they are watched, and only warned about.
+    const GUARDED = [
+      { circuit: "score_entry_v2", queued: true },
+      { circuit: "reveal_top3_v5", queued: true },
+      { circuit: "breed_v3", queued: false },
+      { circuit: "private_hint", queued: false },
+    ] as const;
+
+    console.log(`  comp-defs       : verifying ${GUARDED.length} circuit(s) against the deployed program…`);
 
     const [programDataPda] = PublicKey.findProgramAddressSync(
       [program.programId.toBuffer()],
@@ -1485,13 +1520,15 @@ async function main(): Promise<void> {
       fatal(`could not read programdata at ${programDataPda.toBase58()} — cannot verify circuit names.`);
     }
 
-    for (const circuit of needed) {
+    const arciumProgram = arcium.getArciumProgram(provider);
+
+    for (const { circuit, queued } of GUARDED) {
       const offsetLe = Buffer.from(arcium.getCompDefAccOffset(circuit)).subarray(0, 4);
       const pda = compDefAccOf(circuit);
       const embedded = programData!.data.indexOf(offsetLe) >= 0;
 
       if (!embedded) {
-        fatal(
+        const detail =
           `circuit "${circuit}" is NOT known to the deployed program.\n` +
           `  Its comp-def offset (0x${offsetLe.toString("hex")}) does not appear in the deployed\n` +
           `  binary, so the program never references this name and every queue using it would\n` +
@@ -1500,8 +1537,10 @@ async function main(): Promise<void> {
           `  script is older (or newer) than the program actually deployed on chain. Note the\n` +
           `  comp-def account itself may well still exist and be finalized — superseded comp\n` +
           `  defs cannot be closed on cluster 456 — so its presence proves nothing.\n` +
-          `  Running revision: ${runningRevision()}\n` +
-          `  Aborting BEFORE any round state changes.`);
+          `  Running revision: ${runningRevision()}`;
+        if (queued) fatal(`${detail}\n  Aborting BEFORE any round state changes.`);
+        console.warn(`    WARNING: ${detail}\n  Not queued by this script, so the cycle continues.`);
+        continue;
       }
 
       // Secondary, and genuinely additive: the name is right, but was the circuit ever
@@ -1511,14 +1550,15 @@ async function main(): Promise<void> {
       // run production over a renamed field would be a worse failure than the one prevented.
       const info = await rpcRead(`comp-def ${circuit}`, () => conn.getAccountInfo(pda, "confirmed"));
       if (!info) {
-        fatal(
+        const detail =
           `circuit "${circuit}" is known to the program but its comp def does not exist at\n` +
-          `  ${pda.toBase58()} — it was never registered. Run the uploader for this circuit.\n` +
-          `  Aborting BEFORE any round state changes.`);
+          `  ${pda.toBase58()} — it was never registered. Run the uploader for this circuit.`;
+        if (queued) fatal(`${detail}\n  Aborting BEFORE any round state changes.`);
+        console.warn(`    WARNING: ${detail}\n  Not queued by this script, so the cycle continues.`);
+        continue;
       }
       let finalized: boolean | null = null;
       try {
-        const arciumProgram = arcium.getArciumProgram(provider);
         const cd: any = await arciumProgram.account.computationDefinitionAccount.fetch(pda);
         const flag = cd?.circuitSource?.onChain?.[0]?.isCompleted;
         if (typeof flag === "boolean") finalized = flag;
@@ -1526,16 +1566,89 @@ async function main(): Promise<void> {
         finalized = null;
       }
       if (finalized === false) {
-        fatal(
+        const detail =
           `circuit "${circuit}" exists at ${pda.toBase58()} but is NOT finalized — its upload\n` +
-          `  never completed, so the cluster cannot execute it. Re-run the uploader.\n` +
-          `  Aborting BEFORE any round state changes.`);
+          `  never completed, so the cluster cannot execute it. Re-run the uploader.`;
+        if (queued) fatal(`${detail}\n  Aborting BEFORE any round state changes.`);
+        console.warn(`    WARNING: ${detail}\n  Not queued by this script, so the cycle continues.`);
+      }
+
+      // --- byte freshness ------------------------------------------------------------------
+      // Does the circuit the cluster will EXECUTE still match the circuit this repo would
+      // BUILD from current source?
+      //
+      // Nothing above can see this. A comp-def keeps its name, its offset and its finalized
+      // flag across any number of source edits, so a circuit whose bytes were uploaded months
+      // ago passes every in-binary and account-level check while the cluster runs code nobody
+      // has looked at since. That is exactly how DEV's `score_entry_v2` and `private_hint` sat
+      // on 2026-08-04 bytes for weeks: both in-binary, both finalized, both stale — the local
+      // build had moved on and no check compared the two.
+      //
+      // WARN, NEVER FATAL, on purpose. A finalized comp-def's bytecode is immutable and close
+      // is blocked on cluster 456, so the only remedy is a rename: a deliberate, paid, human
+      // decision that an unattended cycle cannot make. Aborting would take the game down over
+      // a condition the operator cannot resolve from here — and one that is often harmless,
+      // since a behaviour-preserving refactor moves bytes without changing what is computed.
+      // This surfaces the fact; a human decides what it means.
+      //
+      // SILENT WHEN THERE IS NOTHING TO COMPARE. `build/` is gitignored, so on Railway the
+      // artifact is absent and this reports "not checked" rather than inventing a verdict.
+      // The artifact is therefore tested FIRST: with no local build there is no reason to pull
+      // a ~160 KB raw-circuit account over RPC every cycle just to discard it.
+      //
+      // WHAT THIS DOES NOT PROVE. The comparison is deployed-vs-LOCAL-ARTIFACT, not
+      // deployed-vs-SOURCE. A `build/` that is itself out of date will read as "fresh" while
+      // both it and the chain lag the source. `arcium build` also skips a circuit it thinks is
+      // current, so the artifact can be older than it looks — deleting `build/<circuit>.*`
+      // first is the only way to force a real recompile. Treat "fresh" as "matches what this
+      // checkout last built", and rebuild before trusting it as an answer about source.
+      const localPath = path.join(REPO_ROOT, "build", `${circuit}.arcis`);
+      let freshness: string;
+      if (!fs.existsSync(localPath)) {
+        freshness = "bytes not checked (no local build/ artifact)";
+      } else {
+        const local = fs.readFileSync(localPath);
+        const rawPda = arcium.getRawCircuitAccAddress(pda, 0);
+        const raw = await rpcRead(`raw circuit ${circuit}`, () => conn.getAccountInfo(rawPda, "confirmed"));
+        if (!raw) {
+          freshness = "bytes not checked (raw circuit account absent)";
+        } else {
+          const onchain = raw.data.subarray(RAW_CIRCUIT_HEADER);
+          if (onchain.length === local.length && onchain.equals(local)) {
+            freshness = `bytes fresh (${local.length} B)`;
+          } else {
+            let mismatched = Math.abs(onchain.length - local.length);
+            const overlap = Math.min(onchain.length, local.length);
+            for (let b = 0; b < overlap; b++) if (onchain[b] !== local[b]) mismatched++;
+            freshness = "BYTES STALE";
+            console.warn(
+              `    WARNING: circuit "${circuit}" is STALE on chain.\n` +
+              `      deployed : ${onchain.length} B  sha256 ${sha256Hex(onchain).slice(0, 16)}…  (${rawPda.toBase58()})\n` +
+              `      local    : ${local.length} B  sha256 ${sha256Hex(local).slice(0, 16)}…  (build/${circuit}.arcis)\n` +
+              `      ${mismatched} mismatched byte(s). The cluster is executing an older build than this\n` +
+              `      repo compiles. A finalized comp-def cannot be overwritten and close is blocked on\n` +
+              `      cluster 456, so the only fix is a RENAME — check whether the divergence is\n` +
+              `      behaviour-preserving before paying for one. Not fatal; the cycle continues.`);
+          }
+        }
       }
 
       console.log(
         `    ${circuit.padEnd(16)} in-binary OK  ${pda.toBase58()}  ` +
-        `${finalized === true ? "finalized" : "exists (finalization flag unreadable)"}`);
+        `${finalized === true ? "finalized" : "exists (finalization flag unreadable)"}  ${freshness}`);
     }
+  }
+
+  // Stop here when the caller only wants the pre-flight. The guard is the one part of this
+  // script that is pure observation, so it is the part worth being able to run on demand —
+  // before an upload, after a deploy, or when asking whether the chain and this checkout still
+  // agree. Everything above this point is reads; everything below rotates rounds and spends
+  // SOL, which is exactly why the exit is here and not a line later.
+  //
+  //   PREFLIGHT_ONLY=1 npm run auto-cycle
+  if (preflightOnly) {
+    console.log(`\n  pre-flight only (PREFLIGHT_ONLY=1) — no round state touched, nothing spent.`);
+    return;
   }
 
   const current = cfg.currentRound.toNumber();
