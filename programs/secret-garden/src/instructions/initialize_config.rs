@@ -33,6 +33,12 @@ pub(crate) fn handler(ctx: Context<InitializeConfig>) -> Result<()> {
         bump: ctx.bumps.config,
         operators: [Pubkey::default(); 3],
         operator_count: 0,
+        // Uniform target selection, with the auto-restore already in the past. A fresh config
+        // therefore behaves exactly as it did before the weighting existed, twice over — the
+        // weight says "no reduction" AND the restore gate has already fired. Damping is only
+        // ever switched on deliberately, via `set_mutant_weight`.
+        mutant_weight: MUTANT_WEIGHT_UNIFORM,
+        restore_ts: 0,
     });
     Ok(())
 }

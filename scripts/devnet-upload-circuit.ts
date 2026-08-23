@@ -51,7 +51,7 @@ const RAW_HEADER = 9; // 8-byte discriminator + 1-byte bump
 
 const CIRCUIT = (process.env.CIRCUIT ?? "breed") as
   | "breed" | "score_entry_v2" | "reveal_top3" | "private_hint" | "reveal_top3_v3"
-  | "breed_v3" | "reveal_top3_v5";
+  | "breed_v3" | "breed_v5" | "reveal_top3_v5";
 const EXECUTE = process.env.UPLOAD_EXECUTE === "yes";
 const CONCURRENCY = Number(process.env.CONCURRENCY ?? "8");
 const INTER_BATCH_DELAY_MS = Number(process.env.INTER_BATCH_DELAY_MS ?? "250");
@@ -91,9 +91,13 @@ describe(`secret-garden DEVNET resilient upload: ${CIRCUIT} (execute=${EXECUTE})
     private_hint: "initPrivateHintCompDef",
     reveal_top3_v3: "initRevealTop3V3CompDef",
     // The Anchor init instructions kept their original names across the circuit renames —
-    // COMP_DEF_OFFSET_BREED is comp_def_offset("breed_v3") and COMP_DEF_OFFSET_REVEAL_TOP3_V3
+    // COMP_DEF_OFFSET_BREED is comp_def_offset("breed_v5") and COMP_DEF_OFFSET_REVEAL_TOP3_V3
     // is comp_def_offset("reveal_top3_v5"), so these two reuse the same instructions.
     breed_v3: "initBreedingCompDef",
+    // Stage 5G: breed_v3 -> breed_v5 (Soil now actually tilts the Mutant trait). Same
+    // argument signature as breed_v3, so only the name — and therefore the comp-def
+    // offset — changes; the queue/callback wiring is untouched.
+    breed_v5: "initBreedingCompDef",
     reveal_top3_v5: "initRevealTop3V3CompDef",
   };
 

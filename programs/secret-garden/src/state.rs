@@ -31,6 +31,50 @@ pub struct GameConfig {
     pub operators: [Pubkey; 3],
     /// Number of active entries in `operators` (0..=3).
     pub operator_count: u8,
+
+    // --- Mutant target weighting (appended; existing field offsets unchanged so configs
+    //     created before this change stay deserializable — see `migrate_config`) ---
+    /// How often `open_round` is allowed to put Mutant (`TRAIT_ID_MUTANT`) in the trait pool,
+    /// as a fraction of `MUTANT_WEIGHT_UNIFORM` (255 = always, 0 = never). Only the POOL is
+    /// affected; nothing about scoring, entries or flowers reads this.
+    ///
+    /// This exists because `breed_v5` makes Mutant genuinely scarce to breed while flowers
+    /// bred under the old flat-50% formula keep their old odds — so until the post-cutover
+    /// population is large, a Mutant-target round rewards legacy stock. Mutant is the ONLY
+    /// trait where the two generations differ (`mutation_affinity` is read in exactly one
+    /// place: `trait_satisfied`'s arm 8), so damping how often it is targeted damps the whole
+    /// effect proportionally.
+    ///
+    /// Zero-filled to 0 by `migrate_config`'s `resize`, which would otherwise read as "never
+    /// target Mutant" — the exact opposite of a safe default. Two independent things prevent
+    /// that: `migrate_config` writes 255 over the byte explicitly, and `restore_ts` zero-fills
+    /// to 0, which `effective_mutant_weight` reads as "already restored". Either alone is
+    /// sufficient; both are present on purpose.
+    pub mutant_weight: u8,
+    /// Unix timestamp at (and after) which `mutant_weight` is ignored and selection returns to
+    /// uniform, so forgetting to reset the weight cannot quietly distort rounds forever. A 0
+    /// (the zero-filled default) is already in the past, so an un-configured config is uniform.
+    pub restore_ts: i64,
+}
+
+impl GameConfig {
+    /// The Mutant weight that `open_round` should actually use at time `now`.
+    ///
+    /// Returns `MUTANT_WEIGHT_UNIFORM` — i.e. no reduction — once `now` has reached
+    /// `restore_ts`, whatever `mutant_weight` says. The weighting is a temporary measure
+    /// while the post-`breed_v5` flower population builds up, so it fails OPEN: an operator
+    /// who sets a weight and then forgets about it gets uniform selection back on schedule
+    /// rather than a permanently distorted trait pool. Setting `restore_ts` into the past
+    /// (0 included) is therefore also the way to switch the weighting off entirely.
+    ///
+    /// Pure, so it is unit-testable without a `Clock` or an Anchor context.
+    pub fn effective_mutant_weight(&self, now: i64) -> u8 {
+        if now >= self.restore_ts {
+            crate::constants::MUTANT_WEIGHT_UNIFORM
+        } else {
+            self.mutant_weight
+        }
+    }
 }
 
 /// True if `signer` is the config authority or one of the active operators. Authority has
@@ -372,7 +416,7 @@ pub struct CompetitionEntry {
     /// The entry is created with `init` and no instruction ever rewrites this field, so it
     /// cannot be re-snapshotted later. Nothing can change the value behind its back either:
     /// `rarity` is only ever written when a flower is CREATED (starters in `claim_starters`,
-    /// offspring in `start_breeding`/`breed_v3_callback`) and never mutated afterwards, and
+    /// offspring in `start_breeding`/`breed_v5_callback`) and never mutated afterwards, and
     /// a Submitted flower cannot be bred (breeding requires Active), released (that requires
     /// the round Finalized) or closed while the round is live.
     ///
@@ -903,5 +947,107 @@ mod tests {
         assert!(p.check_collection_cap().is_ok());
         p.total_flowers = STARTER_COUNT as u16 - 1;
         assert!(p.check_collection_cap().is_ok());
+    }
+
+    // --- Mutant target weighting: config layout + auto-restore ---------------------------
+
+    fn blank_config() -> GameConfig {
+        GameConfig {
+            authority: Pubkey::new_unique(),
+            paused: false,
+            current_round: 0,
+            starter_count: crate::constants::STARTER_COUNT,
+            version: crate::constants::PROGRAM_VERSION,
+            bump: 255,
+            operators: [Pubkey::default(); 3],
+            operator_count: 0,
+            mutant_weight: crate::constants::MUTANT_WEIGHT_UNIFORM,
+            restore_ts: 0,
+        }
+    }
+
+    #[test]
+    fn game_config_offsets_match_the_documented_layout() {
+        use anchor_lang::AnchorSerialize;
+
+        // Serialize a config whose appended fields carry sentinels, then locate them by the
+        // offsets `migrate_config` writes through. This is what makes the raw byte write in
+        // `migrate_config` safe: insert a field above `mutant_weight` and this fails loudly.
+        let mut c = blank_config();
+        c.mutant_weight = 0xAB;
+        c.restore_ts = 0x0102_0304_0506_0708;
+
+        let mut body = Vec::new();
+        c.serialize(&mut body).unwrap();
+
+        // `serialize` omits the 8-byte discriminator that Anchor prepends on-chain, so the
+        // account offsets are 8 higher than the offsets into `body`.
+        const DISC: usize = 8;
+        assert_eq!(
+            body.len() + DISC,
+            8 + GameConfig::INIT_SPACE,
+            "serialized GameConfig is not INIT_SPACE bytes"
+        );
+        assert_eq!(
+            body.len() + DISC,
+            158,
+            "GameConfig account should be 158 bytes"
+        );
+
+        let w_off = crate::constants::GAME_CONFIG_MUTANT_WEIGHT_OFFSET;
+        assert_eq!(w_off, 149, "mutant_weight offset drifted");
+        assert_eq!(body[w_off - DISC], 0xAB, "mutant_weight is not at byte 149");
+        assert_eq!(
+            &body[w_off - DISC + 1..w_off - DISC + 9],
+            &0x0102_0304_0506_0708i64.to_le_bytes(),
+            "restore_ts is not at bytes 150..158"
+        );
+
+        // The pre-append layout must be untouched: 149 bytes through operator_count.
+        assert_eq!(w_off, 8 + 32 + 1 + 8 + 1 + 1 + 1 + 96 + 1);
+    }
+
+    #[test]
+    fn a_zero_filled_migration_still_selects_uniformly() {
+        // What `migrate_config`'s `resize` alone would produce, WITHOUT its explicit 255
+        // write: both appended fields zero. `restore_ts = 0` must rescue it.
+        let mut c = blank_config();
+        c.mutant_weight = 0;
+        c.restore_ts = 0;
+        assert_eq!(
+            c.effective_mutant_weight(1_800_000_000),
+            crate::constants::MUTANT_WEIGHT_UNIFORM,
+            "a zero-filled config must behave uniformly, not exclude Mutant"
+        );
+    }
+
+    #[test]
+    fn the_weight_applies_only_before_restore_ts() {
+        let mut c = blank_config();
+        c.mutant_weight = 64;
+        c.restore_ts = 1_000;
+
+        assert_eq!(c.effective_mutant_weight(999), 64, "before restore: damped");
+        assert_eq!(
+            c.effective_mutant_weight(1_000),
+            crate::constants::MUTANT_WEIGHT_UNIFORM,
+            "at restore_ts exactly: uniform"
+        );
+        assert_eq!(
+            c.effective_mutant_weight(1_001),
+            crate::constants::MUTANT_WEIGHT_UNIFORM,
+            "after restore: uniform"
+        );
+    }
+
+    #[test]
+    fn a_past_restore_ts_switches_the_damping_off() {
+        let mut c = blank_config();
+        c.mutant_weight = 0;
+        c.restore_ts = -1;
+        assert_eq!(
+            c.effective_mutant_weight(0),
+            crate::constants::MUTANT_WEIGHT_UNIFORM
+        );
     }
 }

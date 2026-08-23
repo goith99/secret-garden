@@ -68,7 +68,7 @@ mod circuits {
     /// `_v2` cannot be re-uploaded in place for the same execpool reason as above, so the
     /// rebalance needs a fresh offset regardless.
     #[instruction]
-    pub fn breed_v3(
+    pub fn breed_v5(
         // Parent A: `kind`/`species` are public; `genome` is the parent's stored
         // ciphertext (zeroed and ignored when the parent is a Starter).
         parent_a_kind: u8,
@@ -267,12 +267,68 @@ mod circuits {
         let aroma_gene = pick(a.aroma_gene, b.aroma_gene, 128);
 
         // recessive_mask and mutation_affinity are dominated by fresh randomness so the
-        // offspring is not predictable from the parents alone (soil tilts mutation).
+        // offspring is not predictable from the parents alone.
         let rand_rec = ArcisRNG::gen_uniform::<u8>();
         let recessive_mask =
             ((a.recessive_mask as u16 + b.recessive_mask as u16 + 2 * (rand_rec as u16)) / 4) as u8;
-        let rand_mut = ArcisRNG::gen_uniform::<u8>();
-        let mutation_affinity = ((rand_mut as u16 + e.soil as u16) / 2) as u8;
+
+        // --- Soil -> Mutant. SOIL BIASES THE PARITY DIRECTLY, and here is why it must. ---
+        //
+        // `breed_v3` computed `mutation_affinity = (rand_mut + soil) / 2` and the Mutant trait
+        // reads `mutation_affinity % 2 == 1`. That combination provably discards soil entirely:
+        // the result is odd iff `(rand_mut + soil) % 4` lands in {2,3}, and because `rand_mut`
+        // is a uniform u8 (256 = 4 * 64) its residues mod 4 are EXACTLY uniform, so adding any
+        // constant soil merely permutes them. P(Mutant) was exactly 0.5 for all 256 soil
+        // values — verified by brute force over the whole 256x256 input space, not estimated.
+        // Soil entered at bit 0 of the sum and the `/2` threw that bit away before the trait
+        // ever looked at it. The old comment claimed "soil tilts mutation"; it never did.
+        //
+        // WHY NOT FIX THE PREDICATE INSTEAD. `trait_satisfied` is the canonical free function
+        // SHARED with `score_entry_v2` and `private_hint`, so touching the Mutant test would
+        // change those two circuits' bytecode as well. The fix therefore has to live entirely
+        // inside breed, which means making the low bit of `mutation_affinity` the soil-biased
+        // quantity rather than a discarded carry.
+        //
+        // THE GATE. A direct comparison, so soil moves the outcome instead of being averaged
+        // away.
+        //
+        // RE-CENTRED IN breed_v5. `breed_v4` fixed the flatness but kept the midpoint at
+        // exactly 50%, which made Mutant a coin flip that soil trimmed by ±12.5pp. That is
+        // not what the trait is for: Mutant is meant to read as a find, and at 50% it read as
+        // the default. The mechanism below is byte-for-byte `breed_v4`'s — only the base and
+        // slope changed — so `trait_satisfied`, `score_entry_v2` and `private_hint` are
+        // untouched.
+        //
+        // CALIBRATED AGAINST THE GAME'S OWN SCARCITY LADDER, not picked freely. At a typical
+        // lift the rarity tiers run Rare ~22%, Epic ~9.4%, Legendary ~3.1%. Mutant should sit
+        // in that band: Legendary-scarce when soil is starved, Epic-ish at neutral, and about
+        // Rare-frequent when soil is maxed.
+        //
+        //     P(Mutant) = (4 + soil/8) / 256
+        //       soil=0   ->   4/256 =  1.563%   (below Legendary — a genuine fluke)
+        //       soil=64  ->  12/256 =  4.688%
+        //       soil=128 ->  20/256 =  7.813%   (neutral, just under Epic's ~9.4%)
+        //       soil=192 ->  28/256 = 10.938%
+        //       soil=255 ->  35/256 = 13.672%   (max soil, between Epic and Rare)
+        //
+        // The dial is now an ~8.8x lever end to end, where breed_v4's was 1.7x — soil stops
+        // being a trim and becomes the decision it was always documented to be.
+        //
+        // `/8` is a power of two, chosen over a slope like `/6` that would hit the same span
+        // less cheaply. Bases 4..35 stay far inside u8: no overflow, and the base never
+        // reaches 0, so no soil value makes Mutant impossible.
+        let add = e.soil / 8;
+        let mutant_threshold = 4u8 + add;
+        let rand_gate = ArcisRNG::gen_uniform::<u8>();
+        let mutant_bit = if rand_gate < mutant_threshold { 1u8 } else { 0u8 };
+
+        // The magnitude is kept meaningful (and still soil-influenced) so the field carries more
+        // than one bit for any future reader; only its LOW bit is reserved for the trait. Forced
+        // arithmetically — `<<`/`&`/`|` are unsupported on secret values in Arcis, so
+        // `(m / 2) * 2` clears bit 0 without bitwise ops. Max (255/2)*2 + 1 = 255, no overflow.
+        let rand_mag = ArcisRNG::gen_uniform::<u8>();
+        let mutation_magnitude = ((rand_mag as u16 + e.soil as u16) / 2) as u8;
+        let mutation_affinity = (mutation_magnitude / 2) * 2 + mutant_bit;
 
         let child = Genome {
             color_gene,

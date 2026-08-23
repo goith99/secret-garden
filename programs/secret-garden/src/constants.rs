@@ -76,15 +76,15 @@ pub const RARITY_RARE: u8 = 3;
 pub const RARITY_EPIC: u8 = 4;
 pub const RARITY_LEGENDARY: u8 = 5; // reserved for non-starter species in later stages
 
-/// Bred-hybrid rarity is rolled inside the `breed_v3` MPC circuit and packed into the
+/// Bred-hybrid rarity is rolled inside the `breed_v5` MPC circuit and packed into the
 /// revealed u32 trait mask at bits 19-21, keeping the proven 2-tuple circuit output.
-/// `breed_v3_callback` unpacks it into `FlowerRecord::rarity` and stores a rarity-STRIPPED
+/// `breed_v5_callback` unpacks it into `FlowerRecord::rarity` and stores a rarity-STRIPPED
 /// mask, so the frontend's petal/color/leaf/stem decoder never sees these bits.
 ///
 /// Bits 19-21 and NOT 27-29: the live Arcium output path truncates a revealed u32 at
 /// ~27 bits, so a tier packed at 27-29 reads back as 0 on-chain.
 ///
-/// CANONICAL SOURCE for the roll itself: the rarity block in `breed_v3`
+/// CANONICAL SOURCE for the roll itself: the rarity block in `breed_v5`
 /// (`encrypted-ixs/src/lib.rs`). `tools/rarity-difftest` transcribes the boundary math
 /// and fails if this mirror and the circuit ever disagree.
 pub const RARITY_SHIFT: u32 = 19;
@@ -104,7 +104,7 @@ pub const RARITY_BASE_LEGENDARY: u16 = 251;
 /// Stage 5F rebalance — these were `(lift * 3) / 4` and `lift / 2`. Both had to change
 /// together: Epic's band is `b_legendary - b_epic`, so flattening only Legendary widens
 /// Epic by exactly what it takes from Legendary, relocating the inflation rather than
-/// removing it. See the boundary comment in `breed_v3` for the full derivation.
+/// removing it. See the boundary comment in `breed_v5` for the full derivation.
 pub const RARITY_EPIC_LIFT_DIV: u16 = 4;
 pub const RARITY_LEGENDARY_LIFT_DIV: u16 = 8;
 
@@ -311,6 +311,45 @@ pub const TRAIT_TABLE: [TraitDef; TRAIT_TABLE_LEN as usize] = [
         name: "Stable",
     }, // stability >= 150
 ];
+
+/// Trait id of Mutant inside `TRAIT_TABLE`, named so `open_round`'s weighting gate does not
+/// hardcode a bare `8`. MUST match `trait_satisfied`'s arm 8 in `encrypted-ixs/src/lib.rs`
+/// (`mutation_affinity % 2 == 1`) — `tools/mutant-weight-difftest` asserts the id agrees
+/// with `TRAIT_TABLE`'s entry, which is the only mirror reachable from Rust.
+pub const TRAIT_ID_MUTANT: u8 = 8;
+
+/// `GameConfig::mutant_weight` value meaning "no reduction at all" — the full 10-trait pool,
+/// i.e. exactly the selection this program performed before the weighting existed.
+///
+/// This is the DEFAULT and the auto-restore value, and it is deliberately the u8 maximum so
+/// the gate below can be proven a no-op rather than merely believed to be one: the gate
+/// includes Mutant iff `e * 255 < w * 256`, and at `w = 255` the right side is 65280 while
+/// the left side maxes out at `255 * 255 = 65025`, so the comparison holds for ALL 256
+/// entropy values. See `mutant_gate_includes_at_uniform_weight` in `open_round`.
+pub const MUTANT_WEIGHT_UNIFORM: u8 = u8::MAX;
+
+/// Which `entropy` byte `open_round`'s Mutant gate consumes.
+///
+/// MUST stay >= 5. Bytes 0..=4 are already spoken for — `entropy[0]` picks the target count
+/// and `entropy[1..=4]` drive the Fisher-Yates swaps (at most `TARGET_TRAIT_MAX` = 4 of
+/// them). Consuming a byte from the untouched tail is what keeps the weighted path
+/// byte-identical to the unweighted one whenever the gate resolves to "include": the swap
+/// stream is not perturbed, only gated. SHA-256 gives 32 bytes, so 5..=31 are all free.
+pub const MUTANT_GATE_ENTROPY_INDEX: usize = 5;
+
+/// Absolute byte offset of `GameConfig::mutant_weight` within the account data, used by
+/// `migrate_config` — which holds the config as a raw `UncheckedAccount` (a pre-migration
+/// config is too short to deserialize) and so cannot reach the field by name.
+///
+/// Layout: 8 (discriminator) + authority(32) + paused(1) + current_round(8) + starter_count(1)
+/// + version(1) + bump(1) + operators(96) + operator_count(1) = 149. Borsh packs with no
+/// padding, so the appended `mutant_weight` starts exactly there and `restore_ts` occupies
+/// 150..158, for a total account length of 158.
+///
+/// VERIFIED, NOT ASSUMED: `game_config_offsets_match_the_documented_layout` in `state.rs`
+/// serializes a real `GameConfig` and asserts this offset holds, so inserting a field above
+/// it fails the test suite instead of silently writing into the wrong byte.
+pub const GAME_CONFIG_MUTANT_WEIGHT_OFFSET: usize = 149;
 
 /// A round requests between MIN and MAX target traits. 2 keeps early rounds approachable
 /// (a flower can plausibly match all of them); 4 caps difficulty and fits the fixed

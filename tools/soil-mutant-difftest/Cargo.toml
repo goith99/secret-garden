@@ -1,0 +1,12 @@
+[package]
+name = "soil-mutant-difftest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Its OWN workspace root on purpose — same rationale as tools/rarity-difftest and
+# tools/trait-satisfied-difftest: a host-only verification crate with no arcis dependency,
+# which must stay out of the path of `arcium build` / `anchor build`.
+[workspace]
+
+[dependencies]

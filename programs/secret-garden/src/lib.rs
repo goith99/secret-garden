@@ -16,7 +16,7 @@ declare_id!("7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo");
 
 /// Computation-definition offset for the `breed` circuit (must match the circuit's
 /// `#[instruction] fn breed` name across all Arcium macros).
-const COMP_DEF_OFFSET_BREED: u32 = comp_def_offset("breed_v3");
+const COMP_DEF_OFFSET_BREED: u32 = comp_def_offset("breed_v5");
 /// Stage 4A scoring circuits.
 const COMP_DEF_OFFSET_SCORE_ENTRY: u32 = comp_def_offset("score_entry_v2");
 const COMP_DEF_OFFSET_REVEAL_TOP3: u32 = comp_def_offset("reveal_top3");
@@ -29,7 +29,7 @@ const COMP_DEF_OFFSET_PRIVATE_HINT: u32 = comp_def_offset("private_hint");
 
 /// Compute-unit budget for Arcium callback transactions. Required from Arcium v0.11.0 onward
 /// (`queue_computation`'s 7th parameter; it did not exist in v0.10.4). Sized from a MEASURED
-/// successful `breed_v3_callback` on devnet, which consumed 94,301 CU on its heaviest path
+/// successful `breed_v5_callback` on devnet, which consumed 94,301 CU on its heaviest path
 /// (flatten 10 genome ciphertexts + SHA-256 commitment + ~400-byte account write). 200,000 is
 /// Solana's default per-instruction budget and leaves >2x headroom over that worst case; every
 /// other callback in this program (score/reveal/hint) writes far less.
@@ -64,6 +64,19 @@ pub mod secret_garden {
     /// `paused` field has existed since Stage 1 but never had an instruction to set it.
     pub fn set_paused(ctx: Context<SetPaused>, new_value: bool) -> Result<()> {
         instructions::set_paused::handler(ctx, new_value)
+    }
+
+    /// Authority-only override for the temporary Mutant target-weighting. `new_weight` is
+    /// 0..=255 as a fraction of `MUTANT_WEIGHT_UNIFORM` (255 = uniform, the default);
+    /// `new_restore_ts` is when selection auto-returns to uniform regardless of the weight.
+    /// Setting `new_restore_ts` to 0 (or any past timestamp) switches the damping off.
+    /// Affects `open_round`'s trait pool ONLY — no flower, entry or scoring path reads it.
+    pub fn set_mutant_weight(
+        ctx: Context<SetMutantWeight>,
+        new_weight: u8,
+        new_restore_ts: i64,
+    ) -> Result<()> {
+        instructions::set_mutant_weight::handler(ctx, new_weight, new_restore_ts)
     }
 
     // --- Multi-operator support (authority-only administration) ---
@@ -123,6 +136,25 @@ pub mod secret_garden {
         // Grow in place; `resize` zero-initializes the appended bytes, so
         // operators = [Pubkey::default(); 3] and operator_count = 0.
         info.resize(new_len)?;
+
+        // `mutant_weight` is the one appended field whose zero value is not the safe default:
+        // 0 reads as "never target Mutant", the opposite of the pre-weighting behaviour this
+        // migration must preserve. Stamp the uniform value over it explicitly.
+        //
+        // Written by offset rather than through a typed `Account` because this instruction
+        // takes the config as a raw `UncheckedAccount` — a pre-migration config is SHORTER
+        // than `GameConfig`, so it cannot be deserialized here at all (that is the whole
+        // reason this instruction exists). The offset is asserted against `GameConfig`'s
+        // layout by `game_config_offsets_match_the_documented_layout` in `state.rs`, so a
+        // field inserted above it breaks the test rather than silently corrupting a config.
+        //
+        // `restore_ts` is left at its zero-filled 0, which `effective_mutant_weight` already
+        // treats as "restore time has passed" — so selection stays uniform even if this write
+        // were somehow skipped. Belt and braces, on purpose.
+        {
+            let mut data = info.try_borrow_mut_data()?;
+            data[GAME_CONFIG_MUTANT_WEIGHT_OFFSET] = MUTANT_WEIGHT_UNIFORM;
+        }
         Ok(())
     }
 
@@ -371,7 +403,7 @@ pub mod secret_garden {
             ctx.accounts,
             computation_offset,
             args,
-            vec![BreedV3Callback::callback_ix(
+            vec![BreedV5Callback::callback_ix(
                 computation_offset,
                 &ctx.accounts.mxe_account,
                 &[
@@ -407,7 +439,7 @@ pub mod secret_garden {
         ctx.accounts.flower_b.status = FLOWER_STATUS_LOCKED;
 
         // Pre-create the offspring with its PUBLIC metadata only. Arcium callbacks cannot
-        // init accounts, so the genome is written later by `breed_v3_callback`; the flower
+        // init accounts, so the genome is written later by `breed_v5_callback`; the flower
         // starts Locked and is flipped to Active only on a successful callback.
         let offspring_index = ctx.accounts.profile.next_flower_index;
         let offspring_stability = (((a_stability as u16 + b_stability as u16) / 2) as u8)
@@ -417,7 +449,7 @@ pub mod secret_garden {
             flower_index: offspring_index,
             visual_species_id: HYBRID_VISUAL_SPECIES_ID,
             generation: offspring_generation,
-            // Unranked until the MPC roll lands. `breed_v3_callback` overwrites this with the
+            // Unranked until the MPC roll lands. `breed_v5_callback` overwrites this with the
             // rolled tier; a failed or expired breed never reaches the callback, so its
             // offspring correctly keeps rarity 0 alongside its zeroed mask and genome.
             rarity: 0,
@@ -463,7 +495,7 @@ pub mod secret_garden {
     /// Permissionless recovery: after `EXPERIMENT_TIMEOUT_SECONDS`, anyone can expire a
     /// stuck Queued/Processing experiment to unlock the player's parents. This touches no
     /// Arcium/MPC state. It sets `callback_processed = true`, so if the MPC computation
-    /// later completes anyway, `breed_v3_callback`'s idempotency guard makes it a no-op —
+    /// later completes anyway, `breed_v5_callback`'s idempotency guard makes it a no-op —
     /// preventing a double `active_experiment_count` decrement or a second resolution.
     /// (Trade-off: a successful-but-late computation is discarded; the pre-created
     /// offspring stays Locked. The priority is recovering the player's parent flowers.)
@@ -536,10 +568,10 @@ pub mod secret_garden {
     /// it, flips it Active, unlocks both parents, and Completes the experiment. On failure:
     /// unlocks both parents and marks the experiment Failed (the offspring stays Locked).
     /// Idempotent via `experiment.callback_processed` — a retried callback no-ops.
-    #[arcium_callback(encrypted_ix = "breed_v3")]
-    pub fn breed_v3_callback(
-        ctx: Context<BreedV3Callback>,
-        output: SignedComputationOutputs<BreedV3Output>,
+    #[arcium_callback(encrypted_ix = "breed_v5")]
+    pub fn breed_v5_callback(
+        ctx: Context<BreedV5Callback>,
+        output: SignedComputationOutputs<BreedV5Output>,
     ) -> Result<()> {
         // A retried callback (or one racing a cancel) must not double-process.
         if ctx.accounts.experiment.callback_processed {
@@ -554,11 +586,11 @@ pub mod secret_garden {
 
         match verified {
             // Stage 3C: `breed` now returns a tuple `(Enc<Mxe, Genome>, u32)`. Per Arcium's
-            // codegen, a tuple return becomes a single `field_0` (BreedV3OutputStruct0) whose
+            // codegen, a tuple return becomes a single `field_0` (BreedV5OutputStruct0) whose
             // inner `field_0` is the encrypted genome and inner `field_1` is the public
             // `revealed_trait_mask`. The genome handling below is byte-for-byte the same as
             // Stage 3A/3B (the proven Enc<Mxe> path) — only the mask write is added.
-            Ok(BreedV3Output { field_0: result }) => {
+            Ok(BreedV5Output { field_0: result }) => {
                 let genome = result.field_0;
                 let revealed_trait_mask = result.field_1;
 
@@ -2561,7 +2593,7 @@ pub struct ManageOperator<'info> {
 }
 
 /// Registers the `breed` computation definition. Restricted to `config.authority`.
-#[init_computation_definition_accounts("breed_v3", authority)]
+#[init_computation_definition_accounts("breed_v5", authority)]
 #[derive(Accounts)]
 pub struct InitBreedingCompDef<'info> {
     #[account(mut)]
@@ -2589,7 +2621,7 @@ pub struct InitBreedingCompDef<'info> {
 
 /// Queues a `breed` computation. The signer (`player`) funds the new accounts and must
 /// own both Active parents; the two parents must be distinct flowers.
-#[queue_computation_accounts("breed_v3", player)]
+#[queue_computation_accounts("breed_v5", player)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
 pub struct StartBreeding<'info> {
@@ -2622,7 +2654,7 @@ pub struct StartBreeding<'info> {
         mut,
         constraint = flower_a.owner == player.key() @ SecretGardenError::FlowerNotOwned,
         // MUST be `== ACTIVE`, not `!= LOCKED`. The old negative form admitted a SUBMITTED
-        // parent, and `breed_v3_callback` unconditionally writes both parents back to ACTIVE on
+        // parent, and `breed_v5_callback` unconditionally writes both parents back to ACTIVE on
         // completion — so breeding mid-round silently laundered a Submitted flower back into
         // an Active one regardless of round state, bypassing the round gate that
         // `release_flower` exists to enforce.
@@ -2651,7 +2683,7 @@ pub struct StartBreeding<'info> {
     pub experiment: Box<Account<'info, Experiment>>,
     /// Offspring flower, pre-created here (Arcium callbacks cannot init accounts). Its
     /// index is the wallet's running `total_flowers` (starters occupy 0..=5). The genome
-    /// is written by `breed_v3_callback`.
+    /// is written by `breed_v5_callback`.
     #[account(
         init,
         payer = player,
@@ -2706,9 +2738,9 @@ pub struct StartBreeding<'info> {
 /// required by `#[callback_accounts]`); the writable game accounts follow in the SAME
 /// order they are registered in `start_breeding`'s `callback_ix` extra-accounts list.
 /// They are bound to the experiment so the callback can only touch the right records.
-#[callback_accounts("breed_v3")]
+#[callback_accounts("breed_v5")]
 #[derive(Accounts)]
-pub struct BreedV3Callback<'info> {
+pub struct BreedV5Callback<'info> {
     pub arcium_program: Program<'info, Arcium>,
     #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_BREED))]
     pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
@@ -2863,7 +2895,7 @@ pub struct CancelStuckScore<'info> {
     pub entry: Box<Account<'info, CompetitionEntry>>,
 }
 
-/// Emitted by `breed_v3_callback` when a breeding computation succeeds.
+/// Emitted by `breed_v5_callback` when a breeding computation succeeds.
 #[event]
 pub struct BreedingComputedEvent {
     /// The offspring genome ciphertext (10 scalars * 32 bytes).

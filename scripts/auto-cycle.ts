@@ -1505,7 +1505,7 @@ async function main(): Promise<void> {
     const GUARDED = [
       { circuit: "score_entry_v2", queued: true },
       { circuit: "reveal_top3_v5", queued: true },
-      { circuit: "breed_v3", queued: false },
+      { circuit: "breed_v5", queued: false },
       { circuit: "private_hint", queued: false },
     ] as const;
 
