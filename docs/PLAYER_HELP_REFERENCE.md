@@ -31,8 +31,9 @@ done.)
 **How does the daily challenge work?**
 Each day a competition round opens with a set of **public target traits** — you can see
 exactly what the judges are looking for, and picking which flower to enter is the strategy.
-Submit one of your **active** flowers before the deadline (rounds last 24 hours and hold up
-to 16 entries). After the round closes, every entry is judged privately and the **top 3
+Submit one of your **active** flowers before the deadline (every round ends at 10:00 UTC and
+holds up to 16 entries; a round normally runs about 24 hours, but one opened late runs
+shorter or longer so the daily deadline stays put). After the round closes, every entry is judged privately and the **top 3
 winners** are revealed. Your flower's exact score stays secret unless it lands in the top 3.
 
 **Is my breeding strategy private?**

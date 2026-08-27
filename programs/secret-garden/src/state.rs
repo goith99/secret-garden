@@ -321,7 +321,8 @@ pub struct CompetitionRound {
     pub status: u8,
     /// Unix timestamp the round opened.
     pub start_time: i64,
-    /// Submission deadline: `start_time + ROUND_DURATION_SECONDS`.
+    /// Submission deadline, snapped to the daily `ROUND_ANCHOR_UTC_SECONDS` anchor by
+    /// `round_end_time` — NOT a fixed offset from `start_time`.
     pub end_time: i64,
     /// Maximum number of entries allowed (see `MAX_PARTICIPANTS`).
     pub max_participants: u16,

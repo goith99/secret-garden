@@ -64,7 +64,8 @@ do not ship those strings without product/design sign-off.
 ## 2. Status reference (what to show the player)
 
 Constants referenced (`constants.rs`): `EXPERIMENT_TIMEOUT_SECONDS = 600`,
-`SCORE_TIMEOUT_SECONDS = 600`, `ROUND_DURATION_SECONDS = 86_400`. `now` = on-chain
+`SCORE_TIMEOUT_SECONDS = 600`, `ROUND_ANCHOR_UTC_SECONDS = 36_000`,
+`MIN_ROUND_DURATION_SECONDS = 43_200`. `now` = on-chain
 unix time (`Clock`).
 
 ### 2.1 `Experiment.status` (`EXPERIMENT_STATUS_*`)

@@ -255,7 +255,9 @@ finalized without ever being scored or revealed.
 | `FLOWER_COLLECTION_CAP` | 20 | live **hybrids** per player (`total_flowers − STARTER_COUNT`) |
 | `MAX_BREEDS_PER_ROUND` | 5 | per-player breeding budget, resets each round |
 | `MAX_BREEDS_AS_PARENT` | 3 | lifetime per-flower parent budget, spent at queue time, **never refunded** |
-| `ROUND_DURATION_SECONDS` | 86 400 | 24h |
+| `ROUND_ANCHOR_UTC_SECONDS` | 36 000 | 10:00 UTC — the fixed instant every round ends at |
+| `MIN_ROUND_DURATION_SECONDS` | 43 200 | 12h floor; a nearer anchor is skipped to the next day |
+| `SECONDS_PER_DAY` | 86 400 | one day, used to walk to the next anchor |
 | `MIN_OPERATOR_CLOSE_DELAY_SECONDS` | 3 600 | operator close delay; authority exempt |
 | `EXPERIMENT_TIMEOUT_SECONDS` | 600 | before an experiment can be cancelled |
 | `SCORE_TIMEOUT_SECONDS` | 600 | before a stuck score can be cancelled |

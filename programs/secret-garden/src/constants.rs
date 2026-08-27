@@ -58,8 +58,30 @@ pub const ENTRY_STATUS_SUBMITTED: u8 = 0;
 /// here costs no layout change and no migration of existing entries.
 pub const ENTRY_STATUS_RELEASED: u8 = 1;
 
-/// Length of a competition round in seconds: 24 hours (24 * 60 * 60 = 86400).
-pub const ROUND_DURATION_SECONDS: i64 = 86_400;
+/// One calendar day in seconds. Used to walk to the next daily anchor, NOT as a round
+/// length — a round's length is whatever `round_end_time` computes (see below).
+pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The fixed wall-clock instant every round is scheduled to END at, expressed as seconds
+/// since UTC midnight. 36 000 = 10:00 UTC.
+///
+/// Rounds used to end exactly 24h after they opened, which made the daily schedule drift:
+/// `open_round` can only run AFTER the previous round's deadline plus however long the
+/// close/score/reveal/finalize pipeline and the operator's cron granularity cost, so every
+/// day's anchor landed later than the last. Anchoring `end_time` to an absolute time of day
+/// instead makes the schedule self-correcting: however late a round opens, its deadline
+/// snaps back onto the anchor, so a late day costs a shorter round rather than a permanently
+/// displaced schedule.
+pub const ROUND_ANCHOR_UTC_SECONDS: i64 = 36_000;
+
+/// Floor on how long a round may run. If the next anchor is nearer than this, `round_end_time`
+/// skips it and targets the following day's instead, so a round opened shortly before the
+/// anchor becomes a long round (up to ~36h) rather than a useless few-minute one.
+///
+/// MUST stay above `MIN_OPERATOR_CLOSE_DELAY_SECONDS`: a round shorter than that delay could
+/// not be closed by the operator key the daily cron signs with, and would strand the schedule
+/// until an authority closed it by hand. The static assertion below enforces this.
+pub const MIN_ROUND_DURATION_SECONDS: i64 = 43_200;
 
 /// Maximum number of entries (participants) allowed per competition round.
 pub const MAX_PARTICIPANTS: u16 = 16;
@@ -68,6 +90,15 @@ pub const MAX_PARTICIPANTS: u16 = 16;
 /// close it. The authority can always close manually with no delay. 1 hour. Stops a leaked
 /// operator key from instantly closing a freshly-opened round.
 pub const MIN_OPERATOR_CLOSE_DELAY_SECONDS: i64 = 3_600;
+
+// --- schedule invariants, checked at compile time ------------------------------------------
+// A round shorter than the operator close delay could not be closed by the daily cron (which
+// signs as an OPERATOR, not the authority), so the floor must clear that delay.
+const _: () = assert!(MIN_ROUND_DURATION_SECONDS > MIN_OPERATOR_CLOSE_DELAY_SECONDS);
+// The anchor is a time OF DAY, so it has to lie inside one.
+const _: () = assert!(ROUND_ANCHOR_UTC_SECONDS >= 0 && ROUND_ANCHOR_UTC_SECONDS < SECONDS_PER_DAY);
+// The floor must be reachable within a day, or `round_end_time` could never satisfy it.
+const _: () = assert!(MIN_ROUND_DURATION_SECONDS < SECONDS_PER_DAY);
 
 /// Rarity tiers written to `FlowerRecord::rarity` (1 = most common .. 5 = rarest).
 pub const RARITY_COMMON: u8 = 1;

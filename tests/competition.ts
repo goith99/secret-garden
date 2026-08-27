@@ -11,7 +11,7 @@
  */
 import * as anchor from "@anchor-lang/core";
 import { assert, expect } from "chai";
-import { Harness } from "./harness.ts";
+import { Harness, FIXED_UNIX_TS } from "./harness.ts";
 
 const { PublicKey } = anchor.web3;
 
@@ -26,7 +26,23 @@ const ERR_FLOWER_NOT_ACTIVE = "0x177b"; // 6011
 const ERR_ROUND_NOT_CLOSED = "0x177c"; // 6012
 
 // Mirror of on-chain constants (programs/.../constants.rs).
-const ROUND_DURATION_SECONDS = 86_400; // 24h
+const SECONDS_PER_DAY = 86_400;
+const ROUND_ANCHOR_UTC_SECONDS = 36_000; // 10:00 UTC
+const MIN_ROUND_DURATION_SECONDS = 43_200; // 12h
+
+/**
+ * TS mirror of `open_round::round_end_time`. A round no longer ends a fixed 24h after it
+ * opens: it ends at the next 10:00 UTC that is at least 12h out, which is what stops the
+ * daily schedule drifting later every cycle. Kept as an independent transcription (not
+ * imported from anywhere) so it witnesses the on-chain behaviour rather than restating it.
+ */
+function roundEndTime(now: number): number {
+  const dayStart = now - ((now % SECONDS_PER_DAY) + SECONDS_PER_DAY) % SECONDS_PER_DAY;
+  let anchor = dayStart + ROUND_ANCHOR_UTC_SECONDS;
+  if (anchor <= now) anchor += SECONDS_PER_DAY;
+  if (anchor - now < MIN_ROUND_DURATION_SECONDS) anchor += SECONDS_PER_DAY;
+  return anchor;
+}
 // What a round ACCEPTS — `open_round` writes this into `max_participants`. Deliberately
 // distinct from the program's `MAX_PARTICIPANTS` (still 16), which is the reveal CIRCUIT's
 // fixed slot width. The bracket decoupled the two: a round is now revealed as several
@@ -209,9 +225,14 @@ describe("secret-garden Stage 2: competition rounds", () => {
       expect(round.maxParticipants).to.equal(ROUND_CAPACITY);
       expect(round.participantCount).to.equal(0);
       expect(round.authority.equals(authority.publicKey)).to.equal(true);
-      expect(round.endTime.sub(round.startTime).toNumber()).to.equal(
-        ROUND_DURATION_SECONDS,
+      // end_time is snapped to the daily 10:00 UTC anchor, not start_time + 24h.
+      expect(round.endTime.toNumber()).to.equal(roundEndTime(FIXED_UNIX_TS));
+      expect(round.endTime.toNumber() % SECONDS_PER_DAY).to.equal(
+        ROUND_ANCHOR_UTC_SECONDS,
       );
+      expect(
+        round.endTime.sub(round.startTime).toNumber(),
+      ).to.be.at.least(MIN_ROUND_DURATION_SECONDS);
 
       const cfg = await h.program.account.gameConfig.fetch(h.configPda());
       expect(cfg.currentRound.toNumber()).to.equal(1);
@@ -316,8 +337,8 @@ describe("secret-garden Stage 2: competition rounds", () => {
 
     it("fails after the round deadline has passed", async () => {
       const { h, authority } = await bootstrapWithOpenRound();
-      // Round opened at FIXED_UNIX_TS; submit one second past end_time.
-      const afterDeadline = 1_700_000_000 + ROUND_DURATION_SECONDS + 1;
+      // Round opened at FIXED_UNIX_TS; submit one second past its SNAPPED end_time.
+      const afterDeadline = roundEndTime(FIXED_UNIX_TS) + 1;
       const r = await h.send(
         [await ixSubmit(h, authority.publicKey, 1, 0)],
         [authority],

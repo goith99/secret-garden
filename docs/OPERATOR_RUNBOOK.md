@@ -53,9 +53,10 @@ finalize_round                  # authority/operator (lets the next round open)
 ### Step-by-step
 
 **a) Open the round** (authority). `open_round` requires the previous round (if any) to be
-`Finalized`; pass `previousRound = null` for the very first round. Sets
-`end_time = start_time + 24h`, `max_participants = 16`, and generates the round's PUBLIC
-target traits.
+`Finalized`; pass `previousRound = null` for the very first round. Sets `end_time` to the
+next 10:00 UTC at least `MIN_ROUND_DURATION_SECONDS` (12h) away — NOT `start_time + 24h`, so
+the daily deadline does not drift later as the cycle's overhead accumulates — plus
+`max_participants = 16`, and generates the round's PUBLIC target traits.
 
 ```ts
 await program.methods.openRound()

@@ -89,7 +89,7 @@ pub(crate) fn handler(ctx: Context<OpenRound>) -> Result<()> {
         round_id: new_round_id,
         status: ROUND_STATUS_OPEN,
         start_time: now,
-        end_time: now + ROUND_DURATION_SECONDS,
+        end_time: round_end_time(now),
         // ROUND_CAPACITY, not MAX_PARTICIPANTS: the latter is the reveal CIRCUIT's fixed
         // 16-slot width (still used by every shard reveal under the hood), whereas this is
         // how many entries a round may ACCEPT. They were the same number only while a round
@@ -109,6 +109,48 @@ pub(crate) fn handler(ctx: Context<OpenRound>) -> Result<()> {
 
     ctx.accounts.config.current_round = new_round_id;
     Ok(())
+}
+
+/// The instant this round's submissions close, snapped to the daily `ROUND_ANCHOR_UTC_SECONDS`
+/// anchor rather than set 24h out from `now`.
+///
+/// Returns the first anchor STRICTLY after `now`, skipping forward one day if that anchor is
+/// nearer than `MIN_ROUND_DURATION_SECONDS`. So the result is always an exact 10:00 UTC, always
+/// in the future, and always at least the floor away — a round therefore runs between 12h and
+/// ~36h, and the schedule reconverges on the anchor after a single round no matter how late
+/// the previous cycle ran.
+///
+/// # Why this is what makes the schedule self-correcting
+///
+/// The old rule — `now + 24h`, via a `ROUND_DURATION_SECONDS` constant this change removes —
+/// compounded: `open_round` cannot run until after the previous deadline, so each day's
+/// `end_time` inherited the previous day's lateness AND added that day's own. Measured on
+/// devnet across rounds 56-65 that came to roughly +30 min/day, dominated by the cron's hourly
+/// granularity rather than the ~2 min pipeline. Anchoring to an absolute time of day discards
+/// the accumulated error every round instead of carrying it.
+///
+/// Pure and exported so the boundary is unit-testable without a validator, exactly like
+/// `select_target_traits` below.
+pub fn round_end_time(now: i64) -> i64 {
+    // `rem_euclid`, not `%`: for a negative `now` the latter yields a negative remainder and
+    // would put `day_start` in the wrong day. Unreachable with a real clock, but the whole
+    // point of a pure helper is that it is correct on its own terms.
+    let day_start = now - now.rem_euclid(SECONDS_PER_DAY);
+    let mut anchor = day_start + ROUND_ANCHOR_UTC_SECONDS;
+
+    // Strictly after `now`: opening exactly ON the anchor must yield a full day, not a
+    // zero-length round.
+    if anchor <= now {
+        anchor += SECONDS_PER_DAY;
+    }
+
+    // One skip is always enough, because the floor is less than a day (asserted in
+    // `constants.rs`), so the next anchor is at most a day further out.
+    if anchor - now < MIN_ROUND_DURATION_SECONDS {
+        anchor += SECONDS_PER_DAY;
+    }
+
+    anchor
 }
 
 /// Picks a round's target traits from `entropy`, damping how often Mutant can appear.
@@ -448,5 +490,165 @@ mod tests {
             rates[4] > 0.25,
             "uniform weight should target Mutant ~30% of rounds"
         );
+    }
+
+    // --- the daily anchor -------------------------------------------------------------------
+
+    /// 2026-01-01T00:00:00Z. Exactly a UTC midnight (`% SECONDS_PER_DAY == 0`), so every case
+    /// below can be written as "midnight plus a time of day" and read at a glance.
+    const MIDNIGHT: i64 = 1_767_225_600;
+    /// That day's 10:00 UTC.
+    const ANCHOR: i64 = MIDNIGHT + ROUND_ANCHOR_UTC_SECONDS;
+
+    #[test]
+    fn the_test_midnight_really_is_a_midnight() {
+        assert_eq!(MIDNIGHT % SECONDS_PER_DAY, 0);
+    }
+
+    #[test]
+    fn the_floor_clears_the_operator_close_delay() {
+        // Runtime mirror of the static assertion in constants.rs. A round shorter than the
+        // operator close delay could not be closed by the cron key at all.
+        assert!(MIN_ROUND_DURATION_SECONDS > MIN_OPERATOR_CLOSE_DELAY_SECONDS);
+    }
+
+    #[test]
+    fn open_just_after_the_anchor_targets_tomorrows_anchor() {
+        // THE STEADY-STATE CASE. The cycle closes at the anchor, spends a couple of minutes on
+        // score/reveal/finalize, then opens. That round must run to the NEXT day's anchor.
+        let now = ANCHOR + 300; // 10:05 UTC
+        assert_eq!(round_end_time(now), ANCHOR + SECONDS_PER_DAY);
+        assert_eq!(round_end_time(now) - now, SECONDS_PER_DAY - 300); // 23h55m
+    }
+
+    #[test]
+    fn open_exactly_on_the_anchor_yields_a_full_day() {
+        // The anchor is "strictly after now", so landing exactly on it must not produce a
+        // zero-length round.
+        assert_eq!(round_end_time(ANCHOR), ANCHOR + SECONDS_PER_DAY);
+        assert_eq!(round_end_time(ANCHOR) - ANCHOR, SECONDS_PER_DAY);
+    }
+
+    #[test]
+    fn open_just_before_the_anchor_skips_to_the_following_day() {
+        // 09:55 — today's anchor is 5 minutes away, far under the floor, so it is skipped.
+        // Without the floor this would be a 5-minute round.
+        let now = ANCHOR - 300;
+        assert_eq!(round_end_time(now), ANCHOR + SECONDS_PER_DAY);
+        assert_eq!(round_end_time(now) - now, SECONDS_PER_DAY + 300); // 24h05m
+    }
+
+    #[test]
+    fn open_well_before_the_anchor_still_respects_the_floor() {
+        // 02:00 — today's anchor is 8h away, still under the 12h floor, so the round runs 32h.
+        let now = MIDNIGHT + 2 * 3600;
+        assert_eq!(round_end_time(now), ANCHOR + SECONDS_PER_DAY);
+        assert_eq!(round_end_time(now) - now, 32 * 3600);
+    }
+
+    #[test]
+    fn the_floor_boundary_is_exact_in_both_directions() {
+        // 22:00 — tomorrow's anchor is exactly the floor away. `<` not `<=`, so it is KEPT and
+        // this is the shortest round the program can ever produce.
+        let at = MIDNIGHT + 79_200;
+        assert_eq!(round_end_time(at), ANCHOR + SECONDS_PER_DAY);
+        assert_eq!(round_end_time(at) - at, MIN_ROUND_DURATION_SECONDS);
+
+        // One second LATER the gap is one under the floor, so a whole day is skipped. (Later,
+        // not earlier: time moving forward shrinks the distance to a fixed anchor, so 21:59:59
+        // is 43_201s out — comfortably over the floor — and only 22:00:01 falls under it.)
+        let after = at + 1;
+        assert_eq!(round_end_time(after), ANCHOR + 2 * SECONDS_PER_DAY);
+        assert_eq!(
+            round_end_time(after) - after,
+            MIN_ROUND_DURATION_SECONDS + SECONDS_PER_DAY - 1
+        );
+
+        // And the second before the boundary is still a normal, kept anchor.
+        assert_eq!(round_end_time(at - 1), ANCHOR + SECONDS_PER_DAY);
+        assert_eq!(round_end_time(at - 1) - (at - 1), MIN_ROUND_DURATION_SECONDS + 1);
+    }
+
+    #[test]
+    fn every_second_of_the_day_lands_on_the_anchor_and_respects_the_bounds() {
+        // Exhaustive over a whole day, so no time of day can produce a short, past-dated or
+        // off-anchor deadline.
+        for s in 0..SECONDS_PER_DAY {
+            let now = MIDNIGHT + s;
+            let end = round_end_time(now);
+            let dur = end - now;
+
+            assert_eq!(
+                end.rem_euclid(SECONDS_PER_DAY),
+                ROUND_ANCHOR_UTC_SECONDS,
+                "end_time is not on the anchor for time-of-day {s}"
+            );
+            assert!(end > now, "end_time is not in the future for time-of-day {s}");
+            assert!(
+                dur >= MIN_ROUND_DURATION_SECONDS,
+                "round shorter than the floor ({dur}s) for time-of-day {s}"
+            );
+            assert!(
+                dur < MIN_ROUND_DURATION_SECONDS + SECONDS_PER_DAY,
+                "round longer than the floor plus a day ({dur}s) for time-of-day {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_schedule_converges_on_the_anchor_and_stays_there() {
+        // The whole point of the change, modelled end to end: a round opens some time after the
+        // previous deadline (cron granularity + the close/score/reveal/finalize pipeline), and
+        // that lateness must NOT accumulate.
+        //
+        // Under the old `now + 86400` rule each `end_time` inherited every previous day's
+        // lateness; here the first round absorbs it and every later one lands exactly on 10:00.
+        for overhead in [62_i64, 204, 3_338, 3_612, 7_272] {
+            // Start deliberately displaced — round 65's real 00:15:52 UTC drift.
+            let mut open_at = MIDNIGHT + 912;
+            let mut end = round_end_time(open_at);
+
+            for round in 0..30 {
+                if round > 0 {
+                    assert_eq!(
+                        end.rem_euclid(SECONDS_PER_DAY),
+                        ROUND_ANCHOR_UTC_SECONDS,
+                        "round {round} drifted off the anchor at overhead {overhead}"
+                    );
+                }
+                // The next round can only open after this deadline, plus the cycle's overhead.
+                open_at = end + overhead;
+                end = round_end_time(open_at);
+            }
+        }
+    }
+
+    #[test]
+    fn lateness_does_not_accumulate_across_rounds() {
+        // Sharper form of the above: two schedules whose overheads differ by an order of
+        // magnitude must still agree on every deadline after the first round.
+        let start = MIDNIGHT + 912;
+        let mut slow_end = round_end_time(start);
+        let mut fast_end = round_end_time(start);
+        for round in 1..30 {
+            slow_end = round_end_time(slow_end + 3_600);
+            fast_end = round_end_time(fast_end + 60);
+            assert_eq!(
+                slow_end, fast_end,
+                "a slower cycle produced a different deadline at round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_timestamps_still_land_on_the_anchor() {
+        // Unreachable from a real clock, but `%` would silently put pre-epoch times in the
+        // wrong day; `rem_euclid` is what makes this hold.
+        for now in [-1_i64, -86_400, -86_401, -1_000_000] {
+            let end = round_end_time(now);
+            assert_eq!(end.rem_euclid(SECONDS_PER_DAY), ROUND_ANCHOR_UTC_SECONDS);
+            assert!(end > now);
+            assert!(end - now >= MIN_ROUND_DURATION_SECONDS);
+        }
     }
 }
