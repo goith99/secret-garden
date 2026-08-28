@@ -44,7 +44,11 @@ import * as fs from "fs";
 import * as os from "os";
 import type { SecretGarden } from "../target/types/secret_garden";
 
-const { PublicKey, Keypair } = anchor.web3;
+const { PublicKey, Keypair, SystemProgram, LAMPORTS_PER_SOL } = anchor.web3;
+
+/** SOL paid per rank, mirroring auto-cycle's PRIZE_SOL. Kept in step with it by hand — the two
+ *  tools pay the same pool and a divergence here would silently over- or under-pay. */
+const PRIZE_SOL = [0.5, 0.5, 0.5];
 type PK = anchor.web3.PublicKey;
 type KP = anchor.web3.Keypair;
 
@@ -141,14 +145,14 @@ async function openRoundPotAccounts(nextRoundId: number) {
   });
 
   // ---- HTTP-only send + confirm (no WebSocket on this Helius endpoint) ----
-  async function sendTxHttp(tx: anchor.web3.Transaction, label: string): Promise<string> {
+  async function sendTxHttp(tx: anchor.web3.Transaction, label: string, signer: anchor.web3.Keypair = authority): Promise<string> {
     for (let attempt = 1; attempt <= 6; attempt++) {
       const bh = await conn.getLatestBlockhash({ commitment: "confirmed" });
       tx.recentBlockhash = bh.blockhash;
       tx.lastValidBlockHeight = bh.lastValidBlockHeight;
-      tx.feePayer = authority.publicKey;
+      tx.feePayer = signer.publicKey;
       tx.signatures = [];
-      tx.sign(authority);
+      tx.sign(signer);
       let sig: string;
       try {
         sig = await conn.sendRawTransaction(tx.serialize(), {
@@ -523,6 +527,125 @@ async function openRoundPotAccounts(nextRoundId: number) {
         .accountsPartial({ authority: authority.publicKey, config: configPda, round }).transaction();
       await sendTxHttp(tx, `finalizeRound(${current})`);
       console.log(`\nRound ${current} finalized. Ready to open the next round.`);
+      return;
+    }
+
+    // ------------------------------------------------------------ DISTRIBUTE
+    // Pays a FINALIZED, revealed round's SOL prize pool from the treasury to its winners.
+    //
+    // WHY THIS EXISTS. auto-cycle pays prizes as step 3b of its own run, and refuses to pay a
+    // round it did not itself reveal — a deliberate double-pay guard, because there is no
+    // on-chain payout ledger to consult. The gap that leaves: a round cycled by hand through
+    // this tool (close/score/reveal/finalize) is never paid by anyone, and auto-cycle will
+    // decline to backfill it. That is not hypothetical — it is how rounds 63, 65 and 67 ended
+    // up owing their winners, and the operator's only signal was a warning line in a cron log.
+    //
+    // The guard here is the same idea, made checkable: scan the treasury's own transfer
+    // history for a batch whose recipient set is exactly this round's winners and which lands
+    // after the round closed. If one exists, this round has been paid and we refuse. It is a
+    // heuristic — SOL transfers carry no memo tying them to a round — but it is the same
+    // evidence a human would use, applied consistently instead of from memory.
+    //
+    //   COMMAND=distribute ROUND=63 TREASURY_PRIVATE_KEY='[...]' ...
+    //   COMMAND=distribute ROUND=63 DRY_RUN=1 ...      # report only, sends nothing
+    if (COMMAND === "distribute") {
+      const roundId = Number(process.env.ROUND ?? current);
+      const dry = process.env.DRY_RUN === "1";
+      if (!Number.isInteger(roundId) || roundId <= 0) throw new Error("set ROUND=<n>");
+
+      const round = roundPda(roundId);
+      const r: any = await program.account.competitionRound.fetch(round);
+      if (r.status !== ROUND_STATUS_FINALIZED) throw new Error(`round ${roundId} is not FINALIZED (status ${r.status})`);
+      if (!r.scoringRevealed) throw new Error(`round ${roundId} has no revealed winners`);
+
+      // top1/2/3 hold CompetitionEntry pubkeys; the wallet is on the entry, not the round.
+      const winners: PK[] = [];
+      for (const e of [r.top1, r.top2, r.top3] as PK[]) {
+        if (e.equals(PublicKey.default)) continue;
+        const entry: any = await program.account.competitionEntry.fetch(e);
+        winners.push(entry.player as PK);
+      }
+      if (winners.length === 0) throw new Error(`round ${roundId} revealed no real winners`);
+      console.log(`\nRound ${roundId}: ${winners.length} winner(s)`);
+      winners.forEach((w, i) => console.log(`  rank ${i + 1}: ${w.toBase58()}  ${PRIZE_SOL[i] ?? 0} SOL`));
+
+      const treasuryKey = process.env.TREASURY_PRIVATE_KEY;
+      if (!treasuryKey) throw new Error("TREASURY_PRIVATE_KEY not set");
+      const treasury = Keypair.fromSecretKey(new Uint8Array(JSON.parse(treasuryKey)));
+      console.log(`  treasury : ${treasury.publicKey.toBase58()}`);
+
+      // --- double-pay guard -------------------------------------------------------------
+      // The root problem is that SOL prizes have no on-chain payout ledger — nothing records
+      // "round N was paid", so this has to be inferred. (The $SGD pot does not share this
+      // weakness: `PotDistribution`'s init IS its receipt. Giving SOL prizes the same marker
+      // would retire this whole guard, and is the right fix if this keeps costing anyone.)
+      //
+      // Inference, deliberately parse-free: a payout is a transaction touching BOTH the
+      // treasury and the winner, after the round closed. Signature lists are one cheap call
+      // per address and need no getParsedTransaction — which matters, because that call is
+      // the first thing the RPC throttles and a guard that loses it would read a rate limit
+      // as "not yet paid" and pay twice.
+      //
+      // The window runs from the round's close to NOW, with no upper bound, so a late manual
+      // backfill (what this command is for) is visible to the next run. The cost of that is
+      // that a winner who also won a LATER round can look paid here; ALL winners must show a
+      // payment before this refuses, and a partial match stops for a human rather than
+      // guessing. Refusing too often is a nuisance; paying twice is real money.
+      const afterClose = r.endTime.toNumber() - 24 * 3600; // tolerate a hand-closed round
+      const sigsFor = async (who: PK): Promise<Set<string>> => {
+        const seen = new Set<string>();
+        let before: string | undefined;
+        for (let page = 0; page < 5; page++) {
+          const got = await conn.getSignaturesForAddress(who, { limit: 1000, before }, "confirmed");
+          if (!got.length) break;
+          for (const g of got) {
+            if (!g.err && (g.blockTime ?? 0) >= afterClose) seen.add(g.signature);
+          }
+          if ((got[got.length - 1].blockTime ?? 0) < afterClose) break;
+          before = got[got.length - 1].signature;
+          await sleep(200);
+        }
+        return seen;
+      };
+      const treasurySigs = await sigsFor(treasury.publicKey);
+      const paid: string[] = [];
+      for (const w of winners) {
+        const shared = [...(await sigsFor(w))].filter((x) => treasurySigs.has(x));
+        if (shared.length) paid.push(`${w.toBase58()}  ${shared[0].slice(0, 16)}…`);
+        await sleep(250);
+      }
+      if (paid.length === winners.length) {
+        console.log(`\n  ALREADY PAID — every winner shares a post-close transaction with the treasury:`);
+        paid.forEach((a) => console.log(`    ${a}`));
+        console.log(`  Refusing to double-pay.`);
+        return;
+      }
+      if (paid.length > 0) {
+        console.log(`\n  PARTIAL — ${paid.length} of ${winners.length} winners already share one:`);
+        paid.forEach((a) => console.log(`    ${a}`));
+        throw new Error(
+          "refusing: cannot tell a partial payout from a winner who was paid for a LATER " +
+          "round. Check these signatures by hand and pay the remainder directly.");
+      }
+      console.log(`  no winner shares a treasury transaction since this round closed — unpaid`);
+
+      const total = winners.reduce((sum, _w, i) => sum + (PRIZE_SOL[i] ?? 0), 0);
+      const bal = (await conn.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL;
+      console.log(`  owed     : ${total} SOL   (treasury holds ${bal.toFixed(4)})`);
+      if (bal < total + 0.01) throw new Error("treasury balance too low");
+      if (dry) { console.log("\n  [dry run — nothing sent]"); return; }
+
+      for (let i = 0; i < winners.length; i++) {
+        const sol = PRIZE_SOL[i] ?? 0;
+        if (sol <= 0) continue;
+        const tx = new anchor.web3.Transaction().add(SystemProgram.transfer({
+          fromPubkey: treasury.publicKey, toPubkey: winners[i],
+          lamports: Math.round(sol * LAMPORTS_PER_SOL),
+        }));
+        const sig = await sendTxHttp(tx, `prize rank ${i + 1} (${sol} SOL)`, treasury);
+        console.log(`    rank ${i + 1} -> ${winners[i].toBase58()}  ${sol} SOL  ${sig ?? ""}`);
+      }
+      console.log(`\nRound ${roundId}: paid ${total} SOL to ${winners.length} winner(s).`);
       return;
     }
 
