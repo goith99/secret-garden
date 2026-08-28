@@ -101,6 +101,12 @@ pub mod secret_garden {
         instructions::close_pot_vault::handler(ctx)
     }
 
+    /// Re-points `GameConfig.sgd_mint`. Authority-only, and only between rounds with the
+    /// current round's pot already drained — see `update_sgd_mint` for why both matter.
+    pub fn update_sgd_mint(ctx: Context<UpdateSgdMint>) -> Result<()> {
+        instructions::update_sgd_mint::handler(ctx)
+    }
+
 
     // --- Multi-operator support (authority-only administration) ---
 

@@ -11,6 +11,7 @@ pub mod set_mutant_weight;
 pub mod set_sgd_mint;
 pub mod set_paused;
 pub mod submit_entry;
+pub mod update_sgd_mint;
 
 // Glob re-export so the `#[program]` macro can resolve each instruction's generated
 // `__client_accounts_*` helper modules at the crate root. The `handler` functions are
@@ -28,3 +29,4 @@ pub use set_mutant_weight::*;
 pub use set_sgd_mint::*;
 pub use set_paused::*;
 pub use submit_entry::*;
+pub use update_sgd_mint::*;

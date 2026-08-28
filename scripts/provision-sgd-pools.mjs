@@ -44,9 +44,13 @@ const USDC = address("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
 // Mirrors dev's reserves: ~1.1 SOL + ~9267 SGD, and ~10 USDC + ~1012 SGD.
 // initialPrice is quoted as tokenB per tokenA with the SDK ordering the mints canonically,
 // so it is derived from the reserve ratio rather than hardcoded.
+// wSOL only. The USDC pair is deliberately omitted here: the operator's devnet USDC is still
+// locked in the OLD pools (closePosition fails on this SDK/splash-pool combination — see
+// scripts/withdraw-old-pools.mjs), and USDC is the less useful pair anyway. A player arrives
+// holding SOL, not devnet USDC, so wSOL/$SGD is the pair that actually makes the entry fee
+// obtainable. Re-add the USDC pair once that liquidity is recovered.
 const PAIRS = [
   { label: "wSOL/$SGD", other: WSOL, otherDecimals: 9, otherAmount: 1.1,  sgdAmount: 9267 },
-  { label: "USDC/$SGD", other: USDC, otherDecimals: 6, otherAmount: 10.0, sgdAmount: 1012 },
 ];
 
 const rpc = createSolanaRpc(RPC);

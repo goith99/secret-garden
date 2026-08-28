@@ -259,4 +259,8 @@ pub enum SecretGardenError {
     /// Arithmetic that must not silently wrap or truncate.
     #[msg("Arithmetic overflow while computing the pot split")]
     PotMathOverflow,
+    /// `update_sgd_mint` was called while the current round's pot still holds tokens. Paying
+    /// it out after the mint moves is impossible, so the change is refused until it is drained.
+    #[msg("The current round's pot must be distributed before changing the $SGD mint")]
+    PotNotDrained,
 }

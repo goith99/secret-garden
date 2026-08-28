@@ -13,6 +13,7 @@ import {
   feeAccounts,
   ixSetSgdMint,
   openRoundAccounts,
+  SGD_DECIMALS,
   SGD_MINT,
   ENTRY_FEE_SGD,
 } from "./sgd.ts";
@@ -23,7 +24,10 @@ type PK = anchor.web3.PublicKey;
 const ROUND_STATUS_FINALIZED = 2;
 // Anchor surfaces custom errors as hex in the failure string.
 const ERR_INSUFFICIENT_FEE = "0x17a9"; // 6057
-const ERR_WRONG_MINT = "0x17ac"; // 6060
+const ERR_WRONG_MINT = "0x17ac";
+const ERR_ROUND_NOT_FINAL = "0x17a4"; // 6052 RoundNotFinalized
+const ERR_POT_NOT_DRAINED = "0x17b0"; // 6064 PotNotDrained
+const ERR_MINT_ALREADY = "0x17ab"; // 6059 SgdMintAlreadySet // 6060
 const ERR_NOT_REVEALED = "0x17ad"; // 6061
 const ERR_POT_TOO_SMALL = "0x17ae"; // 6062
 const FEE = ENTRY_FEE_SGD;
@@ -67,6 +71,17 @@ const ixDistribute = (h: Harness, authority: PK, roundId: number, pairs: PK[], o
     sgdMint: SGD_MINT, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: h.systemProgram(),
     ...(override ?? {}),
   }).remainingAccounts(pairs.map((p) => ({ pubkey: p, isSigner: false, isWritable: true }))).instruction();
+
+/** A second $SGD-shaped mint, to migrate TO. */
+const NEW_SGD_MINT = anchor.web3.Keypair.generate().publicKey;
+
+const ixUpdateSgdMint = (h: Harness, authority: PK, roundId: number, override?: any) =>
+  h.program.methods.updateSgdMint().accountsStrict({
+    authority, config: h.configPda(), round: h.roundPda(roundId),
+    oldPotVault: ataFor(h.potAuthorityPda(roundId), SGD_MINT),
+    newSgdMint: NEW_SGD_MINT,
+    ...(override ?? {}),
+  }).instruction();
 
 /** Config + N players (each with a profile and starters) + $SGD + an open round 1. */
 async function bootstrap(playerCount: number) {
@@ -342,6 +357,75 @@ describe("$SGD entry-fee pot", () => {
       ])], [authority]);
       assert.isNotNull(r.result, "mismatched winner ATA must be rejected");
       expect(r.result).to.contain(ERR_WRONG_MINT);
+    });
+  });
+
+  // ---------------------------------------------------------------- mint migration
+  describe("update_sgd_mint", () => {
+    it("refuses while the round is still OPEN — the live pot would be stranded", async () => {
+      const { h, authority } = await bootstrap(1);
+      h.setMint(NEW_SGD_MINT, SGD_DECIMALS); // the target mint must exist to be pinned
+      // round 1 is open
+      const r = await h.send([await ixUpdateSgdMint(h, authority.publicKey, 1)], [authority]);
+      assert.isNotNull(r.result, "an OPEN round must block the mint change");
+      expect(r.result).to.contain(ERR_ROUND_NOT_FINAL);
+    });
+
+    it("refuses when the finalized round's pot still holds tokens", async () => {
+      const { h, authority, players } = await bootstrap(1);
+      h.setMint(NEW_SGD_MINT, SGD_DECIMALS);
+      await h.send([await ixSubmit(h, players[0].publicKey, 1, 0)], [players[0]]);
+      await revealWith(h, 1, [h.entryPda(h.roundPda(1), players[0].publicKey)]);
+      // finalized, but the 100 SGD fee is still sitting in the vault
+      expect(await h.tokenBalance(ataFor(h.potAuthorityPda(1), SGD_MINT))).to.equal(ENTRY_FEE_SGD);
+      const r2 = await h.send([await ixUpdateSgdMint(h, authority.publicKey, 1)], [authority]);
+      assert.isNotNull(r2.result, "an undrained pot must block the mint change");
+      expect(r2.result).to.contain(ERR_POT_NOT_DRAINED);
+    });
+
+    it("allows the change once the pot has been distributed", async () => {
+      const { h, authority, players } = await bootstrap(1);
+      h.setMint(NEW_SGD_MINT, SGD_DECIMALS);
+      await h.send([await ixSubmit(h, players[0].publicKey, 1, 0)], [players[0]]);
+      const entry = h.entryPda(h.roundPda(1), players[0].publicKey);
+      await revealWith(h, 1, [entry]);
+      await h.send([await ixDistribute(h, authority.publicKey, 1,
+        [entry, ataFor(players[0].publicKey, SGD_MINT)])], [authority]);
+      expect(await h.tokenBalance(ataFor(h.potAuthorityPda(1), SGD_MINT))).to.equal(0n);
+
+      await h.send([await ixUpdateSgdMint(h, authority.publicKey, 1)], [authority]);
+      const cfg: any = await h.program.account.gameConfig.fetch(h.configPda());
+      expect(cfg.sgdMint.toBase58()).to.equal(NEW_SGD_MINT.toBase58());
+    });
+
+    it("rejects a non-authority signer", async () => {
+      const { h, authority, players } = await bootstrap(2);
+      h.setMint(NEW_SGD_MINT, SGD_DECIMALS);
+      await revealWith(h, 1, []);
+      const impostor = players[1];
+      const r = await h.send([await ixUpdateSgdMint(h, impostor.publicKey, 1)], [impostor]);
+      assert.isNotNull(r.result, "a non-authority must be rejected");
+    });
+
+    it("rejects an empty token account that is not this round's pot vault", async () => {
+      const { h, authority, players } = await bootstrap(1);
+      h.setMint(NEW_SGD_MINT, SGD_DECIMALS);
+      await revealWith(h, 1, []);
+      // a player's own (empty-of-nothing) $SGD account holds the right mint but the wrong owner
+      const decoy = ataFor(players[0].publicKey, SGD_MINT);
+      const r = await h.send([await ixUpdateSgdMint(h, authority.publicKey, 1,
+        { oldPotVault: decoy })], [authority]);
+      assert.isNotNull(r.result, "a decoy vault must be rejected");
+      expect(r.result).to.contain(ERR_WRONG_MINT);
+    });
+
+    it("refuses a no-op re-pin to the mint already configured", async () => {
+      const { h, authority } = await bootstrap(1);
+      await revealWith(h, 1, []);
+      const r = await h.send([await ixUpdateSgdMint(h, authority.publicKey, 1,
+        { newSgdMint: SGD_MINT })], [authority]);
+      assert.isNotNull(r.result, "a no-op re-pin must be rejected");
+      expect(r.result).to.contain(ERR_MINT_ALREADY);
     });
   });
 });
