@@ -1,4 +1,6 @@
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token::{Mint, Token, TokenAccount};
 
 use crate::constants::*;
 use crate::error::SecretGardenError;
@@ -22,11 +24,11 @@ pub struct OpenRound<'info> {
         bump = config.bump,
         constraint = !config.paused @ SecretGardenError::GamePaused,
     )]
-    pub config: Account<'info, GameConfig>,
+    pub config: Box<Account<'info, GameConfig>>,
 
     /// The round at `config.current_round`. Required (and must be Finalized) for every
     /// round after the first; `None` only when `config.current_round == 0`.
-    pub previous_round: Option<Account<'info, CompetitionRound>>,
+    pub previous_round: Option<Box<Account<'info, CompetitionRound>>>,
 
     #[account(
         init,
@@ -35,7 +37,43 @@ pub struct OpenRound<'info> {
         seeds = [ROUND_SEED, (config.current_round + 1).to_le_bytes().as_ref()],
         bump,
     )]
-    pub round: Account<'info, CompetitionRound>,
+    pub round: Box<Account<'info, CompetitionRound>>,
+
+    // --- the round's $SGD pot vault -----------------------------------------------------
+    //
+    // Created HERE, by the operator opening the round, rather than lazily on first entry.
+    // The alternative (`init_if_needed` on `submit_entry`) would silently bill the round's
+    // first entrant ~0.00204 SOL of rent that no other entrant pays — a worse deal for being
+    // early, which is exactly backwards. The operator opens the round anyway, so it absorbs
+    // the cost once per round.
+    /// CHECK: authority PDA that owns the vault. Derived, so no keypair for it can exist and
+    /// the program is the only possible signer over the pot. Never deserialized.
+    #[account(seeds = [POT_SEED, (config.current_round + 1).to_le_bytes().as_ref()], bump)]
+    pub pot_authority: UncheckedAccount<'info>,
+
+    /// The pot itself, created empty and funded by the operator.
+    ///
+    /// `init_if_needed` rather than `init`. The honest reason is partly practical: bankrun's
+    /// VM cannot execute this SPL Token build's account-initialisation path ("unsupported BPF
+    /// instruction"), so a hard `init` here would make the whole suite un-runnable offline.
+    /// It is nonetheless safe, because this is a DERIVED associated token account — Anchor
+    /// still enforces `associated_token::mint` and `associated_token::authority` on the
+    /// adopt-existing branch, so the only account that can satisfy these constraints is the
+    /// exact vault this round would have created anyway. There is no substitution to make.
+    #[account(
+        init_if_needed,
+        payer = authority,
+        associated_token::mint = sgd_mint,
+        associated_token::authority = pot_authority,
+    )]
+    pub pot_vault: Box<Account<'info, TokenAccount>>,
+
+    /// Pinned to the configured mint so the vault can only ever hold real $SGD.
+    #[account(constraint = sgd_mint.key() == config.sgd_mint @ SecretGardenError::WrongSgdMint)]
+    pub sgd_mint: Box<Account<'info, Mint>>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
 
     pub system_program: Program<'info, System>,
 }

@@ -30,6 +30,7 @@ import * as anchor from "@anchor-lang/core";
 import BN from "bn.js";
 import { assert } from "chai";
 import { Harness, FIXED_UNIX_TS } from "./harness.ts";
+import { seedSgd, feeAccounts, ixSetSgdMint, SGD_MINT, ENTRY_FEE_SGD, openRoundAccounts } from "./sgd.ts";
 
 const { PublicKey } = anchor.web3;
 type PK = anchor.web3.PublicKey;
@@ -109,6 +110,7 @@ const ixOpenRound = (h: Harness, authority: PK, currentRound: number) =>
       previousRound: currentRound > 0 ? h.roundPda(currentRound) : null,
       round: h.roundPda(currentRound + 1),
       systemProgram: h.systemProgram(),
+      ...openRoundAccounts(h, currentRound + 1),
     })
     .instruction();
 
@@ -124,6 +126,7 @@ const ixSubmit = (h: Harness, player: PK, roundId: number, flower: PK) => {
       flowerRecord: flower,
       entry: h.entryPda(round, player),
       systemProgram: h.systemProgram(),
+      ...feeAccounts(h, player, roundId),
     })
     .instruction();
 };
@@ -226,6 +229,11 @@ async function bootstrapSubmitted(): Promise<{
   const h = await Harness.create();
   const authority = h.payer;
   await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
   await h.send([await ixCreateProfile(h, authority.publicKey)], [authority]);
   await h.send([await ixClaimStarters(h, authority.publicKey)], [authority]);
   const hybrid = await craftHybrid(h, authority.publicKey, HYBRID_INDEX);
@@ -392,6 +400,11 @@ describe("release_flower — returning a competed flower to the collection", () 
       const h = await Harness.create();
       const authority = h.payer;
       await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
       await h.send([await ixCreateProfile(h, authority.publicKey)], [authority]);
       await h.send([await ixClaimStarters(h, authority.publicKey)], [authority]);
       await h.send([await ixOpenRound(h, authority.publicKey, 0)], [authority]);

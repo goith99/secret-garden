@@ -618,3 +618,26 @@ pub const SHARD_RESULT_SEED: &[u8] = b"shardres";
 /// `shard_index` reserved for the FINAL reveal's result record, so it shares the
 /// `SHARD_RESULT_SEED` namespace without colliding with a real shard.
 pub const FINAL_SHARD_INDEX: u8 = 255;
+
+// --- $SGD entry fee and per-round prize pot ---------------------------------------------------
+
+/// PDA seed for a round's pot vault AUTHORITY: `[POT_SEED, round_id_le]`. The vault itself is
+/// that authority's associated token account for `GameConfig::sgd_mint`. No keypair exists for
+/// this authority — the program is the only possible signer, via `CpiContext::new_with_signer`.
+pub const POT_SEED: &[u8] = b"pot";
+
+/// PDA seed for the `PotDistribution` marker: `[POT_DIST_SEED, round_id_le]`.
+///
+/// The marker's `init` IS the replay guard. This is deliberate and load-bearing: a distributed
+/// pot's vault can be REFILLED by anyone (SPL lets any wallet transfer into any token account),
+/// so "the vault is empty" is NOT proof a round was already paid — a 50-token donation would
+/// re-arm a second payout. Only a persistent marker closes that hole, and `init` colliding on a
+/// second call is the same primitive `submit_entry` already relies on for duplicate entries.
+pub const POT_DIST_SEED: &[u8] = b"pot_dist";
+
+/// $SGD charged per `submit_entry`, in base units. 100 SGD at 6 decimals.
+pub const ENTRY_FEE_SGD: u64 = 100_000_000;
+
+/// Winners a pot is split between, at most. The real divisor is however many of
+/// `top1/top2/top3` are non-default, which is `participant_count.min(3)`.
+pub const MAX_POT_WINNERS: usize = 3;

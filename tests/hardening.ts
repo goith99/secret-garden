@@ -19,6 +19,7 @@ import * as anchor from "@anchor-lang/core";
 import BN from "bn.js";
 import { assert, expect } from "chai";
 import { Harness, FIXED_UNIX_TS } from "./harness.ts";
+import { seedSgd, feeAccounts, ixSetSgdMint, SGD_MINT, ENTRY_FEE_SGD, openRoundAccounts } from "./sgd.ts";
 
 const { PublicKey } = anchor.web3;
 type PK = anchor.web3.PublicKey;
@@ -116,6 +117,7 @@ const ixOpenRound = (h: Harness, authority: PK, currentRound: number) =>
       previousRound: currentRound > 0 ? h.roundPda(currentRound) : null,
       round: h.roundPda(currentRound + 1),
       systemProgram: h.systemProgram(),
+      ...openRoundAccounts(h, currentRound + 1),
     })
     .instruction();
 
@@ -137,6 +139,7 @@ const ixSubmit = (h: Harness, player: PK, roundId: number, flowerIndex: number) 
       flowerRecord: h.flowerPda(player, flowerIndex),
       entry: h.entryPda(round, player),
       systemProgram: h.systemProgram(),
+      ...feeAccounts(h, player, roundId),
     })
     .instruction();
 };
@@ -318,6 +321,11 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
       const h = await Harness.create();
       const authority = h.payer;
       await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
 
       const stranger = h.fundedKeypair();
       const r = await h.send(
@@ -336,6 +344,11 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
       const h = await Harness.create();
       const authority = h.payer;
       await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
 
       let r = await h.send([await ixSetPaused(h, authority.publicKey, true)], [authority]);
       assert.isNull(r.result, `set_paused(true) failed: ${r.result}`);
@@ -357,6 +370,11 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
       h = await Harness.create();
       authority = h.payer;
       await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
       // Authority gets a profile + starters and opens a round — all while UNPAUSED.
       await h.send([await ixCreateProfile(h, authority.publicKey)], [authority]);
       await h.send([await ixClaimStarters(h, authority.publicKey)], [authority]);
@@ -755,6 +773,11 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
       const h = await Harness.create();
       const authority = h.payer;
       await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
       await h.send([await ixCreateProfile(h, authority.publicKey)], [authority]);
 
       const profile = await h.program.account.playerProfile.fetch(
@@ -806,6 +829,11 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
       const h = await Harness.create();
       const authority = h.payer;
       await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
 
       const owner = h.fundedKeypair();
       const pda = h.profilePda(owner.publicKey);
@@ -914,6 +942,11 @@ describe("secret-garden Stage 5A: hardening (bankrun)", () => {
       const h = await Harness.create();
       const authority = h.payer;
       await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
 
       // Paused: starting a NEW competition round is blocked by the kill-switch.
       await h.send([await ixSetPaused(h, authority.publicKey, true)], [authority]);

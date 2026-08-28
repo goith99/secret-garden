@@ -39,6 +39,8 @@ pub(crate) fn handler(ctx: Context<InitializeConfig>) -> Result<()> {
         // ever switched on deliberately, via `set_mutant_weight`.
         mutant_weight: MUTANT_WEIGHT_UNIFORM,
         restore_ts: 0,
+        // Unset sentinel — every fee path refuses to run until `set_sgd_mint` pins it.
+        sgd_mint: Pubkey::default(),
     });
     Ok(())
 }

@@ -12,6 +12,7 @@
 import * as anchor from "@anchor-lang/core";
 import { assert, expect } from "chai";
 import { Harness, FIXED_UNIX_TS } from "./harness.ts";
+import { seedSgd, feeAccounts, ixSetSgdMint, SGD_MINT, ENTRY_FEE_SGD, openRoundAccounts } from "./sgd.ts";
 
 const { PublicKey } = anchor.web3;
 
@@ -121,6 +122,7 @@ const ixOpenRound = (h: Harness, authority: PK, currentRound: number) =>
       previousRound: currentRound > 0 ? h.roundPda(currentRound) : null,
       round: h.roundPda(currentRound + 1),
       systemProgram: h.systemProgram(),
+      ...openRoundAccounts(h, currentRound + 1),
     })
     .instruction();
 
@@ -141,6 +143,7 @@ const ixSubmit = (
       flowerRecord: h.flowerPda(player, flowerIndex),
       entry: h.entryPda(round, player),
       systemProgram: h.systemProgram(),
+      ...feeAccounts(h, player, roundId),
     })
     .instruction();
 };
@@ -175,6 +178,11 @@ async function bootstrap(): Promise<{
   const h = await Harness.create();
   const authority = h.payer;
   await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: create the mint and fee balances FIRST (set_sgd_mint reads the mint account, so it
+  // has to exist), then pin it. submit_entry charges a mandatory fee now, so no suite can
+  // submit an entry without all of this in place.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
   await h.send([await ixCreateProfile(h, authority.publicKey)], [authority]);
   await h.send([await ixClaimStarters(h, authority.publicKey)], [authority]);
   return { h, authority };

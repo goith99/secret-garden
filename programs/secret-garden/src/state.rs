@@ -55,6 +55,15 @@ pub struct GameConfig {
     /// uniform, so forgetting to reset the weight cannot quietly distort rounds forever. A 0
     /// (the zero-filled default) is already in the past, so an un-configured config is uniform.
     pub restore_ts: i64,
+
+    // --- $SGD entry fee (appended; existing field offsets unchanged so configs created
+    //     before this change stay deserializable — see `migrate_config`, which zero-fills the
+    //     appended bytes. `Pubkey::default()` is exactly the "not set yet" sentinel that
+    //     `set_sgd_mint` requires and that every fee path refuses to operate on) ---
+    /// The $SGD mint this deployment charges entry fees in and pays pots from. Pinned once by
+    /// `set_sgd_mint` and never re-pointed, so a compromised authority cannot redirect a live
+    /// pot at a mint it controls.
+    pub sgd_mint: Pubkey,
 }
 
 impl GameConfig {
@@ -713,6 +722,26 @@ impl Tier1State {
     }
 }
 
+/// Proof that a round's $SGD pot has been paid out. PDA seeds: `[b"pot_dist", round_id_le]`.
+///
+/// Existence IS the replay guard — `distribute_pot` creates this with `init`, so a second call
+/// fails on the account already being in use. See `POT_DIST_SEED` for why a balance check is
+/// not sufficient. The stored fields are for auditing; nothing reads them back.
+#[account]
+#[derive(InitSpace)]
+pub struct PotDistribution {
+    /// Round whose pot this records.
+    pub round_id: u64,
+    /// Base units actually paid out (the vault balance at distribution time).
+    pub total_paid: u64,
+    /// How many winners it was split between (1..=3).
+    pub winner_count: u8,
+    /// When the payout landed.
+    pub distributed_at: i64,
+    /// PDA bump.
+    pub bump: u8,
+}
+
 #[cfg(test)]
 mod tests {
     //! Stage 5D: per-round breeding limit. These exercise the decision logic directly —
@@ -964,6 +993,7 @@ mod tests {
             operator_count: 0,
             mutant_weight: crate::constants::MUTANT_WEIGHT_UNIFORM,
             restore_ts: 0,
+            sgd_mint: Pubkey::default(),
         }
     }
 
@@ -989,10 +1019,13 @@ mod tests {
             8 + GameConfig::INIT_SPACE,
             "serialized GameConfig is not INIT_SPACE bytes"
         );
+        // 158 before the $SGD work; +32 for the appended `sgd_mint` Pubkey. Growing this is
+        // an ACCOUNT LAYOUT CHANGE: every existing config fails to deserialize until
+        // `migrate_config` runs, so this number moving must always be a deliberate act.
         assert_eq!(
             body.len() + DISC,
-            158,
-            "GameConfig account should be 158 bytes"
+            190,
+            "GameConfig account should be 190 bytes"
         );
 
         let w_off = crate::constants::GAME_CONFIG_MUTANT_WEIGHT_OFFSET;
@@ -1006,6 +1039,16 @@ mod tests {
 
         // The pre-append layout must be untouched: 149 bytes through operator_count.
         assert_eq!(w_off, 8 + 32 + 1 + 8 + 1 + 1 + 1 + 96 + 1);
+
+        // `sgd_mint` is the LAST field, so it occupies the final 32 bytes. Asserting that
+        // pins it as an append: anything inserted above it shifts these bytes and fails here.
+        {
+            let mut c2 = blank_config();
+            c2.sgd_mint = Pubkey::new_from_array([0x5A; 32]);
+            let mut b2 = Vec::new();
+            c2.serialize(&mut b2).unwrap();
+            assert_eq!(&b2[b2.len() - 32..], &[0x5A; 32], "sgd_mint is not the final 32 bytes");
+        }
     }
 
     #[test]

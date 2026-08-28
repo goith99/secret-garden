@@ -15,7 +15,7 @@ cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build", "arcium-anchor/idl-build"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "arcium-anchor/idl-build"]
 anchor-debug = []
 custom-heap = []
 custom-panic = []
@@ -23,6 +23,9 @@ custom-panic = []
 
 [dependencies]
 anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
+# $SGD entry fee / pot: SPL Token transfer_checked + the associated-token program used to
+# create each round's pot vault in open_round.
+anchor-spl = { version = "1.0.2", features = ["token", "associated_token"] }
 # Required by `#[account(zero_copy)]` (Tier1State): the SAFE form derives bytemuck's
 # Pod/Zeroable, which additionally REFUSES TO COMPILE if the struct has any implicit
 # padding — that check is exactly what keeps the zero-copy layout honest.

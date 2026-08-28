@@ -37,6 +37,53 @@ export interface SendResult {
   meta: BanksTransactionResultWithMeta["meta"];
 }
 
+export const TOKEN_PROGRAM_ID = new PublicKey(
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+);
+export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+);
+
+/** Associated-token-account address for (owner, mint). */
+export function ataFor(
+  owner: anchor.web3.PublicKey,
+  mint: anchor.web3.PublicKey,
+): anchor.web3.PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+  )[0];
+}
+
+/** Raw 82-byte SPL mint, built by hand so the tests need no spl-token dependency. */
+function mintData(decimals: number, supply = 0n): Buffer {
+  const b = Buffer.alloc(82);
+  b.writeUInt32LE(0, 0); // mintAuthority: None
+  b.writeBigUInt64LE(supply, 36);
+  b.writeUInt8(decimals, 44);
+  b.writeUInt8(1, 45); // isInitialized
+  b.writeUInt32LE(0, 46); // freezeAuthority: None
+  return b;
+}
+
+/** Raw 165-byte SPL token account. */
+function tokenAccountData(
+  mint: anchor.web3.PublicKey,
+  owner: anchor.web3.PublicKey,
+  amount: bigint,
+): Buffer {
+  const b = Buffer.alloc(165);
+  mint.toBuffer().copy(b, 0);
+  owner.toBuffer().copy(b, 32);
+  b.writeBigUInt64LE(amount, 64);
+  b.writeUInt32LE(0, 72); // delegate: None
+  b.writeUInt8(1, 108); // state: Initialized
+  b.writeUInt32LE(0, 109); // isNative: None
+  b.writeBigUInt64LE(0n, 121); // delegatedAmount
+  b.writeUInt32LE(0, 129); // closeAuthority: None
+  return b;
+}
+
 export class Harness {
   readonly context: ProgramTestContext;
   readonly client: BanksClient;
@@ -54,7 +101,22 @@ export class Harness {
   }
 
   static async create(): Promise<Harness> {
-    const context = await startAnchor(".", [], []);
+    // SPL Token must actually be executable in the test validator: submit_entry now makes a
+    // real transfer_checked CPI, and distribute_pot signs one as a PDA. The .so is dumped from
+    // devnet into tests/fixtures so the tests exercise the genuine program, not a stub.
+    const context = await startAnchor(
+      ".",
+      [
+        { name: "spl_token", programId: TOKEN_PROGRAM_ID },
+        // open_round creates the round's pot vault as an ATA, so the associated-token
+        // program has to be executable here too, not just SPL Token.
+        {
+          name: "spl_associated_token_account",
+          programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+        },
+      ],
+      [],
+    );
     const client = context.banksClient;
 
     // Minimal connection shim: Anchor's account decoder needs a Node `Buffer`,
@@ -139,6 +201,60 @@ export class Harness {
   }
 
   /** Pin the on-chain clock to a fixed unix timestamp (keeps `created_at` stable). */
+  /** Seed an SPL mint at `mint` with the given decimals. */
+  setMint(mint: anchor.web3.PublicKey, decimals = 6): void {
+    this.context.setAccount(mint, {
+      lamports: 1_461_600,
+      data: mintData(decimals),
+      owner: TOKEN_PROGRAM_ID,
+      executable: false,
+    });
+  }
+
+  /** Seed a token account holding `amount` base units. Returns its address. */
+  setTokenAccount(
+    mint: anchor.web3.PublicKey,
+    owner: anchor.web3.PublicKey,
+    amount: bigint,
+    address?: anchor.web3.PublicKey,
+  ): anchor.web3.PublicKey {
+    const addr = address ?? ataFor(owner, mint);
+    this.context.setAccount(addr, {
+      lamports: 2_039_280,
+      data: tokenAccountData(mint, owner, amount),
+      owner: TOKEN_PROGRAM_ID,
+      executable: false,
+    });
+    return addr;
+  }
+
+  /** Balance of a token account, or null if it does not exist. */
+  async tokenBalance(addr: anchor.web3.PublicKey): Promise<bigint | null> {
+    const acc = await this.client.getAccount(addr);
+    if (!acc) return null;
+    return Buffer.from(acc.data).readBigUInt64LE(64);
+  }
+
+  /** The pot-vault authority PDA for a round. */
+  potAuthorityPda(roundId: number): anchor.web3.PublicKey {
+    const id = Buffer.alloc(8);
+    id.writeBigUInt64LE(BigInt(roundId));
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from("pot"), id],
+      this.program.programId,
+    )[0];
+  }
+
+  /** The PotDistribution marker PDA for a round. */
+  potDistPda(roundId: number): anchor.web3.PublicKey {
+    const id = Buffer.alloc(8);
+    id.writeBigUInt64LE(BigInt(roundId));
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from("pot_dist"), id],
+      this.program.programId,
+    )[0];
+  }
+
   async setFixedClock(unixTimestamp: number = FIXED_UNIX_TS): Promise<void> {
     const c = await this.client.getClock();
     this.context.setClock(

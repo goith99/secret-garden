@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_spl::token::{transfer_checked, Mint, Token, TokenAccount, TransferChecked};
 
 use crate::constants::*;
 use crate::error::SecretGardenError;
@@ -29,7 +30,7 @@ pub struct SubmitEntry<'info> {
         seeds = [PROFILE_SEED, player.key().as_ref()],
         bump = profile.bump,
     )]
-    pub profile: Account<'info, PlayerProfile>,
+    pub profile: Box<Account<'info, PlayerProfile>>,
 
     /// Target round. The seed check ties the passed account to its stored `round_id`.
     #[account(
@@ -37,11 +38,11 @@ pub struct SubmitEntry<'info> {
         seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
         bump = round.bump,
     )]
-    pub round: Account<'info, CompetitionRound>,
+    pub round: Box<Account<'info, CompetitionRound>>,
 
     /// Flower being submitted. Ownership and status are validated in the handler.
     #[account(mut)]
-    pub flower_record: Account<'info, FlowerRecord>,
+    pub flower_record: Box<Account<'info, FlowerRecord>>,
 
     #[account(
         init,
@@ -50,9 +51,49 @@ pub struct SubmitEntry<'info> {
         seeds = [ENTRY_SEED, round.key().as_ref(), player.key().as_ref()],
         bump,
     )]
-    pub entry: Account<'info, CompetitionEntry>,
+    pub entry: Box<Account<'info, CompetitionEntry>>,
 
     pub system_program: Program<'info, System>,
+
+    // --- $SGD entry fee (Phase 2) ---
+    //
+    // BOXED, and that is not cosmetic: with these four added, `SubmitEntry::try_accounts`
+    // needed a 5,760-byte stack frame against SBF's 4,096-byte limit. That does not fail
+    // cleanly — it corrupts the frame and the program dies with "Access violation in unknown
+    // section", which looks nothing like an account problem. Boxing moves the deserialized
+    // bodies to the heap and brings the frame back under the limit.--------------------------------------------------------
+    //
+    // Every account below is constrained against `config.sgd_mint` or a program-derived
+    // address. That is the point: the classic exploit here is passing a mint and vault the
+    // caller controls so the "fee" is paid to themselves. Nothing in this list is free-form.
+    /// The configured $SGD mint.
+    #[account(constraint = sgd_mint.key() == config.sgd_mint @ SecretGardenError::WrongSgdMint)]
+    pub sgd_mint: Box<Account<'info, Mint>>,
+
+    /// The player's own $SGD account, debited by the fee.
+    #[account(
+        mut,
+        constraint = player_sgd_ata.owner == player.key() @ SecretGardenError::WrongSgdMint,
+        constraint = player_sgd_ata.mint == config.sgd_mint @ SecretGardenError::WrongSgdMint,
+    )]
+    pub player_sgd_ata: Box<Account<'info, TokenAccount>>,
+
+    /// This round's pot — always pre-existing. `open_round` creates it, and a round account
+    /// cannot exist (so `round.status == OPEN` cannot hold) without `open_round` having run
+    /// and completed, so there is no path by which an entry reaches a missing vault. That is
+    /// why this is a plain reference and never `init_if_needed`: lazy creation would bill the
+    /// round's first entrant rent that nobody else pays.
+    ///
+    /// Its owner is checked in the handler against the round-derived PDA
+    /// (`find_program_address` there rather than an extra account here, to keep the account
+    /// list at the four the design called for).
+    #[account(
+        mut,
+        constraint = pot_vault.mint == config.sgd_mint @ SecretGardenError::WrongSgdMint,
+    )]
+    pub pot_vault: Box<Account<'info, TokenAccount>>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 pub(crate) fn handler(ctx: Context<SubmitEntry>) -> Result<()> {
@@ -80,6 +121,51 @@ pub(crate) fn handler(ctx: Context<SubmitEntry>) -> Result<()> {
             SecretGardenError::RoundFull
         );
     }
+
+    // --- entry fee -------------------------------------------------------------------------
+    //
+    // Placed AFTER every require! above. Anchor's `init` on `entry` runs before this handler,
+    // but a failure anywhere in the instruction reverts the whole transaction — account
+    // creation included — so a rejected entry can never leave the player charged. Doing the
+    // transfer last also means a doomed submission burns no CPI compute.
+    require_keys_neq!(
+        ctx.accounts.config.sgd_mint,
+        Pubkey::default(),
+        SecretGardenError::SgdMintNotSet
+    );
+
+    // The vault must be the one this round's PDA owns. Derived rather than passed so a caller
+    // cannot direct their fee into an account they control.
+    let (expected_pot_authority, _) = Pubkey::find_program_address(
+        &[POT_SEED, ctx.accounts.round.round_id.to_le_bytes().as_ref()],
+        ctx.program_id,
+    );
+    require_keys_eq!(
+        ctx.accounts.pot_vault.owner,
+        expected_pot_authority,
+        SecretGardenError::WrongSgdMint
+    );
+
+    // Checked explicitly so an underfunded player gets a named error instead of an opaque
+    // SPL Token 0x1 that no UI can explain.
+    require!(
+        ctx.accounts.player_sgd_ata.amount >= ENTRY_FEE_SGD,
+        SecretGardenError::InsufficientEntryFee
+    );
+
+    transfer_checked(
+        CpiContext::new(
+            ctx.accounts.token_program.key(),
+            TransferChecked {
+                from: ctx.accounts.player_sgd_ata.to_account_info(),
+                mint: ctx.accounts.sgd_mint.to_account_info(),
+                to: ctx.accounts.pot_vault.to_account_info(),
+                authority: ctx.accounts.player.to_account_info(),
+            },
+        ),
+        ENTRY_FEE_SGD,
+        ctx.accounts.sgd_mint.decimals,
+    )?;
 
     let round_key = ctx.accounts.round.key();
     let flower_key = ctx.accounts.flower_record.key();

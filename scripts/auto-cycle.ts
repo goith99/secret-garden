@@ -734,6 +734,40 @@ async function main(): Promise<void> {
     [Buffer.from("config")], program.programId)[0];
   const roundPda = (id: number) => PublicKey.findProgramAddressSync(
     [Buffer.from("round"), u64le(id)], program.programId)[0];
+
+// --- $SGD pot vault -------------------------------------------------------------------------
+// open_round now creates the round's pot vault itself, funded by the operator, so the round's
+// first entrant is not billed rent nobody else pays. `sgd_mint` is the one account Anchor
+// cannot derive (it has neither seeds nor a fixed address in the IDL), so it must be passed
+// explicitly — accountsPartial alone would fail at runtime.
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const potAuthorityPda = (roundId: number): PK =>
+  PublicKey.findProgramAddressSync([Buffer.from("pot"), u64le(roundId)], program.programId)[0];
+const ataFor = (owner: PK, mint: PK): PK =>
+  PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+  )[0];
+/** The five accounts open_round needs to create the next round's pot vault. */
+async function openRoundPotAccounts(nextRoundId: number) {
+  const cfg: any = await program.account.gameConfig.fetch(configPda);
+  const sgdMint: PK = cfg.sgdMint;
+  if (sgdMint.equals(PublicKey.default)) {
+    throw new Error(
+      "GameConfig.sgd_mint is unset — run `set_sgd_mint` before opening a round, or " +
+      "open_round will fail with SgdMintNotSet.",
+    );
+  }
+  const potAuthority = potAuthorityPda(nextRoundId);
+  return {
+    potAuthority,
+    potVault: ataFor(potAuthority, sgdMint),
+    sgdMint,
+    tokenProgram: TOKEN_PROGRAM_ID,
+    associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+  };
+}
   const entryPda = (round: PK, player: PK) => PublicKey.findProgramAddressSync(
     [Buffer.from("entry"), round.toBuffer(), player.toBuffer()], program.programId)[0];
 
@@ -1838,6 +1872,7 @@ async function main(): Promise<void> {
         config: configPda,
         previousRound: currentRound > 0 ? roundPda(currentRound) : null,
         round: roundPda(currentRound + 1),
+        ...(await openRoundPotAccounts(currentRound + 1)),
       }).transaction();
     await sendTxHttp(tx, `openRound(${currentRound + 1})`);
     const opened: any = await program.account.competitionRound.fetch(roundPda(currentRound + 1));

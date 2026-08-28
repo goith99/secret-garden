@@ -21,6 +21,7 @@ import * as anchor from "@anchor-lang/core";
 import BN from "bn.js";
 import { assert, expect } from "chai";
 import { Harness, FIXED_UNIX_TS } from "./harness.ts";
+import { openRoundAccounts, seedSgd, ixSetSgdMint } from "./sgd.ts";
 
 const { PublicKey, Keypair } = anchor.web3;
 type PK = anchor.web3.PublicKey;
@@ -83,6 +84,7 @@ const ixOpenRound = (h: Harness, authority: PK, currentRound: number) =>
       previousRound: currentRound > 0 ? h.roundPda(currentRound) : null,
       round: h.roundPda(currentRound + 1),
       systemProgram: h.systemProgram(),
+      ...openRoundAccounts(h, currentRound + 1),
     })
     .instruction();
 
@@ -116,6 +118,10 @@ async function bootstrapWithOpenRound(): Promise<{ h: Harness; authority: anchor
   const h = await Harness.create();
   const authority = h.payer;
   await h.send([await ixInitConfig(h, authority.publicKey)], [authority]);
+  // $SGD: open_round now creates the round's pot vault, so the mint must be pinned and the
+  // vault materialised before a round can be opened at all.
+  seedSgd(h, [authority.publicKey]);
+  await h.send([await ixSetSgdMint(h, authority.publicKey)], [authority]);
   await h.send([await ixCreateProfile(h, authority.publicKey)], [authority]);
   await h.send([await ixClaimStarters(h, authority.publicKey)], [authority]);
   const r = await h.send([await ixOpenRound(h, authority.publicKey, 0)], [authority]);

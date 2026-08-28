@@ -8,7 +8,8 @@
     "tests/late-callback.ts",
     "tests/private-hint.ts",
     "tests/mutation.ts",
-    "tests/bracket-generation.ts"
+    "tests/bracket-generation.ts",
+    "tests/pot.ts"
   ],
   "timeout": 1000000,
   "slow": 30000

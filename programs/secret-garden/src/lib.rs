@@ -79,6 +79,29 @@ pub mod secret_garden {
         instructions::set_mutant_weight::handler(ctx, new_weight, new_restore_ts)
     }
 
+    /// Pins the $SGD mint for this deployment. One-time, authority-only — see `set_sgd_mint`.
+    pub fn set_sgd_mint(ctx: Context<SetSgdMint>) -> Result<()> {
+        instructions::set_sgd_mint::handler(ctx)
+    }
+
+    /// Pays a finalized, revealed round's $SGD pot out, split equally between its winners.
+    /// Deliberately separate from `finalize_round` (which never checks `scoring_revealed`)
+    /// and replay-guarded by the `PotDistribution` marker's `init`.
+    ///
+    /// Winner ATAs arrive as remaining_accounts, paired with their entries in rank order:
+    /// `[entry_1, ata_1, entry_2, ata_2, ...]`.
+    pub fn distribute_pot<'info>(
+        ctx: Context<'info, DistributePot<'info>>,
+    ) -> Result<()> {
+        instructions::distribute_pot::handler(ctx)
+    }
+
+    /// Reclaims a distributed round's pot-vault rent.
+    pub fn close_pot_vault(ctx: Context<ClosePotVault>) -> Result<()> {
+        instructions::close_pot_vault::handler(ctx)
+    }
+
+
     // --- Multi-operator support (authority-only administration) ---
 
     /// Grows the singleton `GameConfig` to the multi-operator layout (appends `operators`

@@ -232,4 +232,31 @@ pub enum SecretGardenError {
     /// per-round budget). The flower remains usable for everything except breeding.
     #[msg("That flower has been used as a breeding parent the maximum number of times")]
     FlowerParentLimitReached,
+
+    // --- $SGD entry fee / pot (Phase 2) ---
+    /// The player's $SGD token account holds less than `ENTRY_FEE_SGD`. Checked explicitly
+    /// before the transfer CPI so the failure is legible on-chain instead of surfacing as an
+    /// opaque SPL Token 0x1.
+    #[msg("Not enough $SGD to cover the entry fee")]
+    InsufficientEntryFee,
+    /// `GameConfig::sgd_mint` is still `Pubkey::default()`; run `set_sgd_mint` first.
+    #[msg("The $SGD mint has not been configured yet")]
+    SgdMintNotSet,
+    /// `set_sgd_mint` is one-time: the mint is pinned once and never re-pointed, so a
+    /// compromised authority cannot redirect an in-flight pot to a worthless mint.
+    #[msg("The $SGD mint is already set and cannot be changed")]
+    SgdMintAlreadySet,
+    /// A passed mint/vault/token account does not match `GameConfig::sgd_mint`.
+    #[msg("Token account or mint does not match the configured $SGD mint")]
+    WrongSgdMint,
+    /// The round's winners have not been revealed, so `top1/2/3` cannot be trusted.
+    #[msg("Round winners have not been revealed yet")]
+    RoundNotRevealed,
+    /// The pot holds fewer base units than there are winners, so an equal split would pay
+    /// somebody zero.
+    #[msg("Pot is too small to split between the winners")]
+    PotTooSmall,
+    /// Arithmetic that must not silently wrap or truncate.
+    #[msg("Arithmetic overflow while computing the pot split")]
+    PotMathOverflow,
 }
