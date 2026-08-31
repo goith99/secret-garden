@@ -29,7 +29,7 @@ pub struct SetSgdMint<'info> {
 
     /// Typed as `Mint` so a non-mint account cannot be pinned by mistake — an unparseable
     /// mint here would brick every `submit_entry` until a redeploy, and there is no way back
-    /// because the setter is one-time.
+    /// because the setter is one-time. Its DECIMALS are checked in the handler.
     pub sgd_mint: Account<'info, Mint>,
 }
 
@@ -39,6 +39,16 @@ pub(crate) fn handler(ctx: Context<SetSgdMint>) -> Result<()> {
         Pubkey::default(),
         SecretGardenError::SgdMintAlreadySet
     );
+    // `ENTRY_FEE_SGD` is raw base units, so the decimals decide what a round actually costs.
+    // A mismatch here does not error anywhere downstream — `transfer_checked` is handed this
+    // mint's own decimals and stays perfectly consistent — it just quietly moves the entry fee
+    // by orders of magnitude. Fail loudly instead, while the setter is still one-time.
+    require_eq!(
+        ctx.accounts.sgd_mint.decimals,
+        SGD_DECIMALS,
+        SecretGardenError::WrongSgdDecimals
+    );
+
     ctx.accounts.config.sgd_mint = ctx.accounts.sgd_mint.key();
     Ok(())
 }

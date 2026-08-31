@@ -263,4 +263,62 @@ pub enum SecretGardenError {
     /// it out after the mint moves is impossible, so the change is refused until it is drained.
     #[msg("The current round's pot must be distributed before changing the $SGD mint")]
     PotNotDrained,
+    /// `refund_unrevealed_pot` was aimed at a round whose winners ARE revealed. Those rounds
+    /// belong to `distribute_pot` and only to `distribute_pot` — the refund path must never
+    /// become an alternative way to move a pot that has a legitimate owner.
+    #[msg("This round was revealed; its pot is paid by distribute_pot, not refunded")]
+    RoundAlreadyRevealed,
+    /// The round has not been unrevealed for long enough yet. Stops the authority from
+    /// sweeping a round that is merely slow to reveal.
+    #[msg("Too early to refund this pot; the unrevealed grace period has not elapsed")]
+    RefundTooEarly,
+    /// `RoundSettlement::state` is `POT_PAID`: this pot went to the round's winners.
+    #[msg("This round's pot was already distributed to its winners")]
+    PotAlreadyDistributed,
+    /// `RoundSettlement::state` is `POT_REFUNDED` or `POT_REFUND_PENDING`: this pot went back
+    /// to its entrants, or is in the middle of doing so. Blocks a late reveal from turning into
+    /// a second payout, including mid-refund.
+    #[msg("This round's pot was already refunded to its entrants")]
+    PotAlreadyRefunded,
+    /// A refund batch presented entries out of order, or re-presented one already paid.
+    /// Entries must arrive in strictly ascending pubkey order across the entire refund.
+    #[msg("Refund entries must be in strictly ascending pubkey order and not repeated")]
+    RefundOrderInvalid,
+    /// The batch holds more entries than the round has unpaid entrants.
+    #[msg("Refund batch covers more entrants than the round has left to pay")]
+    RefundBatchTooLong,
+    /// `close_pot_vault` was called against a refund that has not paid every entrant yet.
+    #[msg("Refund is still in progress; finish it before closing the vault")]
+    RefundIncomplete,
+    /// `RoundSettlement` is absent, belongs to another round, or is still in a non-terminal
+    /// state, so nothing proves this pot was settled.
+    #[msg("No settlement marker for this round; the pot has not been paid out or refunded")]
+    PotNotSettled,
+    /// A passed entry account belongs to a different round than the one being settled.
+    #[msg("Entry belongs to a different round")]
+    EntryWrongRound,
+    /// The treasury holds fewer lamports than the payout needs. Checked up front so the
+    /// failure names the problem instead of surfacing as a bare system-program error.
+    #[msg("Treasury does not hold enough SOL to pay this round's prizes")]
+    TreasuryUnderfunded,
+    /// A requested prize exceeds `SOL_PRIZE_MAX_LAMPORTS`. The ceiling exists so a mistyped or
+    /// malicious amount fails on-chain instead of emptying the treasury.
+    #[msg("Prize amount exceeds the per-winner ceiling")]
+    PrizeAmountTooLarge,
+    /// A winner account does not match the wallet that placed the winning entry.
+    #[msg("Payout destination does not match the winning entry's player")]
+    WrongWinnerAccount,
+    /// The mint being pinned does not have `SGD_DECIMALS` decimals. `ENTRY_FEE_SGD` is a raw
+    /// base-unit figure, so a mint with different decimals silently changes what a round costs.
+    #[msg("The $SGD mint must have exactly 6 decimals")]
+    WrongSgdDecimals,
+    /// `accept_authority_transfer` or `cancel_authority_transfer` ran with no proposal open.
+    #[msg("No authority transfer is pending")]
+    NoPendingAuthority,
+    /// `accept_authority_transfer` was signed by someone other than the proposed authority.
+    #[msg("Only the proposed authority can accept the transfer")]
+    NotPendingAuthority,
+    /// A proposal named the zero address (the "none" sentinel) or the current authority.
+    #[msg("Proposed authority must be a real address and not the current authority")]
+    InvalidAuthorityProposal,
 }

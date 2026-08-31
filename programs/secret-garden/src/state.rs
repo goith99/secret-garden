@@ -64,6 +64,20 @@ pub struct GameConfig {
     /// `set_sgd_mint` and never re-pointed, so a compromised authority cannot redirect a live
     /// pot at a mint it controls.
     pub sgd_mint: Pubkey,
+
+    // --- Authority handover (appended; existing field offsets unchanged so configs created
+    //     before this change stay deserializable — see `migrate_config`, whose `resize`
+    //     zero-fills this to `Pubkey::default()`, which is exactly the "nothing pending"
+    //     sentinel. Unlike `mutant_weight`, the zero value here IS the safe default, so the
+    //     migration needs no special-case write for it) ---
+    /// Address that has been PROPOSED as the next authority but has not accepted yet.
+    /// `Pubkey::default()` means no transfer is in flight.
+    ///
+    /// Holding the proposal here rather than swapping `authority` immediately is the whole
+    /// safety property: a handover only completes when the incoming address produces a
+    /// signature, so a mistyped or unowned address can never take control — it simply never
+    /// accepts, and the current authority keeps everything and can cancel.
+    pub pending_authority: Pubkey,
 }
 
 impl GameConfig {
@@ -722,22 +736,101 @@ impl Tier1State {
     }
 }
 
-/// Proof that a round's $SGD pot has been paid out. PDA seeds: `[b"pot_dist", round_id_le]`.
+/// THE single source of truth for what happened to a round's $SGD pot.
+/// PDA seeds: `[b"round_settlement", round_id_le]`.
 ///
-/// Existence IS the replay guard — `distribute_pot` creates this with `init`, so a second call
-/// fails on the account already being in use. See `POT_DIST_SEED` for why a balance check is
-/// not sufficient. The stored fields are for auditing; nothing reads them back.
+/// # What this replaces
+///
+/// Two account types — `PotDistribution` and `PotRefund` — whose EXISTENCE was the answer.
+/// "Was this pot settled?" meant "does either of these two accounts exist?", and keeping the
+/// two paths from both running meant each one probing for the other's account and remembering
+/// to refuse. Three concepts, two probes, no single place to read.
+///
+/// That is the same shape of defect as the SOL prizes, where paid-ness had to be reconstructed
+/// from transaction history rather than read. It worked here only because both probes happened
+/// to be written correctly; nothing about the design MADE them agree.
+///
+/// Now `state` is the answer, the transitions are the only way to change it, and PAID and
+/// REFUNDED are mutually exclusive because a single `u8` cannot hold both. Every path — start a
+/// refund, continue one, distribute, close the vault — reads and writes this one field.
+///
+/// # Why it also carries the refund's progress
+///
+/// A refund spans several transactions (an account list cannot hold `ROUND_CAPACITY` entries
+/// plus their token accounts), so something has to persist the cursor between them. Splitting
+/// that into its own account would put the refund's state back in two places, which is the
+/// thing being fixed. On a distributed round the refund fields simply stay zero.
 #[account]
 #[derive(InitSpace)]
-pub struct PotDistribution {
-    /// Round whose pot this records.
+pub struct RoundSettlement {
+    /// Round this settles. Non-zero once initialized — rounds are 1-indexed, so `0` is how a
+    /// freshly-created (zeroed) account is told apart from one that has been transitioned.
     pub round_id: u64,
-    /// Base units actually paid out (the vault balance at distribution time).
+    /// One of `SETTLEMENT_NONE` / `_POT_REFUND_PENDING` / `_POT_PAID` / `_POT_REFUNDED`.
+    pub state: u8,
+    /// Base units moved out of the vault to their rightful owners: winners for a paid round,
+    /// entrants for a refunded one. Excludes any surplus, which is nobody's by definition.
+    pub total_settled: u64,
+    /// Winners paid (1..=3) for a distribution, entrants refunded for a refund.
+    pub recipient_count: u16,
+    /// When the terminal state was reached; `0` while a refund is still in progress.
+    pub settled_at: i64,
+
+    // --- refund progress; all zero on a distributed round -----------------------------------
+    /// `round.participant_count` snapshotted when the refund began. Frozen, so a later batch
+    /// cannot be redirected by presenting a different round account.
+    pub entrant_count: u16,
+    /// Exactly what each entrant is owed back, fixed at the start. See `refund_unrevealed_pot`
+    /// for why this is a flat per-head figure and not a share of the vault.
+    pub per_entrant: u64,
+    /// Vault balance when the refund began, recorded for audit.
+    pub total_pot: u64,
+    /// Vault balance MINUS what the entrants are collectively owed: donations and any other
+    /// unclaimed surplus. Owed to no player, and swept by `close_pot_vault`.
+    pub surplus: u64,
+    /// Highest entry pubkey refunded so far. Entries arrive in strictly ascending pubkey order,
+    /// so this one value proves no entry is revisited without a bitmap that would grow this
+    /// account with round size.
+    pub cursor: Pubkey,
+    /// When the first refund batch ran.
+    pub started_at: i64,
+
+    /// PDA bump.
+    pub bump: u8,
+}
+
+impl RoundSettlement {
+    /// True once the pot has finished moving, either way. The ONLY question `close_pot_vault`
+    /// needs to ask, and the reason it no longer deserializes two different marker types.
+    pub fn is_terminal(&self) -> bool {
+        self.state == crate::constants::SETTLEMENT_POT_PAID
+            || self.state == crate::constants::SETTLEMENT_POT_REFUNDED
+    }
+}
+
+/// Proof that a round's SOL prizes have been paid. PDA seeds: `[b"prize_dist", round_id_le]`.
+///
+/// The direct twin of [`PotDistribution`], and the reason the SOL prize path moved on-chain at
+/// all. A `SystemProgram::transfer` from an off-chain treasury keypair leaves no trace in this
+/// program's account graph, so nothing could answer "was round N paid?" — the two tools that
+/// pay prizes each guessed, differently, and both guessed wrong in ways that cost real money.
+/// `init` on this account makes the answer a fact.
+#[account]
+#[derive(InitSpace)]
+pub struct PrizeDistribution {
+    /// Round whose prizes this records.
+    pub round_id: u64,
+    /// Lamports actually transferred, summed across winners.
     pub total_paid: u64,
-    /// How many winners it was split between (1..=3).
+    /// The largest single payout in this round, for audit. Per-winner amounts vary with the
+    /// rarity multiplier applied off-chain, so a single "per winner" figure would be a lie.
+    pub largest_paid: u64,
+    /// The wallet that funded the payout, for audit.
+    pub treasury: Pubkey,
+    /// How many winners were paid (1..=3).
     pub winner_count: u8,
     /// When the payout landed.
-    pub distributed_at: i64,
+    pub paid_at: i64,
     /// PDA bump.
     pub bump: u8,
 }
@@ -994,6 +1087,7 @@ mod tests {
             mutant_weight: crate::constants::MUTANT_WEIGHT_UNIFORM,
             restore_ts: 0,
             sgd_mint: Pubkey::default(),
+            pending_authority: Pubkey::default(),
         }
     }
 
@@ -1019,14 +1113,37 @@ mod tests {
             8 + GameConfig::INIT_SPACE,
             "serialized GameConfig is not INIT_SPACE bytes"
         );
-        // 158 before the $SGD work; +32 for the appended `sgd_mint` Pubkey. Growing this is
-        // an ACCOUNT LAYOUT CHANGE: every existing config fails to deserialize until
-        // `migrate_config` runs, so this number moving must always be a deliberate act.
+        // 158 before the $SGD work; +32 for `sgd_mint`; +32 again for `pending_authority`.
+        // Growing this is an ACCOUNT LAYOUT CHANGE: every existing config fails to deserialize
+        // (0xbbb) until `migrate_config` runs, and 19 instruction contexts take a typed
+        // `Account<GameConfig>`, so the whole game is down for the interval between the upgrade
+        // and the migration. This number moving must always be a deliberate act.
         assert_eq!(
             body.len() + DISC,
-            190,
-            "GameConfig account should be 190 bytes"
+            222,
+            "GameConfig account should be 222 bytes"
         );
+
+        // `pending_authority` is the LAST field, so it occupies the final 32 bytes, and
+        // `sgd_mint` the 32 before it. Asserting both pins them as appends: anything inserted
+        // above either shifts these bytes and fails here.
+        {
+            let mut c2 = blank_config();
+            c2.sgd_mint = Pubkey::new_from_array([0x5A; 32]);
+            c2.pending_authority = Pubkey::new_from_array([0x6B; 32]);
+            let mut b2 = Vec::new();
+            c2.serialize(&mut b2).unwrap();
+            assert_eq!(
+                &b2[b2.len() - 32..],
+                &[0x6B; 32],
+                "pending_authority is not the final 32 bytes"
+            );
+            assert_eq!(
+                &b2[b2.len() - 64..b2.len() - 32],
+                &[0x5A; 32],
+                "sgd_mint is not the 32 bytes before pending_authority"
+            );
+        }
 
         let w_off = crate::constants::GAME_CONFIG_MUTANT_WEIGHT_OFFSET;
         assert_eq!(w_off, 149, "mutant_weight offset drifted");
@@ -1039,16 +1156,6 @@ mod tests {
 
         // The pre-append layout must be untouched: 149 bytes through operator_count.
         assert_eq!(w_off, 8 + 32 + 1 + 8 + 1 + 1 + 1 + 96 + 1);
-
-        // `sgd_mint` is the LAST field, so it occupies the final 32 bytes. Asserting that
-        // pins it as an append: anything inserted above it shifts these bytes and fails here.
-        {
-            let mut c2 = blank_config();
-            c2.sgd_mint = Pubkey::new_from_array([0x5A; 32]);
-            let mut b2 = Vec::new();
-            c2.serialize(&mut b2).unwrap();
-            assert_eq!(&b2[b2.len() - 32..], &[0x5A; 32], "sgd_mint is not the final 32 bytes");
-        }
     }
 
     #[test]

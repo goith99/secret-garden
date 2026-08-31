@@ -5,8 +5,9 @@
  * treasury, this comes from the round's own entry fees. Both must run for a round to be fully
  * settled, and the pot must be drained before `update_sgd_mint` will let the mint move.
  *
- * Replay is guarded on chain by the PotDistribution marker's `init`, so a second run fails
- * rather than double-paying — no heuristic needed here, unlike the SOL side.
+ * Replay is guarded on chain by RoundSettlement's state — the single record of what happened to
+ * a pot — so a second run fails rather than double-paying, and so does a run against a pot that
+ * was refunded to its entrants instead. No heuristic needed here, unlike the SOL side.
  *
  *   set -a; source .env; set +a
  *   node scripts/distribute-pot.mjs ROUND=69            # dry run
@@ -35,14 +36,20 @@ const cfg = await program.account.gameConfig.fetch(configPda);
 const [roundPda] = PublicKey.findProgramAddressSync([Buffer.from("round"), u64(ROUND)], program.programId);
 const r = await program.account.competitionRound.fetch(roundPda);
 const [potAuthority] = PublicKey.findProgramAddressSync([Buffer.from("pot"), u64(ROUND)], program.programId);
-const [potDistribution] = PublicKey.findProgramAddressSync([Buffer.from("pot_dist"), u64(ROUND)], program.programId);
+// ONE account answers what happened to this pot: paid, refunded, mid-refund, or nothing yet.
+const [settlement] = PublicKey.findProgramAddressSync([Buffer.from("round_settlement"), u64(ROUND)], program.programId);
+const SETTLEMENT_NAME = ["none", "refund in progress", "PAID to winners", "REFUNDED to entrants"];
 const potVault = ataFor(potAuthority, cfg.sgdMint);
 
 console.log(`program : ${program.programId.toBase58()}`);
 console.log(`round   : ${ROUND}  status ${r.status}  revealed ${r.scoringRevealed}`);
 const bal = await conn.getTokenAccountBalance(potVault).catch(() => null);
 console.log(`pot     : ${bal ? bal.value.uiAmountString : "no vault"} SGD  (${potVault.toBase58()})`);
-if (await conn.getAccountInfo(potDistribution)) { console.log("ALREADY DISTRIBUTED (marker exists) — nothing to do."); process.exit(0); }
+const st = await program.account.roundSettlement.fetchNullable(settlement);
+if (st && st.state !== 0) {
+  console.log(`settlement: ${SETTLEMENT_NAME[st.state] ?? st.state} — nothing to do.`);
+  process.exit(0);
+}
 if (!bal || bal.value.amount === "0") { console.log("pot is empty — nothing to distribute."); process.exit(0); }
 
 // Winners in rank order; remaining accounts are [entry, winnerAta] pairs.
@@ -81,7 +88,7 @@ for (const p of pairs) {
 
 const tx = await program.methods.distributePot().accountsStrict({
   authority: authority.publicKey, config: configPda, round: roundPda,
-  potDistribution, potAuthority, potVault, sgdMint: cfg.sgdMint,
+  settlement, potAuthority, potVault, sgdMint: cfg.sgdMint,
   tokenProgram: TOK, systemProgram: SystemProgram.programId,
 }).remainingAccounts(pairs.flatMap((p) => ([
   { pubkey: p.entry, isSigner: false, isWritable: false },

@@ -1,9 +1,9 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Mint, TokenAccount};
+use anchor_spl::token::Mint;
 
 use crate::constants::*;
 use crate::error::SecretGardenError;
-use crate::state::{CompetitionRound, GameConfig};
+use crate::state::{CompetitionRound, GameConfig, RoundSettlement};
 
 /// Re-points `GameConfig.sgd_mint` at a different mint. Authority-only.
 ///
@@ -21,15 +21,35 @@ use crate::state::{CompetitionRound, GameConfig};
 /// cannot be reclaimed. The tokens are not lost in the sense of being burned — they sit in an
 /// account nothing is authorised to touch, which is worse, because it looks recoverable.
 ///
-/// So this refuses unless BOTH hold:
-///   1. the current round is FINALIZED — no round is mid-flight;
-///   2. that round's pot vault, under the OUTGOING mint, is EMPTY — whatever was collected has
-///      already been distributed (or none ever was).
+/// So this refuses unless the current round is FINALIZED and its pot has actually been SETTLED
+/// — paid to winners or refunded to entrants — proven by `RoundSettlement` reaching a terminal
+/// state. Together those mean nothing denominated in the outgoing mint is still owed.
 ///
-/// Together those mean nothing denominated in the outgoing mint is still owed by the program.
-/// Older rounds' vaults are not checked here and cannot be: there is no bounded way to
-/// enumerate them on chain. Settle any outstanding pot with `distribute_pot` BEFORE calling
-/// this — after it, that pot is unreachable.
+/// # Why settlement and not "the vault is empty"
+///
+/// The old guard read `old_pot_vault.amount == 0`, and a balance is the wrong kind of evidence
+/// twice over.
+///
+/// It was FORGEABLE. Only the vault's owner and mint were checked, and anyone can create a
+/// non-ATA token account owned by any PDA — so an empty lookalike passed the drained test while
+/// the real pot sat full, and the mint moved out from under it. The guard existed precisely to
+/// stop that outcome and could be walked straight past.
+///
+/// It was also GRIEFABLE, in the opposite direction. A balance can be raised by anyone: SPL
+/// lets any wallet transfer into any token account. One base unit donated into a settled
+/// round's vault made `amount == 0` false forever — the pot could not be distributed again (the
+/// marker already existed), so nothing could empty it, so the mint could never move. A
+/// permissionless, permanent block on a migration path, for the price of dust.
+///
+/// A settlement marker has neither property. It cannot be created except by the instruction
+/// that actually moved the money, it cannot be raised or lowered by a third party, and no
+/// donation changes it. The vault account is not passed at all any more: with the marker there
+/// is nothing left for it to prove, and an account carried along without a job invites the
+/// reader to assume a guarantee it is not providing.
+///
+/// Older rounds' vaults are still not checked and still cannot be — there is no bounded way to
+/// enumerate them on chain. Settle any outstanding pot BEFORE calling this; after it, that pot
+/// is unreachable. Sweep the surplus with `close_pot_vault` first too, for the same reason.
 #[derive(Accounts)]
 pub struct UpdateSgdMint<'info> {
     /// Must equal `config.authority`.
@@ -51,11 +71,13 @@ pub struct UpdateSgdMint<'info> {
     )]
     pub round: Account<'info, CompetitionRound>,
 
-    /// That round's pot vault under the OUTGOING mint. Its owner is checked in the handler
-    /// against the round-derived pot authority, so an unrelated empty token account cannot be
-    /// substituted to pass the drained check.
-    #[account(constraint = old_pot_vault.mint == config.sgd_mint @ SecretGardenError::WrongSgdMint)]
-    pub old_pot_vault: Account<'info, TokenAccount>,
+    /// CHECK: the current round's settlement record. Read raw rather than typed because it is
+    /// legitimately ABSENT for a round nobody entered — such a round collects no fees, so
+    /// nothing ever creates a settlement for it, and demanding one would block the migration
+    /// forever behind a pot that never existed. The handler deserializes it when a round has
+    /// entrants and skips it when `participant_count == 0`.
+    #[account(seeds = [ROUND_SETTLEMENT_SEED, round.round_id.to_le_bytes().as_ref()], bump)]
+    pub settlement: UncheckedAccount<'info>,
 
     /// The incoming mint. Typed so an unparseable account cannot be pinned.
     pub new_sgd_mint: Account<'info, Mint>,
@@ -67,19 +89,30 @@ pub(crate) fn handler(ctx: Context<UpdateSgdMint>) -> Result<()> {
         SecretGardenError::RoundNotFinalized
     );
 
-    // The vault must be THIS round's, not any empty account that happens to hold the old mint.
-    let (expected_authority, _) = Pubkey::find_program_address(
-        &[POT_SEED, ctx.accounts.round.round_id.to_le_bytes().as_ref()],
-        ctx.program_id,
-    );
-    require_keys_eq!(
-        ctx.accounts.old_pot_vault.owner,
-        expected_authority,
-        SecretGardenError::WrongSgdMint
-    );
-    require!(
-        ctx.accounts.old_pot_vault.amount == 0,
-        SecretGardenError::PotNotDrained
+    // Settled, or never had anything to settle. Both are unforgeable: a terminal settlement can
+    // only be reached by the instruction that moved the money, and `participant_count` is
+    // written by `submit_entry` and never by a caller.
+    if ctx.accounts.round.participant_count > 0 {
+        require!(
+            !ctx.accounts.settlement.data_is_empty(),
+            SecretGardenError::PotNotDrained
+        );
+        let data = ctx.accounts.settlement.try_borrow_data()?;
+        let m = RoundSettlement::try_deserialize(&mut &data[..])?;
+        require_eq!(
+            m.round_id,
+            ctx.accounts.round.round_id,
+            SecretGardenError::PotNotDrained
+        );
+        require!(m.is_terminal(), SecretGardenError::PotNotDrained);
+    }
+
+    // Same reasoning as `set_sgd_mint`: the fee is a base-unit constant, so the decimals ARE
+    // its value. Checked here too because this is the only other way the mint moves.
+    require_eq!(
+        ctx.accounts.new_sgd_mint.decimals,
+        SGD_DECIMALS,
+        SecretGardenError::WrongSgdDecimals
     );
 
     // A no-op re-pin is a caller mistake worth naming rather than silently accepting.

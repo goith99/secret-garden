@@ -46,12 +46,19 @@ pub struct ReleaseFlower<'info> {
     pub owner: Signer<'info>,
 
     /// Pause kill-switch: releasing is a player-facing action, blocked while paused.
+    ///
+    /// BOXED, and not cosmetically. `ReleaseFlower::try_accounts` sat 8 bytes over SBF's
+    /// 4,096-byte frame limit as a build WARNING for a long time; appending
+    /// `pending_authority` to `GameConfig` turned that warning into a runtime "Program failed
+    /// to complete" on every release. Boxing the three big deserialized bodies moves them to
+    /// the heap and brings the frame back well under. Same fix, and same reason, as the
+    /// comment in `SubmitEntry`.
     #[account(
         seeds = [CONFIG_SEED],
         bump = config.bump,
         constraint = !config.paused @ SecretGardenError::GamePaused,
     )]
-    pub config: Account<'info, GameConfig>,
+    pub config: Box<Account<'info, GameConfig>>,
 
     /// The round the flower competed in. Must be fully Finalized — see the gate note above.
     #[account(
@@ -60,7 +67,7 @@ pub struct ReleaseFlower<'info> {
         constraint = round.status == ROUND_STATUS_FINALIZED
             @ SecretGardenError::RoundNotFinalized,
     )]
-    pub round: Account<'info, CompetitionRound>,
+    pub round: Box<Account<'info, CompetitionRound>>,
 
     /// The caller's entry in that round. KEPT (never closed) — it is the round's permanent
     /// record, and `round.top1/2/3` name entry pubkeys — but its `status` is flipped to
@@ -75,7 +82,7 @@ pub struct ReleaseFlower<'info> {
         constraint = entry.status == ENTRY_STATUS_SUBMITTED
             @ SecretGardenError::EntryAlreadyReleased,
     )]
-    pub entry: Account<'info, CompetitionEntry>,
+    pub entry: Box<Account<'info, CompetitionEntry>>,
 
     /// The flower to release. No `seeds` needed: Anchor proves it is a program-owned
     /// `FlowerRecord`, the `owner` constraint proves it belongs to the signer, and the
@@ -88,7 +95,7 @@ pub struct ReleaseFlower<'info> {
         constraint = flower.genome_status == GENOME_STATUS_ENCRYPTED
             @ SecretGardenError::StarterNotDeletable,
     )]
-    pub flower: Account<'info, FlowerRecord>,
+    pub flower: Box<Account<'info, FlowerRecord>>,
 }
 
 pub(crate) fn handler(ctx: Context<ReleaseFlower>) -> Result<()> {

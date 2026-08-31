@@ -28,15 +28,31 @@ const [potAuthority] = PublicKey.findProgramAddressSync([Buffer.from("pot"), u64
 const [oldPotVault] = PublicKey.findProgramAddressSync(
   [potAuthority.toBuffer(), TOK.toBuffer(), cfg.sgdMint.toBuffer()], ATOK);
 const bal = await conn.getTokenAccountBalance(oldPotVault).catch(() => null);
+// The guard is the settlement marker, not the balance — a balance is both forgeable (an empty
+// lookalike used to pass) and griefable (a dust donation used to block this forever). The vault
+// is still READ here, because a non-zero balance means unswept surplus that becomes unreachable
+// the moment the mint moves.
+const [settlement] = PublicKey.findProgramAddressSync(
+  [Buffer.from("round_settlement"), u64(rid)], program.programId);
+const st = await program.account.roundSettlement.fetchNullable(settlement);
+const SETTLED = ["none", "refund in progress", "PAID to winners", "REFUNDED to entrants"];
 console.log(`program : ${program.programId.toBase58()}`);
 console.log(`old mint: ${cfg.sgdMint.toBase58()}`);
 console.log(`new mint: ${NEW.toBase58()}`);
 console.log(`round   : ${rid}  status ${r.status} (2 = FINALIZED required)`);
-console.log(`old pot : ${bal ? bal.value.uiAmountString : "n/a"} SGD (must be 0)`);
+console.log(`settled : ${st ? (SETTLED[st.state] ?? st.state) : "none"}` +
+  `${r.participantCount === 0 ? "  (round had no entrants — nothing to settle)" : ""}`);
+console.log(`old pot : ${bal ? bal.value.uiAmountString : "n/a"} SGD`);
+if (bal && bal.value.amount !== "0") {
+  console.log(`\n  WARNING: the old vault still holds ${bal.value.uiAmountString} SGD.`);
+  console.log(`  This no longer blocks the change — it is unclaimed surplus, not owed to any`);
+  console.log(`  player — but every path to it is pinned to config.sgd_mint, so it becomes`);
+  console.log(`  UNREACHABLE once the mint moves. Run close_pot_vault first to sweep it.`);
+}
 if (!EXECUTE) { console.log("\n[dry run — nothing sent]"); process.exit(0); }
 const tx = await program.methods.updateSgdMint().accountsStrict({
   authority: authority.publicKey, config: configPda, round: roundPda,
-  oldPotVault, newSgdMint: NEW,
+  settlement, newSgdMint: NEW,
 }).transaction();
 const bh = await conn.getLatestBlockhash("confirmed");
 tx.recentBlockhash = bh.blockhash; tx.feePayer = authority.publicKey; tx.sign(authority);

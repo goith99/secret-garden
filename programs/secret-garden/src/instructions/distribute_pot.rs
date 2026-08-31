@@ -4,7 +4,7 @@ use anchor_spl::token::{transfer_checked, Mint, Token, TokenAccount, TransferChe
 use crate::constants::*;
 use crate::error::SecretGardenError;
 use crate::state::{
-    is_operator_or_authority, CompetitionEntry, CompetitionRound, GameConfig, PotDistribution,
+    is_operator_or_authority, CompetitionEntry, CompetitionRound, GameConfig, RoundSettlement,
 };
 
 /// Pays a finalized round's $SGD pot out, split equally between its revealed winners.
@@ -37,17 +37,24 @@ pub struct DistributePot<'info> {
     )]
     pub round: Account<'info, CompetitionRound>,
 
-    /// THE REPLAY GUARD. `init` fails if this already exists, so a second `distribute_pot` for
-    /// the same round cannot land. A vault-balance check would NOT be sufficient: anyone can
-    /// transfer $SGD into a distributed vault and re-arm the payout.
+    /// THE settlement state — replay guard and mutual exclusion in one account.
+    ///
+    /// This used to be two: a `PotDistribution` whose `init` collided on a second call, plus an
+    /// `UncheckedAccount` pointed at the refund marker purely to prove it did not exist. Both
+    /// questions are now one read of `state`, and the answer cannot disagree with itself.
+    ///
+    /// `init_if_needed` rather than `init` because the refund path may have created this
+    /// account first; the replay guard is the explicit state check in the handler, which is
+    /// strictly more informative than a collision — a caller learns whether the pot was paid,
+    /// refunded, or is mid-refund, rather than "account already in use".
     #[account(
-        init,
+        init_if_needed,
         payer = authority,
-        space = 8 + PotDistribution::INIT_SPACE,
-        seeds = [POT_DIST_SEED, round.round_id.to_le_bytes().as_ref()],
+        space = 8 + RoundSettlement::INIT_SPACE,
+        seeds = [ROUND_SETTLEMENT_SEED, round.round_id.to_le_bytes().as_ref()],
         bump,
     )]
-    pub pot_distribution: Account<'info, PotDistribution>,
+    pub settlement: Account<'info, RoundSettlement>,
 
     /// CHECK: the pot vault's authority. Derived here from the round id, so it is a PDA and
     /// nothing else — no keypair for it exists, and the program signing with these seeds is the
@@ -55,12 +62,22 @@ pub struct DistributePot<'info> {
     #[account(seeds = [POT_SEED, round.round_id.to_le_bytes().as_ref()], bump)]
     pub pot_authority: UncheckedAccount<'info>,
 
-    /// The round's pot. Both its mint and its owner are constrained, so a caller cannot
-    /// substitute a vault they control or one holding a different token.
+    /// The round's pot, PINNED TO THE ASSOCIATED TOKEN ACCOUNT.
+    ///
+    /// Owner-and-mint used to be the whole check, and it was not enough. Anyone can create a
+    /// NON-ATA token account owned by any PDA, so a second account satisfying both conditions
+    /// can always be made to exist. Passing an empty one here sent the handler down the
+    /// `pot == 0` branch: it wrote a permanent settlement marker recording the round as paid
+    /// while the real vault sat untouched and, because the marker can never be written twice,
+    /// unpayable forever. One wrong account in one operator transaction, irreversible.
+    ///
+    /// `associated_token::` narrows the set of accounts that can satisfy this to exactly one —
+    /// the vault `open_round` created — because an ATA's address is a pure function of its
+    /// owner and mint. There is no second candidate to substitute.
     #[account(
         mut,
-        constraint = pot_vault.mint == config.sgd_mint @ SecretGardenError::WrongSgdMint,
-        constraint = pot_vault.owner == pot_authority.key() @ SecretGardenError::WrongSgdMint,
+        associated_token::mint = sgd_mint,
+        associated_token::authority = pot_authority,
     )]
     pub pot_vault: Account<'info, TokenAccount>,
 
@@ -84,6 +101,31 @@ pub(crate) fn handler<'info>(
         Pubkey::default(),
         SecretGardenError::SgdMintNotSet
     );
+
+    // One read covers every way this pot could already be spoken for: paid to winners, handed
+    // back to entrants, or a refund that has started and not finished. The last case is the one
+    // the old pairwise probe could not express — a partially built refund marker did not yet
+    // mean the pot was gone, so a late reveal could have raced it.
+    let fresh = ctx.accounts.settlement.round_id == 0;
+    if fresh {
+        ctx.accounts.settlement.round_id = ctx.accounts.round.round_id;
+        ctx.accounts.settlement.bump = ctx.bumps.settlement;
+        ctx.accounts.settlement.state = SETTLEMENT_NONE;
+    } else {
+        require_eq!(
+            ctx.accounts.settlement.round_id,
+            ctx.accounts.round.round_id,
+            SecretGardenError::EntryWrongRound
+        );
+    }
+    match ctx.accounts.settlement.state {
+        SETTLEMENT_NONE => {}
+        SETTLEMENT_POT_PAID => return Err(SecretGardenError::PotAlreadyDistributed.into()),
+        SETTLEMENT_POT_REFUNDED | SETTLEMENT_POT_REFUND_PENDING => {
+            return Err(SecretGardenError::PotAlreadyRefunded.into())
+        }
+        _ => return Err(SecretGardenError::PotNotSettled.into()),
+    }
 
     let round = &ctx.accounts.round;
     require!(
@@ -114,13 +156,10 @@ pub(crate) fn handler<'info>(
     // untouched. The marker is still written, so this round is closed out either way.
     if k == 0 || pot == 0 {
         let now = Clock::get()?.unix_timestamp;
-        ctx.accounts.pot_distribution.set_inner(PotDistribution {
-            round_id: round.round_id,
-            total_paid: 0,
-            winner_count: 0,
-            distributed_at: now,
-            bump: ctx.bumps.pot_distribution,
-        });
+        ctx.accounts.settlement.state = SETTLEMENT_POT_PAID;
+        ctx.accounts.settlement.total_settled = 0;
+        ctx.accounts.settlement.recipient_count = 0;
+        ctx.accounts.settlement.settled_at = now;
         return Ok(());
     }
 
@@ -192,12 +231,9 @@ pub(crate) fn handler<'info>(
     require!(total_paid == pot, SecretGardenError::PotMathOverflow);
 
     let now = Clock::get()?.unix_timestamp;
-    ctx.accounts.pot_distribution.set_inner(PotDistribution {
-        round_id: round.round_id,
-        total_paid,
-        winner_count: k as u8,
-        distributed_at: now,
-        bump: ctx.bumps.pot_distribution,
-    });
+    ctx.accounts.settlement.state = SETTLEMENT_POT_PAID;
+    ctx.accounts.settlement.total_settled = total_paid;
+    ctx.accounts.settlement.recipient_count = k as u16;
+    ctx.accounts.settlement.settled_at = now;
     Ok(())
 }

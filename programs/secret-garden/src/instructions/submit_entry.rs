@@ -1,4 +1,5 @@
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::get_associated_token_address;
 use anchor_spl::token::{transfer_checked, Mint, Token, TokenAccount, TransferChecked};
 
 use crate::constants::*;
@@ -84,9 +85,18 @@ pub struct SubmitEntry<'info> {
     /// why this is a plain reference and never `init_if_needed`: lazy creation would bill the
     /// round's first entrant rent that nobody else pays.
     ///
-    /// Its owner is checked in the handler against the round-derived PDA
-    /// (`find_program_address` there rather than an extra account here, to keep the account
-    /// list at the four the design called for).
+    /// PINNED TO THE ASSOCIATED TOKEN ADDRESS in the handler, which is the same guarantee the
+    /// `associated_token::` constraint gives the other pot instructions, reached differently.
+    ///
+    /// The constraint form needs a `pot_authority` account in this struct to point at, and
+    /// adding one would change the account list of the single instruction every player sends —
+    /// breaking every client build in flight for no security gain, since an ATA's address is a
+    /// pure function of (authority, mint) and the handler already derives the authority. The
+    /// check there is `require_keys_eq!(pot_vault.key(), get_associated_token_address(..))`,
+    /// which is exactly what the constraint expands to.
+    ///
+    /// This account also stays `Box`ed for the stack-frame reason above; a fifth account here
+    /// is precisely what that comment is about.
     #[account(
         mut,
         constraint = pot_vault.mint == config.sgd_mint @ SecretGardenError::WrongSgdMint,
@@ -134,15 +144,20 @@ pub(crate) fn handler(ctx: Context<SubmitEntry>) -> Result<()> {
         SecretGardenError::SgdMintNotSet
     );
 
-    // The vault must be the one this round's PDA owns. Derived rather than passed so a caller
-    // cannot direct their fee into an account they control.
+    // The vault must be THE round's vault — not merely one its PDA happens to own.
+    //
+    // Owning-PDA-plus-right-mint was the old test, and anyone can create a non-ATA token account
+    // owned by any PDA, so a player could point their fee at a lookalike. That burned their own
+    // 100 SGD rather than stealing anyone's, but it broke the invariant the pot depends on:
+    // vault balance == participant_count * ENTRY_FEE_SGD. Deriving the ATA address leaves
+    // exactly one account that can satisfy this.
     let (expected_pot_authority, _) = Pubkey::find_program_address(
         &[POT_SEED, ctx.accounts.round.round_id.to_le_bytes().as_ref()],
         ctx.program_id,
     );
     require_keys_eq!(
-        ctx.accounts.pot_vault.owner,
-        expected_pot_authority,
+        ctx.accounts.pot_vault.key(),
+        get_associated_token_address(&expected_pot_authority, &ctx.accounts.config.sgd_mint),
         SecretGardenError::WrongSgdMint
     );
 

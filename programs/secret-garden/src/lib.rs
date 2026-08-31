@@ -79,6 +79,26 @@ pub mod secret_garden {
         instructions::set_mutant_weight::handler(ctx, new_weight, new_restore_ts)
     }
 
+    /// Nominates the next `GameConfig.authority`. Current authority only. Changes nothing by
+    /// itself — the nominee must sign `accept_authority_transfer` before any power moves, which
+    /// is what makes a mistyped address harmless rather than fatal.
+    pub fn propose_authority_transfer(
+        ctx: Context<ProposeAuthorityTransfer>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        instructions::transfer_authority::propose_handler(ctx, new_authority)
+    }
+
+    /// Completes a proposed handover. Signed by the PROPOSED authority, not the current one.
+    pub fn accept_authority_transfer(ctx: Context<AcceptAuthorityTransfer>) -> Result<()> {
+        instructions::transfer_authority::accept_handler(ctx)
+    }
+
+    /// Withdraws a pending proposal. Current authority only.
+    pub fn cancel_authority_transfer(ctx: Context<CancelAuthorityTransfer>) -> Result<()> {
+        instructions::transfer_authority::cancel_handler(ctx)
+    }
+
     /// Pins the $SGD mint for this deployment. One-time, authority-only — see `set_sgd_mint`.
     pub fn set_sgd_mint(ctx: Context<SetSgdMint>) -> Result<()> {
         instructions::set_sgd_mint::handler(ctx)
@@ -86,7 +106,8 @@ pub mod secret_garden {
 
     /// Pays a finalized, revealed round's $SGD pot out, split equally between its winners.
     /// Deliberately separate from `finalize_round` (which never checks `scoring_revealed`)
-    /// and replay-guarded by the `PotDistribution` marker's `init`.
+    /// and replay-guarded by `RoundSettlement::state`, the single source of truth for whether
+    /// a pot has been paid, refunded, or neither.
     ///
     /// Winner ATAs arrive as remaining_accounts, paired with their entries in rank order:
     /// `[entry_1, ata_1, entry_2, ata_2, ...]`.
@@ -96,7 +117,37 @@ pub mod secret_garden {
         instructions::distribute_pot::handler(ctx)
     }
 
-    /// Reclaims a distributed round's pot-vault rent.
+    /// Hands an UNREVEALED finalized round's pot back to the players who funded it, in
+    /// batches, guarded by `RoundSettlement::state`. Authority-only, and only once the round has
+    /// been unrevealed for `POT_REFUND_MIN_AGE_SECONDS`.
+    ///
+    /// This is the escape hatch for a round the game failed to score: `distribute_pot` cannot
+    /// touch it (no reveal), so without this its entry fees are unrecoverable. Entries arrive
+    /// as remaining_accounts paired with their owners' token accounts, in strictly ascending
+    /// entry-pubkey order: `[entry_1, ata_1, entry_2, ata_2, ...]`.
+    pub fn refund_unrevealed_pot<'info>(
+        ctx: Context<'info, RefundUnrevealedPot<'info>>,
+    ) -> Result<()> {
+        instructions::refund_unrevealed_pot::handler(ctx)
+    }
+
+    /// Pays a finalized, revealed round's SOL prizes from the treasury and records the payout
+    /// with a `PrizeDistribution` marker, whose `init` is the replay guard.
+    ///
+    /// Replaces two off-chain "was this already paid?" heuristics with an on-chain fact. The
+    /// transfers and the marker are one atomic event. Winners arrive as remaining_accounts
+    /// paired with their entries in rank order: `[entry_1, wallet_1, entry_2, wallet_2, ...]`.
+    /// `amounts` is one lamport figure per winner, in the same rank order, each bounded by
+    /// `SOL_PRIZE_MAX_LAMPORTS` — the rarity multiplier that decides them lives off-chain.
+    pub fn pay_sol_prizes<'info>(
+        ctx: Context<'info, PaySolPrizes<'info>>,
+        amounts: Vec<u64>,
+    ) -> Result<()> {
+        instructions::pay_sol_prizes::handler(ctx, amounts)
+    }
+
+    /// Reclaims a settled round's pot-vault rent — settled meaning distributed to winners OR
+    /// refunded to entrants.
     pub fn close_pot_vault(ctx: Context<ClosePotVault>) -> Result<()> {
         instructions::close_pot_vault::handler(ctx)
     }

@@ -626,17 +626,102 @@ pub const FINAL_SHARD_INDEX: u8 = 255;
 /// this authority — the program is the only possible signer, via `CpiContext::new_with_signer`.
 pub const POT_SEED: &[u8] = b"pot";
 
-/// PDA seed for the `PotDistribution` marker: `[POT_DIST_SEED, round_id_le]`.
+/// PDA seed for the `RoundSettlement` state account: `[ROUND_SETTLEMENT_SEED, round_id_le]`.
 ///
-/// The marker's `init` IS the replay guard. This is deliberate and load-bearing: a distributed
-/// pot's vault can be REFILLED by anyone (SPL lets any wallet transfer into any token account),
-/// so "the vault is empty" is NOT proof a round was already paid — a 50-token donation would
-/// re-arm a second payout. Only a persistent marker closes that hole, and `init` colliding on a
-/// second call is the same primitive `submit_entry` already relies on for duplicate entries.
-pub const POT_DIST_SEED: &[u8] = b"pot_dist";
+/// ONE account answers "what happened to this round's pot?", and it is the only thing that
+/// answers it. It replaces two separate marker types (`PotDistribution` and `PotRefund`) whose
+/// mere EXISTENCE encoded the answer, and whose mutual exclusion had to be enforced by each
+/// path probing for the other's account. That worked, but "settled" was a fact spread across
+/// three places and reconstructed by whoever needed it — the same shape of bug as the SOL
+/// prizes, where paid-ness had to be inferred rather than read.
+///
+/// Now the states are explicit and the transitions are the only way to move between them, so
+/// PAID and REFUNDED are mutually exclusive BY CONSTRUCTION rather than by two checks
+/// remembering to agree. See `SETTLEMENT_*` for the state values.
+///
+/// Still the marker's `init` that stops a replay, just via `init_if_needed` plus a state check
+/// rather than a bare collision — a refund needs several transactions, so the account has to
+/// survive between them, and a named error beats "account already in use".
+pub const ROUND_SETTLEMENT_SEED: &[u8] = b"round_settlement";
 
-/// $SGD charged per `submit_entry`, in base units. 100 SGD at 6 decimals.
+/// Settlement states. Stored as a `u8` so the account never needs a layout change to gain one.
+///
+/// `NONE` is also what a freshly-created (zeroed) account reads as, which is exactly right: an
+/// account that exists but has never been transitioned has settled nothing.
+pub const SETTLEMENT_NONE: u8 = 0;
+/// A refund has begun but has not paid every entrant yet. Blocks `distribute_pot` from the
+/// FIRST batch onward — the window between starting a refund and finishing it was previously
+/// unguarded, because `PotRefund` existing did not yet mean the pot was gone.
+pub const SETTLEMENT_POT_REFUND_PENDING: u8 = 1;
+/// Terminal: the pot went to the round's revealed winners.
+pub const SETTLEMENT_POT_PAID: u8 = 2;
+/// Terminal: the pot went back to the round's entrants.
+pub const SETTLEMENT_POT_REFUNDED: u8 = 3;
+
+/// Decimals every pinned $SGD mint must have.
+///
+/// `ENTRY_FEE_SGD` is a raw base-unit figure, so its VALUE is a function of the mint's decimals
+/// and nothing else. Pin a 9-decimal mint and 100_000_000 base units silently becomes 0.1
+/// tokens; pin a 2-decimal one and it becomes a million. Nothing would error — `transfer_checked`
+/// is handed the mint's own decimals, so it stays internally consistent all the way down while
+/// the entry fee has quietly moved by three orders of magnitude. `set_sgd_mint` and
+/// `update_sgd_mint` both refuse a mint that does not match this.
+pub const SGD_DECIMALS: u8 = 6;
+
+/// $SGD charged per `submit_entry`, in base units. 100 SGD at `SGD_DECIMALS`.
 pub const ENTRY_FEE_SGD: u64 = 100_000_000;
+
+/// PDA seed for the `PrizeDistribution` marker: `[PRIZE_DIST_SEED, round_id_le]`.
+///
+/// The SOL-prize twin of `ROUND_SETTLEMENT_SEED`, and DELIBERATELY a separate account. Pot
+/// settlement and prize payment are different money from different sources — the pot is the
+/// entrants' own fees held by a program PDA, the prizes come from an off-chain treasury — and a
+/// round can legitimately be in any combination of the two. Folding them together would force
+/// one to wait on the other for no reason. It exists because SOL prizes previously had NO
+/// on-chain record at all. They were paid by an off-chain treasury keypair with a bare
+/// `SystemProgram::transfer`, which writes nothing into the program's account graph, so
+/// "was round N paid?" could only ever be GUESSED at — by intersecting the winner's and the
+/// treasury's transaction histories. That heuristic has an unbounded forward window, so a
+/// winner paid for a LATER round reads as proof the earlier one was settled. This seed turns
+/// the question into a `getAccountInfo`.
+pub const PRIZE_DIST_SEED: &[u8] = b"prize_dist";
+
+/// How long after a round's submission deadline an unrevealed pot may be refunded.
+///
+/// The gate exists so the authority cannot sweep a round that is merely SLOW. A real reveal
+/// runs minutes after `close_round` — the auto-cycle attempts one every quarter hour — so
+/// seven days is several orders of magnitude past "clearly should have happened by now",
+/// while still being a bounded wait rather than the permanent loss this replaces.
+///
+/// Measured from `end_time`, NOT from finalization: `CompetitionRound` has no `finalized_at`
+/// field, and adding one would be an account-layout change requiring every existing round to
+/// be migrated before any instruction touching a round could run again. `end_time` is fixed
+/// when the round opens, always precedes finalization, and cannot be moved afterwards, so it
+/// is a strictly conservative reference point — it can only make the wait longer than the
+/// nominal seven days, never shorter.
+pub const POT_REFUND_MIN_AGE_SECONDS: i64 = 7 * SECONDS_PER_DAY;
+
+/// Base SOL prize per revealed winner, in lamports. 0.5 SOL.
+///
+/// The BASE, not the payout. `auto-cycle.ts` scales this by a rarity multiplier of up to 1.75x
+/// before sending, so the amount actually owed varies per winner and cannot be a single
+/// on-chain number without repricing the game — which a fund-safety fix has no business doing.
+/// `pay_sol_prizes` therefore takes the amounts as an argument and bounds them by
+/// `SOL_PRIZE_MAX_LAMPORTS` instead of dictating them.
+///
+/// It is still worth pinning here. The base previously existed only as two hand-synced
+/// TypeScript copies whose own comment admits they are "kept in step with it by hand — the two
+/// tools pay the same pool and a divergence here would silently over- or under-pay". This is
+/// the value those copies are supposed to agree with.
+pub const SOL_PRIZE_LAMPORTS: u64 = 500_000_000;
+
+/// Hard ceiling on what any single winner may be paid by `pay_sol_prizes`.
+///
+/// Twice the base, which clears the 1.75x top rarity multiplier with room to spare while still
+/// making a mistyped or malicious amount fail on-chain rather than empty the treasury. The
+/// instruction cannot police WHY an amount was chosen — the multiplier lives off-chain — but it
+/// can refuse an amount no legitimate policy would ever produce.
+pub const SOL_PRIZE_MAX_LAMPORTS: u64 = 1_000_000_000;
 
 /// Winners a pot is split between, at most. The real divisor is however many of
 /// `top1/top2/top3` are non-default, which is `participant_count.min(3)`.

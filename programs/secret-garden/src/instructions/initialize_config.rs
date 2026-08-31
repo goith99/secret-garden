@@ -41,6 +41,8 @@ pub(crate) fn handler(ctx: Context<InitializeConfig>) -> Result<()> {
         restore_ts: 0,
         // Unset sentinel — every fee path refuses to run until `set_sgd_mint` pins it.
         sgd_mint: Pubkey::default(),
+        // No handover in flight at genesis.
+        pending_authority: Pubkey::default(),
     });
     Ok(())
 }
