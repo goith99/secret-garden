@@ -668,8 +668,19 @@ interface CycleSummary {
   /** ALWAYS player wallets, resolved through the entry→player map on every path. */
   top3: string[];
   prizes: PrizeResult[];
-  /** True when the reveal ran in a PRIOR run, so this run deliberately did not distribute. */
+  /** True when the reveal ran in a PRIOR run. No longer affects whether payouts happen —
+   *  the on-chain markers decide that — but still worth reporting. */
   revealedPreviously: boolean;
+  /** Step 4b found a PrizeDistribution marker and correctly did nothing. */
+  prizesAlreadyPaid: boolean;
+  /** Step 4b found the pot already settled and correctly did nothing. */
+  potAlreadySettled: boolean;
+  /** $SGD actually paid out of the round's pot by this run. */
+  potPaidSgd: number;
+  /** Set when the pot distribution failed; the next cycle retries. */
+  potError?: string;
+  /** Why step 4b paid nothing, when it had no marker to point at. */
+  prizeSkipReason: string | null;
   /** True when the round was already FINALIZED when the cycle started — i.e. finalized
    *  OUTSIDE auto-cycle, so no prize distribution was ever run by a cycle. */
   externallyFinalized: boolean;
@@ -734,6 +745,48 @@ async function main(): Promise<void> {
     [Buffer.from("config")], program.programId)[0];
   const roundPda = (id: number) => PublicKey.findProgramAddressSync(
     [Buffer.from("round"), u64le(id)], program.programId)[0];
+  /** Marker proving a round's SOL prizes were paid. Its existence is the only guard needed. */
+  const prizeDistPda = (id: number) => PublicKey.findProgramAddressSync(
+    [Buffer.from("prize_dist"), u64le(id)], program.programId)[0];
+  /** The one account that says what happened to a round's $SGD pot. */
+  const settlementPda = (id: number) => PublicKey.findProgramAddressSync(
+    [Buffer.from("round_settlement"), u64le(id)], program.programId)[0];
+  /**
+   * Was this round's SOL prize pool already paid?
+   *
+   * THIS REPLACES THE DOUBLE-PAY GUARD. The old one was process-local control flow — prizes
+   * counted as paid if and only if THIS invocation had just performed the reveal — so a manual
+   * reveal, a crashed run or a resumed run all fell through to "not paid by me" and nothing
+   * ever picked them up. That is how rounds 63, 65 and 67 came to owe their winners. There is
+   * now an on-chain marker, so the question is a `getAccountInfo` and the answer is a fact.
+   */
+  const prizesAlreadyPaid = async (id: number): Promise<boolean> =>
+    (await conn.getAccountInfo(prizeDistPda(id), "confirmed")) !== null;
+  /** 0 = none, 1 = refund in progress, 2 = paid to winners, 3 = refunded to entrants. */
+  const settlementState = async (id: number): Promise<number> => {
+    const acc: any = await program.account.roundSettlement.fetchNullable(settlementPda(id));
+    return acc ? (acc.state as number) : 0;
+  };
+  /** Create any winner $SGD account that does not exist yet; distribute_pot requires them. */
+  async function ensureAtas(mint: PK, owners: PK[]): Promise<void> {
+    for (const o of owners) {
+      const ata = ataFor(o, mint);
+      if (await conn.getAccountInfo(ata, "confirmed")) continue;
+      const ix = new anchor.web3.TransactionInstruction({
+        programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+        keys: [
+          { pubkey: signer.publicKey, isSigner: true, isWritable: true },
+          { pubkey: ata, isSigner: false, isWritable: true },
+          { pubkey: o, isSigner: false, isWritable: false },
+          { pubkey: mint, isSigner: false, isWritable: false },
+          { pubkey: anchor.web3.SystemProgram.programId, isSigner: false, isWritable: false },
+          { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([]),
+      });
+      await sendTxHttp(new anchor.web3.Transaction().add(ix), `createAta(${o.toBase58().slice(0, 8)})`);
+    }
+  }
 
 // --- $SGD pot vault -------------------------------------------------------------------------
 // open_round now creates the round's pot vault itself, funded by the operator, so the round's
@@ -806,6 +859,9 @@ async function openRoundPotAccounts(nextRoundId: number) {
     tx: anchor.web3.Transaction,
     label: string,
     payer: anchor.web3.Keypair = signer,
+    // Co-signers beyond the fee payer. `pay_sol_prizes` needs the treasury's signature for
+    // the lamports it moves, while the operator still pays the fee and the marker rent.
+    extraSigners: anchor.web3.Keypair[] = [],
   ): Promise<string> {
     for (let attempt = 1; attempt <= 6; attempt++) {
       const bh = await conn.getLatestBlockhash({ commitment: "confirmed" });
@@ -813,7 +869,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
       tx.lastValidBlockHeight = bh.lastValidBlockHeight;
       tx.feePayer = payer.publicKey;
       tx.signatures = [];
-      tx.sign(payer);
+      tx.sign(payer, ...extraSigners);
       let sig: string;
       try {
         sig = await conn.sendRawTransaction(tx.serialize(), {
@@ -885,14 +941,19 @@ async function openRoundPotAccounts(nextRoundId: number) {
    * here, so the healthy path and the skip paths can never disagree again. Unfilled ranks
    * (fewer than three entrants) are omitted.
    */
-  async function resolveWinnerWallets(round: PK, r: any): Promise<{ rank: number; wallet: PK }[]> {
+  async function resolveWinnerWallets(
+    round: PK, r: any,
+  ): Promise<{ rank: number; wallet: PK; entry: PK }[]> {
     const entries = await entriesForRound(round);
     const byEntry = new Map<string, PK>(entries.map((e) => [(e.pubkey as PK).toBase58(), e.player as PK]));
-    const out: { rank: number; wallet: PK }[] = [];
+    // The ENTRY pubkey travels with the wallet now: both `pay_sol_prizes` and
+    // `distribute_pot` take [entry, destination] pairs as remaining accounts, because
+    // top1/2/3 name entries and only the entry knows which wallet placed it.
+    const out: { rank: number; wallet: PK; entry: PK }[] = [];
     [r.top1, r.top2, r.top3].forEach((entryPk: PK, idx: number) => {
       if (entryPk.equals(PublicKey.default)) return; // unfilled rank
       const player = byEntry.get(entryPk.toBase58());
-      if (player) out.push({ rank: idx + 1, wallet: player });
+      if (player) out.push({ rank: idx + 1, wallet: player, entry: entryPk });
       else console.log(`  ⚠ rank ${idx + 1}: entry ${entryPk.toBase58()} has no matching entry account`);
     });
     return out;
@@ -1431,32 +1492,104 @@ async function openRoundPotAccounts(nextRoundId: number) {
   // 2, then 3). Each transfer is independent: a failure is logged and recorded but does NOT
   // abort the others or the surrounding cycle — a failed payout is surfaced for MANUAL retry.
   async function distributePrizes(
-    winners: { rank: number; wallet: PK }[],
+    roundId: number,
+    winners: { rank: number; wallet: PK; entry: PK }[],
   ): Promise<PrizeResult[]> {
+    // Amounts first, transfers second. Both used to happen per winner in a loop of bare
+    // SystemProgram transfers, which is why a partial failure could leave a round half-paid
+    // with nothing on-chain recording which half. `pay_sol_prizes` takes the whole set at once:
+    // the transfers and the PrizeDistribution marker are one instruction, so the round is
+    // either fully paid AND marked, or neither.
+    //
+    // FLAT amounts. Production pays PRIZE_SOL by rank with no rarity multiplier — dev scales
+    // by rarity and this deliberately does not, because the two deployments have always paid
+    // differently and this change is not the place to reconcile that.
     const results: PrizeResult[] = [];
+    const amounts: bigint[] = [];
     for (const w of winners) {
-      const sol = PRIZE_SOL[w.rank - 1];
-      const lamports = Math.round(sol * LAMPORTS_PER_SOL);
-      try {
-        const tx = new anchor.web3.Transaction().add(
-          anchor.web3.SystemProgram.transfer({
-            fromPubkey: treasury.publicKey,
-            toPubkey: w.wallet,
-            lamports,
-          }),
-        );
-        // Treasury is the fee-payer + source, so it (not the operator) signs this tx.
-        const sig = await sendTxHttp(tx, `prize rank ${w.rank} (${sol} SOL)`, treasury);
-        console.log(`  ✓ rank ${w.rank}: sent ${sol} SOL to ${w.wallet.toBase58()} (sig ${short(sig)})`);
-        results.push({ rank: w.rank, wallet: w.wallet.toBase58(), amountSol: sol, ok: true });
-      } catch (e) {
-        const msg = (e as Error).message;
-        console.error(`  ✗ rank ${w.rank}: FAILED to send ${sol} SOL to ${w.wallet.toBase58()} — ${msg}`);
-        console.error(`    (cycle continues; retry this payout manually)`);
-        results.push({ rank: w.rank, wallet: w.wallet.toBase58(), amountSol: sol, ok: false, error: msg });
-      }
+      const sol = PRIZE_SOL[w.rank - 1] ?? 0;
+      amounts.push(BigInt(Math.round(sol * LAMPORTS_PER_SOL)));
+      console.log(`    rank ${w.rank}: ${sol} SOL to ${w.wallet.toBase58()}`);
+      results.push({ rank: w.rank, wallet: w.wallet.toBase58(), amountSol: sol, ok: false });
+    }
+
+    try {
+      const tx = await program.methods
+        .paySolPrizes(amounts.map((a) => new anchor.BN(a.toString())))
+        .accountsPartial({
+          authority: signer.publicKey,
+          treasury: treasury.publicKey,
+          config: configPda,
+          round: roundPda(roundId),
+          prizeDistribution: prizeDistPda(roundId),
+        })
+        .remainingAccounts(winners.flatMap((w) => [
+          { pubkey: w.entry, isSigner: false, isWritable: false },
+          { pubkey: w.wallet, isSigner: false, isWritable: true },
+        ]))
+        .transaction();
+      // Operator pays the fee and the marker rent; the treasury signs for its own lamports.
+      const sig = await sendTxHttp(tx, `paySolPrizes(${roundId})`, undefined, [treasury]);
+      console.log(`  ✓ paid ${winners.length} winner(s) and wrote the marker (sig ${short(sig)})`);
+      for (const x of results) x.ok = true;
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.error(`  ✗ SOL PRIZE PAYOUT FAILED for round ${roundId} — ${msg}`);
+      console.error(`    Nothing was paid and no marker was written, so the next cycle retries`);
+      console.error(`    this round automatically. No manual reconciliation needed.`);
+      for (const x of results) x.error = msg;
     }
     return results;
+  }
+
+  /**
+   * Pay the round's $SGD pot to the same winners. Separate money, separate guard: the pot is
+   * the entrants' own fees held by a program PDA, and RoundSettlement records where it went.
+   *
+   * This step did not exist before. The cron created a pot vault every round and never drained
+   * one — rounds 70 and 71 accumulated 1,200 SGD between them with nothing scheduled to pay it.
+   */
+  async function distributeSgdPot(
+    roundId: number,
+    winners: { rank: number; wallet: PK; entry: PK }[],
+  ): Promise<{ ok: boolean; paidSgd: number; error?: string }> {
+    const cfg: any = await program.account.gameConfig.fetch(configPda);
+    const sgdMint: PK = cfg.sgdMint;
+    const potAuthority = potAuthorityPda(roundId);
+    const potVault = ataFor(potAuthority, sgdMint);
+    const bal = await conn.getTokenAccountBalance(potVault).catch(() => null);
+    const potSgd = bal ? Number(bal.value.amount) / 1e6 : 0;
+    if (!bal || bal.value.amount === "0") {
+      console.log(`  pot is empty — nothing to distribute`);
+      return { ok: true, paidSgd: 0 };
+    }
+    try {
+      // Every winner needs somewhere to receive into, or the transfer CPI fails mid-payout.
+      await ensureAtas(sgdMint, winners.map((w) => w.wallet));
+      const tx = await program.methods.distributePot()
+        .accountsPartial({
+          authority: signer.publicKey,
+          config: configPda,
+          round: roundPda(roundId),
+          settlement: settlementPda(roundId),
+          potAuthority,
+          potVault,
+          sgdMint,
+        })
+        .remainingAccounts(winners.flatMap((w) => [
+          { pubkey: w.entry, isSigner: false, isWritable: false },
+          { pubkey: ataFor(w.wallet, sgdMint), isSigner: false, isWritable: true },
+        ]))
+        .transaction();
+      const sig = await sendTxHttp(tx, `distributePot(${roundId})`);
+      console.log(`  ✓ paid ${potSgd} SGD to ${winners.length} winner(s) (sig ${short(sig)})`);
+      return { ok: true, paidSgd: potSgd };
+    } catch (e) {
+      const msg = (e as Error).message;
+      console.error(`  ✗ POT DISTRIBUTION FAILED for round ${roundId} — ${msg}`);
+      console.error(`    The pot is untouched and unsettled, so the next cycle retries it.`);
+      return { ok: false, paidSgd: 0, error: msg };
+    }
   }
 
   // --- balance gates (operator fees + treasury prize pool) ------------------
@@ -1689,7 +1822,8 @@ async function openRoundPotAccounts(nextRoundId: number) {
   const summary: CycleSummary = {
     processedRound: null, entryCount: null, closedRound: null,
     scoredCount: 0, scoredThisRun: 0, top3: [], prizes: [],
-    revealedPreviously: false, externallyFinalized: false,
+    revealedPreviously: false, prizesAlreadyPaid: false, potAlreadySettled: false,
+    potPaidSgd: 0, prizeSkipReason: null, externallyFinalized: false,
     finalizedRound: null, openedRound: null,
   };
 
@@ -1719,14 +1853,10 @@ async function openRoundPotAccounts(nextRoundId: number) {
   // entrants, finalized manually on 2026-08-09, 1.5 SOL of prizes never sent.
   if (r.status === ROUND_STATUS_FINALIZED) {
     summary.externallyFinalized = true;
-    console.log(`\n  ${"!".repeat(72)}`);
-    console.log(`  ⚠ ACTION REQUIRED — ROUND ${current} WAS FINALIZED EXTERNALLY`);
-    console.log(`    This round was already FINALIZED before the cycle started, so it was`);
-    console.log(`    finalized OUTSIDE auto-cycle (manual reveal / operator panel).`);
-    console.log(`    PRIZE DISTRIBUTION WAS NOT RUN BY THIS CYCLE — auto-cycle only pays after a`);
-    console.log(`    reveal it performed itself. Verify manually whether prizes are owed for`);
-    console.log(`    round ${current} and pay them if so. This cycle will only open the next round.`);
-    console.log(`  ${"!".repeat(72)}`);
+    console.log(`\n  ⓘ round ${current} was already FINALIZED before this cycle started, so it`);
+    console.log(`    was finalized outside auto-cycle (manual reveal / operator panel).`);
+    console.log(`    Payouts are no longer this cycle's blind spot: step 4b pays any revealed`);
+    console.log(`    round with no marker, whoever revealed it.`);
   }
 
   // Anchor hands back i64 as a BN; tolerate a plain number too.
@@ -1800,13 +1930,11 @@ async function openRoundPotAccounts(nextRoundId: number) {
     console.log(`\n[reveal] skipping — round ${current} already FINALIZED (see the warning above)`);
     summary.top3 = (await resolveWinnerWallets(round, r)).map((w) => w.wallet.toBase58());
   } else if (r.scoringRevealed) {
-    // Resumed run: reveal already happened previously, so prizes were (or should have been)
-    // paid by that run. We do NOT auto-distribute again — there is no on-chain payout ledger,
-    // so re-paying here would double-pay. Surface it for manual verification instead.
+    // Resumed run: the reveal already happened. This used to be where the cycle gave up on
+    // prizes, because nothing on-chain could say whether the earlier run had paid them. The
+    // markers answer that now, so this branch just reuses the winners and step 4b decides.
     summary.revealedPreviously = true;
     console.log(`\n[reveal] already revealed in a prior run — reusing stored winners`);
-    console.log(`  ⚠ NOT auto-distributing prizes (double-pay guard). If the prior run's payouts`);
-    console.log(`    did not complete, verify on-chain and pay the affected winner(s) manually.`);
     summary.top3 = (await resolveWinnerWallets(round, r)).map((w) => w.wallet.toBase58());
   } else if (!hasEntries) {
     console.log(`\n[reveal] skipping — round ${current} has 0 entries (nothing to rank)`);
@@ -1836,9 +1964,11 @@ async function openRoundPotAccounts(nextRoundId: number) {
     winnerWallets.forEach((w) => console.log(`    ${w.rank}: ${w.wallet.toBase58()}`));
     await saveResultsToSupabase(current, rr, scored);
 
-    // --- PRIZE DISTRIBUTION (after a successful reveal, before finalize) ---
-    console.log(`\n[distribute] paying prize pool from treasury to ${winnerWallets.length} winner(s)...`);
-    summary.prizes = await distributePrizes(winnerWallets);
+    // Payouts are NOT here any more. Both `pay_sol_prizes` and `distribute_pot` require a
+    // FINALIZED round, so they moved below finalize into step 4b. That reordering is safe
+    // precisely because of the markers: if the run dies between the two, the round is
+    // finalized and unpaid, no marker exists, and the very next cycle pays it. Under the old
+    // ordering the same crash produced a round nothing would ever revisit.
   }
 
   // ------------------------------------------------------------- 4. FINALIZE
@@ -1852,6 +1982,46 @@ async function openRoundPotAccounts(nextRoundId: number) {
     // Set ONLY here: this run genuinely finalized the round.
     summary.finalizedRound = current;
     console.log(`\n[finalize] ✓ round ${current} finalized`);
+  }
+
+  // ------------------------------------- 4b. PAYOUTS (marker-guarded, idempotent)
+  //
+  // Runs for ANY finalized, revealed round that has not been paid — not only one this
+  // invocation revealed. That single change is what retires the old double-pay guard: a
+  // manually revealed round, a resumed run and a crashed run all now converge here and get
+  // paid, instead of each falling through a different branch into silence.
+  //
+  // Both payouts are attempted independently. SOL comes from the treasury and $SGD from the
+  // round's own pot vault; a failure in one must not block the other, and neither leaves a
+  // marker behind unless it actually moved the money.
+  r = await program.account.competitionRound.fetch(round);
+  if (!r.scoringRevealed) {
+    console.log(`\n[payouts] skipping — round ${current} was never revealed, so it has no winners`);
+    summary.prizeSkipReason = "round never revealed";
+  } else {
+    const winnerWallets = await resolveWinnerWallets(round, r);
+    if (!winnerWallets.length) {
+      console.log(`\n[payouts] skipping — round ${current} revealed no winners`);
+      summary.prizeSkipReason = "no winners";
+    } else {
+      if (await prizesAlreadyPaid(current)) {
+        console.log(`\n[payouts] SOL: already paid (PrizeDistribution marker on-chain)`);
+        summary.prizesAlreadyPaid = true;
+      } else {
+        console.log(`\n[payouts] SOL: paying ${winnerWallets.length} winner(s) for round ${current}...`);
+        summary.prizes = await distributePrizes(current, winnerWallets);
+      }
+      const st = await settlementState(current);
+      if (st !== 0) {
+        console.log(`[payouts] $SGD: already settled (state ${st})`);
+        summary.potAlreadySettled = true;
+      } else {
+        console.log(`[payouts] $SGD: distributing round ${current}'s pot...`);
+        const res = await distributeSgdPot(current, winnerWallets);
+        summary.potPaidSgd = res.paidSgd;
+        if (!res.ok) summary.potError = res.error;
+      }
+    }
   }
 
   // ----------------------------------------------------------------- 5. OPEN
@@ -1909,20 +2079,23 @@ function printSummary(s: CycleSummary, operatorSol: number, treasurySol: number)
     + ` (round total on-chain: ${s.scoredCount}${s.entryCount === null ? "" : `/${s.entryCount}`})`);
   console.log(`  Top 3 (wallets)    : ${s.top3.length ? "" : "—"}`);
   s.top3.forEach((w, i) => console.log(`    ${i + 1}. ${w}`));
-  const noPayoutReason = s.externallyFinalized
-    ? "— NOT RUN (round finalized externally — verify prizes manually)"
-    : s.revealedPreviously
-      ? "— not run (already revealed by a prior run; double-pay guard)"
-      : s.top3.length === 0
-        ? "— (no winners to pay)"
-        : "— (no payouts this run)";
-  console.log(`  Prize distribution : ${s.prizes.length ? "" : noPayoutReason}`);
+  const noPayoutReason = s.prizesAlreadyPaid
+    ? "— already paid (PrizeDistribution marker on-chain)"
+    : s.prizeSkipReason
+      ? `— (${s.prizeSkipReason})`
+      : "— (no payouts this run)";
+  console.log(`  SOL prizes         : ${s.prizes.length ? "" : noPayoutReason}`);
   s.prizes.forEach((p) =>
     console.log(`    rank ${p.rank}: ${p.amountSol} SOL -> ${p.wallet}  [${p.ok ? "SENT" : "FAILED"}]`
       + (p.ok || !p.error ? "" : ` (${p.error})`)));
+  console.log(`  $SGD pot           : ${
+    s.potAlreadySettled ? "— already settled (RoundSettlement on-chain)"
+      : s.potError ? `FAILED (${s.potError}) — next cycle retries`
+        : s.potPaidSgd > 0 ? `${s.potPaidSgd} SGD paid to winners`
+          : "— (nothing to distribute)"}`);
   const failed = s.prizes.filter((p) => !p.ok);
   if (failed.length) {
-    console.log(`    ⚠ ${failed.length} payout(s) FAILED — retry manually: `
+    console.log(`    ⚠ ${failed.length} payout(s) FAILED — the next cycle retries automatically: `
       + failed.map((p) => `rank ${p.rank} (${p.amountSol} SOL -> ${p.wallet})`).join(", "));
   }
   console.log(`  Round finalized    : ${s.finalizedRound === null
