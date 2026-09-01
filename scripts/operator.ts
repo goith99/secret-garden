@@ -55,8 +55,12 @@ const { PublicKey, Keypair, SystemProgram, LAMPORTS_PER_SOL } = anchor.web3;
  * transfers that recorded nothing, so the absence of a marker tells you nothing about them.
  * The `distribute` command refuses them without an explicit BACKFILL=1. Raise this if the
  * upgrade slips to a later round; never lower it.
+ *
+ * 73, not 72: Railway only picked up the marker-writing code after the push at ~11:15Z on
+ * 2026-08-31, by which time the 10:01Z cycle had already paid round 72 the old way. Confirmed
+ * against the treasury's parsed transfers — 70, 71 and 72 all show 0.5 SOL to every winner.
  */
-const PRIZE_MARKER_FIRST_ROUND = 72;
+const PRIZE_MARKER_FIRST_ROUND = 73;
 
 const PRIZE_SOL = [0.5, 0.5, 0.5];
 type PK = anchor.web3.PublicKey;
@@ -646,7 +650,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
         }
         const tx = await program.methods
           .paySolPrizes(winners.map((_w, i) =>
-            new anchor.BN(Math.round((PRIZE_SOL[i] ?? 0) * LAMPORTS_PER_SOL))))
+            new BN(Math.round((PRIZE_SOL[i] ?? 0) * LAMPORTS_PER_SOL))))
           .accountsPartial({
             authority: authority.publicKey, treasury: treasury.publicKey,
             config: configPda, round, prizeDistribution: prizeDist,

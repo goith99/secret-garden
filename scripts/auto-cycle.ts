@@ -89,6 +89,21 @@ const MIN_BALANCE_SOL = 0.5;
 
 // Prize pool: SOL paid from the Treasury to the rank 1/2/3 winners, in that order. Indexed
 // by (rank - 1).
+/**
+ * First round whose SOL prizes are recorded by an on-chain `PrizeDistribution` marker.
+ *
+ * Anything BELOW this predates the ledger: those rounds were paid by bare treasury transfers
+ * that recorded nothing, so the ABSENCE of a marker says nothing about whether they were paid.
+ * The backlog scan below must never reach them, or it would pay them a second time.
+ *
+ * 73, not 72. The upgrade landed 2026-08-31T04:13Z, but Railway only picked it up after the
+ * push at ~11:15Z — by which time the 10:01Z cycle had already paid round 72 through the OLD
+ * code path. Round 73 is the first round the marker-writing code actually processed. Verified
+ * against the treasury's parsed transfer history: rounds 70, 71 and 72 each show 0.5 SOL
+ * reaching every winner at 10:01 on their close day; round 73 shows nothing.
+ */
+const PRIZE_LEDGER_FIRST_ROUND = 73;
+
 const PRIZE_SOL = [0.5, 0.5, 0.5];
 // Minimum Treasury balance required before the cycle runs — at least one day's full prize
 // pool (0.5 + 0.5 + 0.5 = 1.5 SOL), plus the same 0.1 SOL absolute headroom the previous
@@ -681,6 +696,8 @@ interface CycleSummary {
   potError?: string;
   /** Why step 4b paid nothing, when it had no marker to point at. */
   prizeSkipReason: string | null;
+  /** What the pre-close backlog scan settled, for rounds earlier runs left owing. */
+  backlogPaid: string[];
   /** True when the round was already FINALIZED when the cycle started — i.e. finalized
    *  OUTSIDE auto-cycle, so no prize distribution was ever run by a cycle. */
   externallyFinalized: boolean;
@@ -1515,7 +1532,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
 
     try {
       const tx = await program.methods
-        .paySolPrizes(amounts.map((a) => new anchor.BN(a.toString())))
+        .paySolPrizes(amounts.map((a) => new BN(a.toString())))
         .accountsPartial({
           authority: signer.publicKey,
           treasury: treasury.publicKey,
@@ -1540,6 +1557,57 @@ async function openRoundPotAccounts(nextRoundId: number) {
       for (const x of results) x.error = msg;
     }
     return results;
+  }
+
+  /**
+   * Settle EVERY finalized round that still owes money, not just the one this run processed.
+   *
+   * THIS IS THE THING THE OLD ERROR MESSAGE LIED ABOUT. When a payout failed, the log said "the
+   * next cycle retries this round automatically". It did not, for two independent reasons, and
+   * round 73 proved both: step 4b only ever looked at the round the run was currently
+   * processing, AND the cycle returns early when the current round is not yet closeable — so
+   * the eight cycles that followed round 73's failure never even reached the payout stage. A
+   * round that failed once was orphaned until someone noticed by hand.
+   *
+   * The scan runs BEFORE the close gate precisely so that early return cannot skip it. It is
+   * purely marker-driven: a round is owed if it is FINALIZED, revealed, has winners, and has no
+   * `PrizeDistribution` / terminal `RoundSettlement`. No transaction-history inference, no
+   * signature intersection — those were the guards this whole design replaced.
+   *
+   * Bounded below by `PRIZE_LEDGER_FIRST_ROUND`, which is what stops it walking back into
+   * rounds the marker cannot speak for and paying them twice.
+   */
+  async function settleBacklog(currentRound: number): Promise<void> {
+    const ids: number[] = [];
+    for (let i = PRIZE_LEDGER_FIRST_ROUND; i <= currentRound; i++) ids.push(i);
+    if (!ids.length) return;
+
+    // Two batched reads rather than 2N round-trips, so this stays cheap as the ledger grows.
+    const markers = await conn.getMultipleAccountsInfo(ids.map(prizeDistPda), "confirmed");
+    const settles = await conn.getMultipleAccountsInfo(ids.map(settlementPda), "confirmed");
+    const owing = ids.filter((_id, i) => markers[i] === null || settles[i] === null);
+    if (!owing.length) return;
+
+    console.log(`\n[backlog] ${owing.length} round(s) with an unwritten payout record: ${owing.join(", ")}`);
+    for (const id of owing) {
+      const i = ids.indexOf(id);
+      const r: any = await program.account.competitionRound.fetch(roundPda(id)).catch(() => null);
+      if (!r) continue;
+      if (r.status !== ROUND_STATUS_FINALIZED || !r.scoringRevealed) continue;
+      const winners = await resolveWinnerWallets(roundPda(id), r);
+      if (!winners.length) continue;
+
+      if (markers[i] === null) {
+        console.log(`[backlog] round ${id}: SOL prizes unpaid — paying ${winners.length} winner(s)`);
+        const res = await distributePrizes(id, winners);
+        summary.backlogPaid.push(`round ${id} SOL: ${res.every((x) => x.ok) ? "paid" : "FAILED"}`);
+      }
+      if (settles[i] === null) {
+        console.log(`[backlog] round ${id}: pot unsettled — distributing`);
+        const res = await distributeSgdPot(id, winners);
+        summary.backlogPaid.push(`round ${id} pot: ${res.ok ? `${res.paidSgd} SGD` : "FAILED"}`);
+      }
+    }
   }
 
   /**
@@ -1823,7 +1891,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
     processedRound: null, entryCount: null, closedRound: null,
     scoredCount: 0, scoredThisRun: 0, top3: [], prizes: [],
     revealedPreviously: false, prizesAlreadyPaid: false, potAlreadySettled: false,
-    potPaidSgd: 0, prizeSkipReason: null, externallyFinalized: false,
+    potPaidSgd: 0, prizeSkipReason: null, backlogPaid: [], externallyFinalized: false,
     finalizedRound: null, openedRound: null,
   };
 
@@ -1838,6 +1906,13 @@ async function openRoundPotAccounts(nextRoundId: number) {
   }
 
   const round = roundPda(current);
+
+  // ------------------------------------------------- 0. BACKLOG (before anything can return)
+  //
+  // Deliberately ahead of the close gate. The cycle returns early when the current round is
+  // still live, and that return is what stopped round 73's failed payout from ever being
+  // retried. Settling owed rounds must not sit behind a branch that skips most of the time.
+  await settleBacklog(current);
 
   // ---------------------------------------------------------------- 1. CLOSE
   let r: any = await program.account.competitionRound.fetch(round);
@@ -2088,6 +2163,10 @@ function printSummary(s: CycleSummary, operatorSol: number, treasurySol: number)
   s.prizes.forEach((p) =>
     console.log(`    rank ${p.rank}: ${p.amountSol} SOL -> ${p.wallet}  [${p.ok ? "SENT" : "FAILED"}]`
       + (p.ok || !p.error ? "" : ` (${p.error})`)));
+  if (s.backlogPaid.length) {
+    console.log(`  Backlog settled    :`);
+    s.backlogPaid.forEach((b) => console.log(`    ${b}`));
+  }
   console.log(`  $SGD pot           : ${
     s.potAlreadySettled ? "— already settled (RoundSettlement on-chain)"
       : s.potError ? `FAILED (${s.potError}) — next cycle retries`

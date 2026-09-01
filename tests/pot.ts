@@ -1194,6 +1194,31 @@ describe("$SGD entry-fee pot", () => {
       expect(BigInt(m.largestPaid.toString())).to.equal(PRIZE);
     });
 
+    it("a round skipped at reveal time can still be paid cycles later", async () => {
+      // The guarantee the cron's backlog scan leans on. Round 73 failed its payout in
+      // production and eight later cycles never retried it, because the cycle only ever looked
+      // at the round it was processing. The scan fixes that off-chain — but only if the
+      // PROGRAM imposes no recency constraint. This proves it does not: a round is paid here
+      // after it has been finalized, revealed, AND superseded by a later open round.
+      const { h, authority, players, entries, treasury, pairs } = await revealedRound(2);
+      // Move the game on: round 1 is finalized, so round 2 can open on top of it.
+      await h.send([await ixOpenRound(h, authority.publicKey, 1)], [authority]);
+      const cfg: any = await h.program.account.gameConfig.fetch(h.configPda());
+      expect(Number(cfg.currentRound)).to.equal(2, "the game must have moved past round 1");
+      assert.isNull(await h.client.getAccount(h.prizeDistPda(1)), "round 1 must still be unpaid");
+
+      const before = await sol(h, players[1].publicKey);
+      const r = await h.send(
+        [await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
+        [authority, treasury]);
+      assert.isNull(r.result, `a stale round must still be payable: ${r.result}`);
+      expect((await sol(h, players[1].publicKey)) - before).to.equal(PRIZE);
+      const m: any = await h.program.account.prizeDistribution.fetch(h.prizeDistPda(1));
+      expect(m.winnerCount).to.equal(2);
+      expect(BigInt(m.totalPaid.toString())).to.equal(PRIZE * 2n);
+      void entries;
+    });
+
     it("ADVERSARIAL: a second payout for the same round cannot land", async () => {
       const { h, authority, treasury, pairs } = await revealedRound(2);
       assert.isNull((await h.send([await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
