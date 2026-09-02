@@ -41,8 +41,10 @@ const signer = await createKeyPairSignerFromBytes(player.secretKey);
 const pool = await fetchSplashPool(rpc, WSOL, SGD);
 console.log(`pool: ${pool.address}  initialized=${pool.initialized}`);
 
-// Swap 0.05 SOL -> $SGD. At ~8425 SGD/SOL that is ~420 SGD, comfortably over the 100 fee.
-const IN = 50_000_000n;
+// Swap 0.05 SOL -> $SGD by default. At ~8425 SGD/SOL that is ~420 SGD, comfortably over the
+// 100 fee. SWAP_LAMPORTS overrides the amount, the same env-or-default shape SGD_MINT uses
+// above — the figures in this comment describe the default, not whatever is passed in.
+const IN = BigInt(process.env.SWAP_LAMPORTS ?? 50_000_000);
 const { quote, callback } = await swap({ inputAmount: IN, mint: WSOL }, pool.address, signer);
 console.log(`quote: ${Number(IN) / 1e9} SOL -> ~${Number(quote.tokenEstOut) / 1e6} $SGD (min ${Number(quote.tokenMinOut) / 1e6})`);
 const sig = await callback();
