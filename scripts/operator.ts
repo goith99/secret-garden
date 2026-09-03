@@ -13,7 +13,7 @@
  *   close   — close_round; print "Round N closed. X entries received."
  *   score   — auto-score every unscored CompetitionEntry of the current round
  *             (queue_score_entry per entry, no wallet popup)
- *   reveal  — queue_reveal_top3; wait for MPC; print the top-3 winner wallets
+ *   reveal  — bracket reveal (init/shards/collect/apply); print the top-3 winner wallets
  *   finalize— finalize_round; required terminal step before the next open_round
  *
  *   Round-running commands (open/close/score/reveal/finalize) accept the config
@@ -31,7 +31,7 @@
  * devnet tests already use.)
  *   set -a; source .env; set +a
  *   ANCHOR_PROVIDER_URL=$HELIUS_RPC_URL \
- *     ANCHOR_WALLET=$HOME/.config/solana/id.json \
+ *     OPERATOR_KEYPAIR=$HOME/.config/solana/id.json \   # defaults to id.json
  *     ARCIUM_CLUSTER_OFFSET=456 \
  *     COMMAND=status \
  *     npx mocha --no-config --timeout 300000 scripts/operator.ts
@@ -46,23 +46,6 @@ import type { SecretGarden } from "../target/types/secret_garden";
 
 const { PublicKey, Keypair, SystemProgram, LAMPORTS_PER_SOL } = anchor.web3;
 
-/** SOL paid per rank, mirroring auto-cycle's PRIZE_SOL. Kept in step with it by hand — the two
- *  tools pay the same pool and a divergence here would silently over- or under-pay. */
-/**
- * First round whose SOL prizes are recorded by an on-chain `PrizeDistribution` marker.
- *
- * Anything BELOW this predates the ledger: those rounds were paid (or not) by bare treasury
- * transfers that recorded nothing, so the absence of a marker tells you nothing about them.
- * The `distribute` command refuses them without an explicit BACKFILL=1. Raise this if the
- * upgrade slips to a later round; never lower it.
- *
- * 73, not 72: Railway only picked up the marker-writing code after the push at ~11:15Z on
- * 2026-08-31, by which time the 10:01Z cycle had already paid round 72 the old way. Confirmed
- * against the treasury's parsed transfers — 70, 71 and 72 all show 0.5 SOL to every winner.
- */
-const PRIZE_MARKER_FIRST_ROUND = 73;
-
-const PRIZE_SOL = [0.5, 0.5, 0.5];
 type PK = anchor.web3.PublicKey;
 type KP = anchor.web3.Keypair;
 
@@ -99,7 +82,14 @@ describe(`secret-garden operator [COMMAND=${COMMAND}] (cluster 456)`, () => {
     "confirmed"
   );
   const program = anchor.workspace.SecretGarden as anchor.Program<SecretGarden>;
-  const authority = readKpJson(`${os.homedir()}/.config/solana/id.json`);
+  // KEYPAIR PATH IS CONFIGURABLE, because the authority moved behind a Squads multisig.
+  // This used to hardcode id.json on the assumption that it WAS config.authority. It is not
+  // any more: the authority is a vault PDA that cannot sign locally at all, so every command
+  // here has to run as a registered OPERATOR instead. Defaults to id.json so existing usage
+  // is unchanged.
+  const authority = readKpJson(
+    process.env.OPERATOR_KEYPAIR ?? `${os.homedir()}/.config/solana/id.json`,
+  );
 
   const arciumEnv = arcium.getArciumEnv();
   const clusterAccount = arcium.getClusterAccAddress(arciumEnv.arciumClusterOffset);
@@ -162,8 +152,8 @@ async function openRoundPotAccounts(nextRoundId: number) {
   async function sendTxHttp(
     tx: anchor.web3.Transaction, label: string,
     signer: anchor.web3.Keypair = authority,
-    // `pay_sol_prizes` needs the treasury's signature for its own lamports while the
-    // operator still pays the fee and the marker rent.
+    // Co-signers beyond the fee payer. Unused now that there is no SOL prize; kept because
+    // the parameter is harmless and a future instruction may need it.
     extraSigners: anchor.web3.Keypair[] = [],
   ): Promise<string> {
     for (let attempt = 1; attempt <= 6; attempt++) {
@@ -486,29 +476,129 @@ async function openRoundPotAccounts(nextRoundId: number) {
         throw new Error(`scoring incomplete: ${r.scoredCount}/${r.participantCount} scored (run COMMAND=score)`);
       }
 
-      // The circuit reads each entry's stored score by reference; the entries
-      // must be passed as remaining_accounts in slot order (exactly
-      // participant_count of them).
+      // ---- BRACKET REVEAL (the only reveal path) -------------------------------
+      //
+      // WHY NOT `queue_reveal_top3`. A single Arcium computation may reference at most 14
+      // distinct accounts in its argument list (measured on devnet: N=14 ok, N=15 and N=16
+      // rejected with Arcium error 6202), so the legacy one-shot reveal silently stops
+      // working somewhere between 14 and 16 entries and leaves the round UNREVEALABLE.
+      // Every round therefore goes through the bracket, which is shard-sized to stay under
+      // that ceiling. The legacy instruction is still registered and callable in principle;
+      // nothing in the operational flow calls it.
+      //
+      // A round that fits in ONE shard skips the final reveal entirely (see below), so the
+      // common small-round case still costs exactly one MPC call — same as the legacy path.
       const entries = await entriesForRound(round);
       const scored = entries.filter((e) => e.scored);
       if (scored.length !== r.participantCount) {
         throw new Error(`found ${scored.length} scored entries but participantCount=${r.participantCount}`);
       }
-      const remaining = scored.map((e) => ({
-        pubkey: e.pubkey as PK, isWritable: false, isSigner: false,
-      }));
 
-      const offset = freshOffset();
-      const tx = await program.methods.queueRevealTop3(offset)
-        .accountsPartial({ authority: authority.publicKey, round, ...queueAccsFor("reveal_top3", offset) })
-        .remainingAccounts(remaining)
-        .transaction();
-      await sendTxHttp(tx, "queueRevealTop3");
-      console.log(`\n[reveal_top3] queued; awaiting MPC finalization...`);
-      await arcium.awaitComputationFinalization(
-        provider, offset, program.programId, "confirmed", 360000);
+      // Canonical order: entry PDAs ascending. Anyone can recompute this offline, and the
+      // program re-verifies it, so the shard partition is checked rather than trusted.
+      // BYTE-WISE sort — this must match the on-chain `Pubkey` ordering exactly. Anchor's
+      // `Pubkey` compares as [u8; 32], NOT as base58 text: a key with a leading zero byte
+      // yields a 43-char base58 string that sorts LAST as text but FIRST as bytes. Sorting
+      // by base58 silently produces a partition the program rejects (error 6037).
+      const allEntries = scored
+        .map((e) => e.pubkey as PK)
+        .sort((a, b) => Buffer.compare(a.toBuffer(), b.toBuffer()));
 
-      // Poll the round until the callback flips scoringRevealed and writes top1..3.
+      // `reveal_top3_v5` ranks on `score * 8 + rarity` and the program reads each rarity from
+      // the FlowerRecord the entry itself recorded, so every QUEUE reveal takes TWO runs of
+      // remaining accounts: the entries, then their flowers in the SAME order. The collect_*
+      // instructions are unchanged and still take exactly n — passing 2n there fails
+      // WrongEntryCount, so the two cases must not share a helper by accident.
+      const flowerOf = new Map<string, PK>(
+        scored.map((e) => [(e.pubkey as PK).toBase58(), e.flowerRecord as PK]));
+      const metas = (keys: PK[]) => keys.map((p) => ({ pubkey: p, isWritable: false, isSigner: false }));
+      const metasWithFlowers = (keys: PK[]) => [
+        ...metas(keys),
+        ...metas(keys.map((k) => {
+          const f = flowerOf.get(k.toBase58());
+          if (!f) throw new Error(`no FlowerRecord known for entry ${k.toBase58()}`);
+          return f;
+        })),
+      ];
+      const sizes = planShards(allEntries.length);
+      const chunks: PK[][] = [];
+      let cursor = 0;
+      for (const s of sizes) { chunks.push(allEntries.slice(cursor, cursor + s)); cursor += s; }
+      const single = chunks.length === 1;
+      const bracket = bracketPda(round);
+      console.log(`\n[bracket] ${allEntries.length} entries -> ${chunks.length} shard(s) [${sizes.join(", ")}]` +
+        `${single ? " (single shard: final reveal skipped)" : ""}`);
+
+      const bState: any = await program.account.bracketState.fetchNullable(bracket);
+      if (!bState) {
+        const padSizes = [0, 0, 0, 0];
+        sizes.forEach((s, i) => (padSizes[i] = s));
+        const bounds = [PublicKey.default, PublicKey.default, PublicKey.default, PublicKey.default];
+        chunks.forEach((c, i) => (bounds[i] = c[0]));
+        await sendTxHttp(await program.methods.initBracket(padSizes, bounds, chunks.length)
+          .accountsPartial({ authority: authority.publicKey, config: configPda, round, bracket })
+          .transaction(), "initBracket");
+      }
+
+      for (let k = 0; k < chunks.length; k++) {
+        const rem = chunks[k].map((p) => ({ pubkey: p, isWritable: false, isSigner: false }));
+        const existing: any = await program.account.revealTop3V3Result.fetchNullable(shardResPda(round, k));
+        if (!existing?.ready) {
+          const off = freshOffset();
+          await sendTxHttp(await program.methods.queueShardReveal(off, k)
+            .accountsPartial({
+              authority: authority.publicKey, config: configPda, round, bracket,
+              result: shardResPda(round, k), ...queueAccsFor("reveal_top3_v5", off),
+            }).remainingAccounts(metasWithFlowers(chunks[k])).transaction(), `queueShardReveal(${k})`);
+          console.log(`  [shard ${k}] queued (${chunks[k].length} entries); awaiting MPC...`);
+          await arcium.awaitComputationFinalization(provider, off, program.programId, "confirmed", 360000);
+          for (let i = 0; i < 180; i++) {
+            const res: any = await program.account.revealTop3V3Result.fetchNullable(shardResPda(round, k));
+            if (res?.ready) break;
+            await sleep(1000);
+          }
+        }
+        const bb: any = await program.account.bracketState.fetch(bracket);
+        if ((bb.shardsCollected & (1 << k)) === 0) {
+          await sendTxHttp(await program.methods.collectShardWinners(k)
+            .accountsPartial({
+              authority: authority.publicKey, config: configPda, round, bracket,
+              result: shardResPda(round, k),
+            }).remainingAccounts(rem).transaction(), `collectShardWinners(${k})`);
+        }
+      }
+
+      // Multi-shard rounds need one more MPC call to rank the shard winners against each
+      // other. A single-shard round does NOT: that shard's ranking already IS the round's.
+      if (!single) {
+        const bb: any = await program.account.bracketState.fetch(bracket);
+        if (!bb.finalQueued) {
+          const finalists = (bb.finalists as PK[]).slice(0, bb.finalistCount)
+            .sort((a, b) => (a.toBase58() < b.toBase58() ? -1 : 1));
+          const off = freshOffset();
+          await sendTxHttp(await program.methods.queueShardReveal(off, FINAL_SHARD_INDEX)
+            .accountsPartial({
+              authority: authority.publicKey, config: configPda, round, bracket,
+              result: shardResPda(round, FINAL_SHARD_INDEX), ...queueAccsFor("reveal_top3_v5", off),
+            }).remainingAccounts(metasWithFlowers(finalists))
+            .transaction(), "queueFinalReveal");
+          console.log(`  [final] queued over ${finalists.length} shard winners; awaiting MPC...`);
+          await arcium.awaitComputationFinalization(provider, off, program.programId, "confirmed", 360000);
+          for (let i = 0; i < 180; i++) {
+            const res: any = await program.account.revealTop3V3Result.fetchNullable(shardResPda(round, FINAL_SHARD_INDEX));
+            if (res?.ready) break;
+            await sleep(1000);
+          }
+        }
+      }
+
+      const resultIndex = single ? 0 : FINAL_SHARD_INDEX;
+      await sendTxHttp(await program.methods.applyBracketResult(resultIndex)
+        .accountsPartial({
+          authority: authority.publicKey, config: configPda, round, bracket,
+          result: shardResPda(round, resultIndex),
+        }).transaction(), "applyBracketResult");
+
       let revealed = false;
       let rr: any;
       for (let k = 0; k < 180; k++) {
@@ -516,7 +606,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
         if (rr.scoringRevealed) { revealed = true; break; }
         await sleep(1000);
       }
-      if (!revealed) throw new Error("reveal MPC finalized but round.scoringRevealed never flipped");
+      if (!revealed) throw new Error("bracket applied but round.scoringRevealed never flipped");
 
       // Map winning entry pubkeys back to the player wallet that submitted them.
       const byEntry = new Map(scored.map((e) => [(e.pubkey as PK).toBase58(), e.player as PK]));
@@ -550,135 +640,6 @@ async function openRoundPotAccounts(nextRoundId: number) {
       return;
     }
 
-    // ------------------------------------------------------------ DISTRIBUTE
-    // Pays a FINALIZED, revealed round's SOL prize pool from the treasury to its winners.
-    //
-    // WHY THIS EXISTS. auto-cycle pays prizes as step 3b of its own run, and refuses to pay a
-    // round it did not itself reveal — a deliberate double-pay guard, because there is no
-    // on-chain payout ledger to consult. The gap that leaves: a round cycled by hand through
-    // this tool (close/score/reveal/finalize) is never paid by anyone, and auto-cycle will
-    // decline to backfill it. That is not hypothetical — it is how rounds 63, 65 and 67 ended
-    // up owing their winners, and the operator's only signal was a warning line in a cron log.
-    //
-    // The guard here is the same idea, made checkable: scan the treasury's own transfer
-    // history for a batch whose recipient set is exactly this round's winners and which lands
-    // after the round closed. If one exists, this round has been paid and we refuse. It is a
-    // heuristic — SOL transfers carry no memo tying them to a round — but it is the same
-    // evidence a human would use, applied consistently instead of from memory.
-    //
-    //   COMMAND=distribute ROUND=63 TREASURY_PRIVATE_KEY='[...]' ...
-    //   COMMAND=distribute ROUND=63 DRY_RUN=1 ...      # report only, sends nothing
-    if (COMMAND === "distribute") {
-      const roundId = Number(process.env.ROUND ?? current);
-      const dry = process.env.DRY_RUN === "1";
-      if (!Number.isInteger(roundId) || roundId <= 0) throw new Error("set ROUND=<n>");
-
-      const round = roundPda(roundId);
-      const r: any = await program.account.competitionRound.fetch(round);
-      if (r.status !== ROUND_STATUS_FINALIZED) throw new Error(`round ${roundId} is not FINALIZED (status ${r.status})`);
-      if (!r.scoringRevealed) throw new Error(`round ${roundId} has no revealed winners`);
-
-      // top1/2/3 hold CompetitionEntry pubkeys; the wallet is on the entry, not the round.
-      const winners: PK[] = [];
-      for (const e of [r.top1, r.top2, r.top3] as PK[]) {
-        if (e.equals(PublicKey.default)) continue;
-        const entry: any = await program.account.competitionEntry.fetch(e);
-        winners.push(entry.player as PK);
-      }
-      if (winners.length === 0) throw new Error(`round ${roundId} revealed no real winners`);
-      console.log(`\nRound ${roundId}: ${winners.length} winner(s)`);
-      winners.forEach((w, i) => console.log(`  rank ${i + 1}: ${w.toBase58()}  ${PRIZE_SOL[i] ?? 0} SOL`));
-
-      const treasuryKey = process.env.TREASURY_PRIVATE_KEY;
-      if (!treasuryKey) throw new Error("TREASURY_PRIVATE_KEY not set");
-      const treasury = Keypair.fromSecretKey(new Uint8Array(JSON.parse(treasuryKey)));
-      console.log(`  treasury : ${treasury.publicKey.toBase58()}`);
-
-      // --- guard: the on-chain marker, not a guess ------------------------------------
-      //
-      // This used to infer payment by intersecting the winner's and the treasury's transaction
-      // histories, because SOL prizes had no on-chain ledger. That inference had an unbounded
-      // forward window, so a winner who also won a LATER round read as proof the earlier one
-      // was settled, and it matched on ANY shared transaction rather than a transfer of the
-      // right size in the right direction. It could say "already paid" when nothing was paid.
-      //
-      // `pay_sol_prizes` now writes a PrizeDistribution marker atomically with the transfers,
-      // so for any round settled after that upgrade the question is a getAccountInfo.
-      const [prizeDist] = PublicKey.findProgramAddressSync(
-        [Buffer.from("prize_dist"), u64le(roundId)], program.programId);
-      if (await conn.getAccountInfo(prizeDist, "confirmed")) {
-        console.log(`\n  ALREADY PAID — PrizeDistribution marker exists for round ${roundId}.`);
-        console.log(`  Refusing to double-pay.`);
-        return;
-      }
-
-      // THE MARKER IS ONLY AUTHORITATIVE GOING FORWARD. Rounds paid BEFORE the marker shipped
-      // have no marker and never will, so "no marker" does not mean "unpaid" for them — it
-      // means "unknowable from chain state". Paying one of those again is real money, so this
-      // refuses to guess and makes the operator assert it, having checked by hand.
-      //
-      // `PRIZE_MARKER_FIRST_ROUND` is the first round opened after the upgrade; anything below
-      // it predates the ledger. Raise it, never lower it.
-      if (roundId < PRIZE_MARKER_FIRST_ROUND && process.env.BACKFILL !== "1") {
-        console.log(`\n  ROUND ${roundId} PREDATES THE ON-CHAIN PRIZE LEDGER.`);
-        console.log(`  No PrizeDistribution marker exists, and for a pre-upgrade round that is`);
-        console.log(`  NOT evidence it went unpaid — the old flow paid prizes and recorded`);
-        console.log(`  nothing. Verify by hand (check the treasury's transfers to each winner`);
-        console.log(`  around ${new Date(r.endTime.toNumber() * 1000).toISOString()}), then`);
-        console.log(`  re-run with BACKFILL=1 to override.`);
-        console.log(`  Winners: ${winners.map((w) => w.toBase58()).join(", ")}`);
-        return;
-      }
-      if (roundId < PRIZE_MARKER_FIRST_ROUND) {
-        console.log(`\n  BACKFILL=1 — paying a pre-ledger round on the operator's assertion.`);
-      }
-
-      const total = winners.reduce((sum, _w, i) => sum + (PRIZE_SOL[i] ?? 0), 0);
-      const bal = (await conn.getBalance(treasury.publicKey)) / LAMPORTS_PER_SOL;
-      console.log(`  owed     : ${total} SOL   (treasury holds ${bal.toFixed(4)})`);
-      if (bal < total + 0.01) throw new Error("treasury balance too low");
-      if (dry) { console.log("\n  [dry run — nothing sent]"); return; }
-
-      // Post-ledger rounds go through the program, so the payout and its receipt are one
-      // transaction. Pre-ledger backfills fall back to bare transfers: `pay_sol_prizes` would
-      // write a marker dated today for money that may have moved weeks ago, which is a worse
-      // lie than no marker at all.
-      if (roundId >= PRIZE_MARKER_FIRST_ROUND) {
-        const entries: PK[] = [];
-        for (const e of [r.top1, r.top2, r.top3] as PK[]) {
-          if (!e.equals(PublicKey.default)) entries.push(e);
-        }
-        const tx = await program.methods
-          .paySolPrizes(winners.map((_w, i) =>
-            new BN(Math.round((PRIZE_SOL[i] ?? 0) * LAMPORTS_PER_SOL))))
-          .accountsPartial({
-            authority: authority.publicKey, treasury: treasury.publicKey,
-            config: configPda, round, prizeDistribution: prizeDist,
-          })
-          .remainingAccounts(entries.flatMap((e, i) => [
-            { pubkey: e, isSigner: false, isWritable: false },
-            { pubkey: winners[i], isSigner: false, isWritable: true },
-          ]))
-          .transaction();
-        const sig = await sendTxHttp(tx, `paySolPrizes(${roundId})`, undefined, [treasury]);
-        console.log(`    paid ${total} SOL and wrote the marker  ${sig ?? ""}`);
-      } else {
-        for (let i = 0; i < winners.length; i++) {
-          const sol = PRIZE_SOL[i] ?? 0;
-          if (sol <= 0) continue;
-          const tx = new anchor.web3.Transaction().add(SystemProgram.transfer({
-            fromPubkey: treasury.publicKey, toPubkey: winners[i],
-            lamports: Math.round(sol * LAMPORTS_PER_SOL),
-          }));
-          const sig = await sendTxHttp(tx, `prize rank ${i + 1} (${sol} SOL)`, treasury);
-          console.log(`    rank ${i + 1} -> ${winners[i].toBase58()}  ${sol} SOL  ${sig ?? ""}`);
-        }
-      }
-      console.log(`\nRound ${roundId}: paid ${total} SOL to ${winners.length} winner(s).`);
-      return;
-    }
-
-    // ------------------------------------------------------------ LIST-OPERATORS
     if (COMMAND === "list-operators") {
       console.log(`\n=== Operators ===`);
       console.log(`Authority : ${cfg.authority.toBase58()}`);

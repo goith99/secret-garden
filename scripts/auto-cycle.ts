@@ -7,11 +7,11 @@
  *   1. close_round   (skipped if the round is already closed/finalized)
  *   2. score         (auto-score every unscored CompetitionEntry)
  *   3. bracket reveal (partition -> shard reveals -> final reveal -> apply)
- *   3b. distribute   (pay the SOL prize pool from the Treasury to the top 3 winners)
+ *   3b. distribute   (pay the round's $SGD pot to the top 3 winners)
  *   4. finalize_round
  *   5. open_round    (open the next round)
  *
- * REVEAL IS A BRACKET, NOT ONE CALL. `queue_reveal_top3` is retired from this script: Arcium
+ * REVEAL IS A BRACKET, NOT ONE CALL. The monolithic reveal is deleted entirely: Arcium
  * rejects a queue_computation referencing 15+ distinct accounts (error 6202), and the program
  * caps that path at MAX_PARTICIPANTS = 16 — so a real round (round 50 drew 91 entries) could
  * never be revealed by it. Every round now goes through the bracket, whose shape depends only
@@ -40,17 +40,16 @@
  * KEYPAIRS: Railway has no persistent secret filesystem, so both keys come from env vars as
  * Solana-CLI JSON array strings (e.g. "[12,34,...]"). Each is parsed, written to its OWN 0600
  * temp file under /tmp ONLY, used to load the Keypair, and unlinked on exit. Keys are never
- * logged. The OPERATOR key signs the program instructions (cycle); the separate TREASURY key
- * signs only the prize transfers. They are never mixed into the same variable or file.
+ * logged. The OPERATOR key signs every program instruction; it is the only key this script
+ * loads.
  *
- * PRIZE POOL: after a successful reveal_top3 and BEFORE finalize, the Treasury pays
- * 0.5 SOL to each of the rank 1 / 2 / 3 winner wallets. Transfers are sequential and
- * independent — one failure is logged for manual retry and does NOT stop the rest of the
+ * PRIZE: the round's $SGD pot, paid AFTER finalize by distribute_pot and guarded by the
+ * RoundSettlement state so a crashed or resumed run cannot double-pay. There is no SOL prize —
+ * it was an external treasury subsidy that paid out free SOL on rounds nobody competed in.
  * cycle (close/score/reveal/finalize/open still complete).
  *
  * ENV VARS:
  *   OPERATOR_PRIVATE_KEY  (required) JSON array string of the operator's 64-byte secret key
- *   TREASURY_PRIVATE_KEY  (required) JSON array string of the treasury's 64-byte secret key
  *   HELIUS_RPC_URL        (required) RPC for transactions + single-account reads
  *   ARCIUM_CLUSTER_OFFSET (default 456)
  *   SUPABASE_URL          (optional) round-history write (same pattern as operator.ts)
@@ -58,7 +57,6 @@
  *
  * Run locally (NEVER commit the keys):
  *   export OPERATOR_PRIVATE_KEY='[...]'
- *   export TREASURY_PRIVATE_KEY='[...]'
  *   export HELIUS_RPC_URL='https://...'
  *   export ARCIUM_CLUSTER_OFFSET=456
  *   node scripts/auto-cycle.ts        # Node 22 strips TS types natively
@@ -87,44 +85,19 @@ const ROUND_STATUS_NAME = ["OPEN", "CLOSED", "FINALIZED"];
 // is worse than skipping a day).
 const MIN_BALANCE_SOL = 0.5;
 
-// Prize pool: SOL paid from the Treasury to the rank 1/2/3 winners, in that order. Indexed
-// by (rank - 1).
 /**
- * First round whose SOL prizes are recorded by an on-chain `PrizeDistribution` marker.
- *
- * Anything BELOW this predates the ledger: those rounds were paid by bare treasury transfers
- * that recorded nothing, so the ABSENCE of a marker says nothing about whether they were paid.
- * The backlog scan below must never reach them, or it would pay them a second time.
- *
- * 73, not 72. The upgrade landed 2026-08-31T04:13Z, but Railway only picked it up after the
- * push at ~11:15Z — by which time the 10:01Z cycle had already paid round 72 through the OLD
- * code path. Round 73 is the first round the marker-writing code actually processed. Verified
- * against the treasury's parsed transfer history: rounds 70, 71 and 72 each show 0.5 SOL
- * reaching every winner at 10:01 on their close day; round 73 shows nothing.
+ * First round whose $SGD pot settlement is recorded on-chain by `RoundSettlement`. Anything
+ * below this predates the account, so the absence of one says nothing about whether that
+ * round's pot was paid — the backlog scan must never reach them.
  */
-const PRIZE_LEDGER_FIRST_ROUND = 73;
+const POT_LEDGER_FIRST_ROUND = 73;
 
-const PRIZE_SOL = [0.5, 0.5, 0.5];
-// Minimum Treasury balance required before the cycle runs — at least one day's full prize
-// pool (0.5 + 0.5 + 0.5 = 1.5 SOL), plus the same 0.1 SOL absolute headroom the previous
-// 10-SOL-pool gate carried. Transfer fees come from that headroom (three transfers cost
-// ~0.000015 SOL, so 0.1 is deliberately generous); a per-payout shortfall is caught and
-// logged for retry.
-const MIN_TREASURY_SOL = 1.6;
-
-// The ONLY treasury this script may ever spend from — PRODUCTION's live wallet.
-//
-// WHY THIS EXISTS. The treasury key arrives at runtime through TREASURY_PRIVATE_KEY, and this
-// script is byte-identical in the dev and production repos. Nothing else pins, names or checks
-// which wallet that env var holds, so the two environments were separated only by whichever
-// value happened to be exported in the invoking shell. This constant makes a cross-environment
-// mixup impossible rather than merely unlikely — in BOTH directions: it equally refuses a dev
-// key here, which would otherwise pay real winners from a test wallet and silently under-fund
-// or fail the payout.
-//
-// If you are deliberately rotating the production treasury, change THIS value — do not remove
-// the check.
-const TREASURY_PUBKEY = "Dp9E6VLzcDM8gWuieJuGChBDsnEDWH71HiEXeYsgB9rJ";
+// The SOL prize is GONE. It was an external treasury subsidy, and because the pot splits
+// between k = min(participants, 3) winners, at three entrants or fewer every entrant won and
+// was refunded in full — so it paid free SOL for turning up unopposed, which rounds 69 and 72
+// did naturally. The $SGD pot is the whole prize now, and the pot is the entrants' own fees,
+// so it cannot be farmed. PRIZE_SOL, MIN_TREASURY_SOL, the treasury pin and the prize-ledger
+// cutover went with it.
 
 // --- bracket-reveal constants (mirror programs/secret-garden/src/constants.rs) ----------
 // Changing one here without changing it there produces a partition the program rejects.
@@ -379,9 +352,7 @@ const REVEAL_CU_LIMIT = 250_000;
 
 // Each key is materialized here (under /tmp ONLY — never the project dir) and removed on
 // exit. 0600 so only the process owner can read it. The operator key (cycle signer) and the
-// treasury key (prize payer) are kept in SEPARATE files and SEPARATE variables.
 const OPERATOR_KEYPAIR_PATH = path.join("/tmp", "operator-keypair.json");
-const TREASURY_KEYPAIR_PATH = path.join("/tmp", "treasury-keypair.json");
 
 // Remove BOTH temp keys AND the single-instance lock on ANY exit — including the early
 // process.exit() paths (low balance, fatal validation) that never reach main()'s catch, and
@@ -391,9 +362,7 @@ const TREASURY_KEYPAIR_PATH = path.join("/tmp", "treasury-keypair.json");
 // Synchronous, best-effort. (SIGKILL is the one case nothing can clean up — that is precisely
 // what LOCK_STALE_SECONDS exists for.)
 process.on("exit", () => {
-  for (const p of [OPERATOR_KEYPAIR_PATH, TREASURY_KEYPAIR_PATH]) {
-    try { fs.unlinkSync(p); } catch { /* never written, or already gone */ }
-  }
+  try { fs.unlinkSync(OPERATOR_KEYPAIR_PATH); } catch { /* never written, or already gone */ }
   releaseLock();
 });
 
@@ -476,7 +445,7 @@ async function rpcRead<T>(label: string, fn: () => Promise<T>): Promise<T> {
  * Parse a Solana-CLI JSON-array secret key from `envVar`, write it to a 0600 temp file at
  * `tmpPath` (under /tmp ONLY), and load the Keypair FROM that file path. Exits immediately on
  * any problem. The key material itself is never logged. Used independently for the operator
- * key and the treasury key — each gets its own env var, temp file, and returned variable.
+ * key. (A separate treasury key existed while SOL prizes did; it is no longer loaded.)
  */
 function loadKeypairFromEnv(envVar: string, tmpPath: string): anchor.web3.Keypair {
   const raw = process.env[envVar];
@@ -655,20 +624,6 @@ interface WinnerRow {
   generation: number;
 }
 
-interface PrizeResult {
-  rank: number;
-  wallet: string;
-  amountSol: number;
-  ok: boolean;
-  error?: string;
-}
-
-/**
- * What the cycle ACTUALLY did. Every field is either a stage this run performed, or null/false
- * because it did not — the previous shape conflated "the round this cycle looked at" with "the
- * stage this cycle ran", so a cycle that only opened the next round still printed
- * "Round closed: 50 (91 entries)" and "Entries scored: 0" for a round it never touched.
- */
 interface CycleSummary {
   /** The round this cycle worked on, whatever it did to it. Never implies an action. */
   processedRound: number | null;
@@ -682,12 +637,9 @@ interface CycleSummary {
   scoredThisRun: number;
   /** ALWAYS player wallets, resolved through the entry→player map on every path. */
   top3: string[];
-  prizes: PrizeResult[];
   /** True when the reveal ran in a PRIOR run. No longer affects whether payouts happen —
    *  the on-chain markers decide that — but still worth reporting. */
   revealedPreviously: boolean;
-  /** Step 4b found a PrizeDistribution marker and correctly did nothing. */
-  prizesAlreadyPaid: boolean;
   /** Step 4b found the pot already settled and correctly did nothing. */
   potAlreadySettled: boolean;
   /** $SGD actually paid out of the round's pot by this run. */
@@ -708,31 +660,10 @@ interface CycleSummary {
 
 async function main(): Promise<void> {
   // --- secrets + RPC wiring -------------------------------------------------
-  // Load BOTH keys up-front (fail fast). Treasury must be ready BEFORE the cycle starts —
-  // the cycle is effectively atomic, so we never want to close/score/reveal a round and only
-  // THEN discover the treasury key is missing/invalid. Separate vars, separate temp files.
   const signer = loadKeypairFromEnv("OPERATOR_PRIVATE_KEY", OPERATOR_KEYPAIR_PATH);
-  // A PREFLIGHT_ONLY run reads chain state and spends nothing, so it has no spending
-  // preconditions and does not need spending credentials. Demanding the treasury key would put
-  // the circuit-freshness check out of reach of everyone except whoever holds it — the opposite
-  // of making staleness visible. The pin below still runs whenever a key IS supplied, so this
-  // relaxes who may RUN the check, never which wallet may be paid from.
+  // No treasury key any more: the SOL prize is gone, so this script spends only the
+  // operator's own lamports (transaction fees, and the rent it pays for settlements and ATAs).
   const preflightOnly = process.env.PREFLIGHT_ONLY === "1";
-  const treasuryUnused = preflightOnly && !process.env.TREASURY_PRIVATE_KEY;
-  const treasury = treasuryUnused
-    ? signer
-    : loadKeypairFromEnv("TREASURY_PRIVATE_KEY", TREASURY_KEYPAIR_PATH);
-  // Prove the supplied key is THIS environment's treasury before anything can be spent. Runs
-  // before any RPC, any round state change and any transfer, so a wrong key costs nothing.
-  if (!treasuryUnused && treasury.publicKey.toBase58() !== TREASURY_PUBKEY) {
-    fatal(
-      `TREASURY_PRIVATE_KEY is the WRONG WALLET for this environment.\n` +
-        `  supplied: ${treasury.publicKey.toBase58()}\n` +
-        `  expected: ${TREASURY_PUBKEY}  (production)\n` +
-        `Refusing to run. This is the PRODUCTION repo — check you have not exported the dev ` +
-        `treasury key into this shell.`,
-    );
-  }
 
   const heliusUrl = process.env.HELIUS_RPC_URL;
   if (!heliusUrl || heliusUrl.trim() === "") {
@@ -762,23 +693,9 @@ async function main(): Promise<void> {
     [Buffer.from("config")], program.programId)[0];
   const roundPda = (id: number) => PublicKey.findProgramAddressSync(
     [Buffer.from("round"), u64le(id)], program.programId)[0];
-  /** Marker proving a round's SOL prizes were paid. Its existence is the only guard needed. */
-  const prizeDistPda = (id: number) => PublicKey.findProgramAddressSync(
-    [Buffer.from("prize_dist"), u64le(id)], program.programId)[0];
   /** The one account that says what happened to a round's $SGD pot. */
   const settlementPda = (id: number) => PublicKey.findProgramAddressSync(
     [Buffer.from("round_settlement"), u64le(id)], program.programId)[0];
-  /**
-   * Was this round's SOL prize pool already paid?
-   *
-   * THIS REPLACES THE DOUBLE-PAY GUARD. The old one was process-local control flow — prizes
-   * counted as paid if and only if THIS invocation had just performed the reveal — so a manual
-   * reveal, a crashed run or a resumed run all fell through to "not paid by me" and nothing
-   * ever picked them up. That is how rounds 63, 65 and 67 came to owe their winners. There is
-   * now an on-chain marker, so the question is a `getAccountInfo` and the answer is a fact.
-   */
-  const prizesAlreadyPaid = async (id: number): Promise<boolean> =>
-    (await conn.getAccountInfo(prizeDistPda(id), "confirmed")) !== null;
   /** 0 = none, 1 = refund in progress, 2 = paid to winners, 3 = refunded to entrants. */
   const settlementState = async (id: number): Promise<number> => {
     const acc: any = await program.account.roundSettlement.fetchNullable(settlementPda(id));
@@ -871,13 +788,13 @@ async function openRoundPotAccounts(nextRoundId: number) {
 
   // ---- HTTP-only send + confirm (no WebSocket on this Helius endpoint) ----
   // `payer` is the fee-payer + sole signer for the tx; defaults to the operator `signer` for
-  // program instructions, but prize transfers pass the `treasury` keypair instead.
+  // program instructions; always the operator now that no payout comes from a second wallet.
   async function sendTxHttp(
     tx: anchor.web3.Transaction,
     label: string,
     payer: anchor.web3.Keypair = signer,
-    // Co-signers beyond the fee payer. `pay_sol_prizes` needs the treasury's signature for
-    // the lamports it moves, while the operator still pays the fee and the marker rent.
+    // Co-signers beyond the fee payer. Unused now that there is no SOL prize; kept because
+    // the parameter is harmless and a future instruction may need it.
     extraSigners: anchor.web3.Keypair[] = [],
   ): Promise<string> {
     for (let attempt = 1; attempt <= 6; attempt++) {
@@ -1505,59 +1422,8 @@ async function openRoundPotAccounts(nextRoundId: number) {
     console.log(wrote ? `  Results saved to Supabase` : `  Results were already published to Supabase`);
   }
 
-  // Pay the SOL prize pool from the Treasury to each winner wallet, sequentially (rank 1, then
   // 2, then 3). Each transfer is independent: a failure is logged and recorded but does NOT
   // abort the others or the surrounding cycle — a failed payout is surfaced for MANUAL retry.
-  async function distributePrizes(
-    roundId: number,
-    winners: { rank: number; wallet: PK; entry: PK }[],
-  ): Promise<PrizeResult[]> {
-    // Amounts first, transfers second. Both used to happen per winner in a loop of bare
-    // SystemProgram transfers, which is why a partial failure could leave a round half-paid
-    // with nothing on-chain recording which half. `pay_sol_prizes` takes the whole set at once:
-    // the transfers and the PrizeDistribution marker are one instruction, so the round is
-    // either fully paid AND marked, or neither.
-    //
-    // FLAT amounts. Production pays PRIZE_SOL by rank with no rarity multiplier — dev scales
-    // by rarity and this deliberately does not, because the two deployments have always paid
-    // differently and this change is not the place to reconcile that.
-    const results: PrizeResult[] = [];
-    const amounts: bigint[] = [];
-    for (const w of winners) {
-      const sol = PRIZE_SOL[w.rank - 1] ?? 0;
-      amounts.push(BigInt(Math.round(sol * LAMPORTS_PER_SOL)));
-      console.log(`    rank ${w.rank}: ${sol} SOL to ${w.wallet.toBase58()}`);
-      results.push({ rank: w.rank, wallet: w.wallet.toBase58(), amountSol: sol, ok: false });
-    }
-
-    try {
-      const tx = await program.methods
-        .paySolPrizes(amounts.map((a) => new BN(a.toString())))
-        .accountsPartial({
-          authority: signer.publicKey,
-          treasury: treasury.publicKey,
-          config: configPda,
-          round: roundPda(roundId),
-          prizeDistribution: prizeDistPda(roundId),
-        })
-        .remainingAccounts(winners.flatMap((w) => [
-          { pubkey: w.entry, isSigner: false, isWritable: false },
-          { pubkey: w.wallet, isSigner: false, isWritable: true },
-        ]))
-        .transaction();
-      // Operator pays the fee and the marker rent; the treasury signs for its own lamports.
-      const sig = await sendTxHttp(tx, `paySolPrizes(${roundId})`, undefined, [treasury]);
-      console.log(`  ✓ paid ${winners.length} winner(s) and wrote the marker (sig ${short(sig)})`);
-      for (const x of results) x.ok = true;
-    } catch (e) {
-      const msg = (e as Error).message;
-      console.error(`  ✗ SOL PRIZE PAYOUT FAILED for round ${roundId} — ${msg}`);
-      console.error(`    Nothing was paid and no marker was written, so the next cycle retries`);
-      console.error(`    this round automatically. No manual reconciliation needed.`);
-      for (const x of results) x.error = msg;
-    }
-    return results;
-  }
 
   /**
    * Settle EVERY finalized round that still owes money, not just the one this run processed.
@@ -1571,42 +1437,32 @@ async function openRoundPotAccounts(nextRoundId: number) {
    *
    * The scan runs BEFORE the close gate precisely so that early return cannot skip it. It is
    * purely marker-driven: a round is owed if it is FINALIZED, revealed, has winners, and has no
-   * `PrizeDistribution` / terminal `RoundSettlement`. No transaction-history inference, no
+   * a terminal `RoundSettlement`. No transaction-history inference, no
    * signature intersection — those were the guards this whole design replaced.
    *
-   * Bounded below by `PRIZE_LEDGER_FIRST_ROUND`, which is what stops it walking back into
+   * Bounded below by `POT_LEDGER_FIRST_ROUND`, which is what stops it walking back into
    * rounds the marker cannot speak for and paying them twice.
    */
   async function settleBacklog(currentRound: number): Promise<void> {
     const ids: number[] = [];
-    for (let i = PRIZE_LEDGER_FIRST_ROUND; i <= currentRound; i++) ids.push(i);
+    for (let i = POT_LEDGER_FIRST_ROUND; i <= currentRound; i++) ids.push(i);
     if (!ids.length) return;
 
-    // Two batched reads rather than 2N round-trips, so this stays cheap as the ledger grows.
-    const markers = await conn.getMultipleAccountsInfo(ids.map(prizeDistPda), "confirmed");
+    // One batched read rather than N round-trips, so this stays cheap as the ledger grows.
     const settles = await conn.getMultipleAccountsInfo(ids.map(settlementPda), "confirmed");
-    const owing = ids.filter((_id, i) => markers[i] === null || settles[i] === null);
+    const owing = ids.filter((_id, i) => settles[i] === null);
     if (!owing.length) return;
 
-    console.log(`\n[backlog] ${owing.length} round(s) with an unwritten payout record: ${owing.join(", ")}`);
+    console.log(`\n[backlog] ${owing.length} round(s) with an unsettled pot: ${owing.join(", ")}`);
     for (const id of owing) {
-      const i = ids.indexOf(id);
       const r: any = await program.account.competitionRound.fetch(roundPda(id)).catch(() => null);
       if (!r) continue;
       if (r.status !== ROUND_STATUS_FINALIZED || !r.scoringRevealed) continue;
       const winners = await resolveWinnerWallets(roundPda(id), r);
       if (!winners.length) continue;
-
-      if (markers[i] === null) {
-        console.log(`[backlog] round ${id}: SOL prizes unpaid — paying ${winners.length} winner(s)`);
-        const res = await distributePrizes(id, winners);
-        summary.backlogPaid.push(`round ${id} SOL: ${res.every((x) => x.ok) ? "paid" : "FAILED"}`);
-      }
-      if (settles[i] === null) {
-        console.log(`[backlog] round ${id}: pot unsettled — distributing`);
-        const res = await distributeSgdPot(id, winners);
-        summary.backlogPaid.push(`round ${id} pot: ${res.ok ? `${res.paidSgd} SGD` : "FAILED"}`);
-      }
+      console.log(`[backlog] round ${id}: pot unsettled — distributing`);
+      const res = await distributeSgdPot(id, winners);
+      summary.backlogPaid.push(`round ${id} pot: ${res.ok ? `${res.paidSgd} SGD` : "FAILED"}`);
     }
   }
 
@@ -1660,14 +1516,13 @@ async function openRoundPotAccounts(nextRoundId: number) {
     }
   }
 
-  // --- balance gates (operator fees + treasury prize pool) ------------------
+  // --- balance gate (operator fees) ----------------------------------------
   // Both checked BEFORE any cycle work so a low balance skips the day cleanly rather than
   // closing a round and then stalling.
   console.log(`\n=== Secret Garden — AUTO-CYCLE (cluster ${arciumEnv.arciumClusterOffset}) ===`);
   console.log(`  revision        : ${runningRevision()}`);
   console.log(`  program         : ${program.programId.toBase58()}`);
   console.log(`  operator wallet : ${signer.publicKey.toBase58()}`);
-  console.log(`  treasury wallet : ${treasuryUnused ? "(not supplied — pre-flight only)" : treasury.publicKey.toBase58()}`);
 
   // Both balance gates ask "can this wallet afford a cycle?", which a pre-flight never runs.
   // Skipping them keeps the check usable on an under-funded or read-only checkout — the point
@@ -1683,18 +1538,6 @@ async function openRoundPotAccounts(nextRoundId: number) {
     process.exit(1);
   }
   if (!preflightOnly) console.log(`  operator balance: ${startSol.toFixed(4)} SOL (>= ${MIN_BALANCE_SOL} minimum) — proceeding`);
-
-  const treasuryStartSol = preflightOnly ? 0 : (await rpcRead("treasury balance",
-    () => conn.getBalance(treasury.publicKey, "confirmed"))) / LAMPORTS_PER_SOL;
-  if (!preflightOnly && treasuryStartSol < MIN_TREASURY_SOL) {
-    console.error(
-      `\nACTION REQUIRED — LOW TREASURY BALANCE: treasury wallet ${treasury.publicKey.toBase58()} ` +
-      `holds ${treasuryStartSol.toFixed(4)} SOL, below the ${MIN_TREASURY_SOL} SOL minimum ` +
-      `(one day's prize pool is ${PRIZE_SOL.reduce((a, b) => a + b, 0)} SOL).`);
-    console.error(`Top up the treasury, then the next scheduled run will proceed. Skipping the cycle.`);
-    process.exit(1);
-  }
-  if (!preflightOnly) console.log(`  treasury balance: ${treasuryStartSol.toFixed(4)} SOL (>= ${MIN_TREASURY_SOL} minimum) — proceeding`);
 
   // --- authorization: wallet must be the config authority or a registered operator ------
   // Same retry as the balance gates: this is the third of the three opening reads, and an
@@ -1889,8 +1732,8 @@ async function openRoundPotAccounts(nextRoundId: number) {
   const current = cfg.currentRound.toNumber();
   const summary: CycleSummary = {
     processedRound: null, entryCount: null, closedRound: null,
-    scoredCount: 0, scoredThisRun: 0, top3: [], prizes: [],
-    revealedPreviously: false, prizesAlreadyPaid: false, potAlreadySettled: false,
+    scoredCount: 0, scoredThisRun: 0, top3: [],
+    revealedPreviously: false, potAlreadySettled: false,
     potPaidSgd: 0, prizeSkipReason: null, backlogPaid: [], externallyFinalized: false,
     finalizedRound: null, openedRound: null,
   };
@@ -1901,7 +1744,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
     console.log(`\n[open] no round has ever been opened — opening round 1`);
     await openNextRound(0);
     summary.openedRound = 1;
-    printSummary(summary, await balanceSol(), await treasuryBalanceSol());
+    printSummary(summary, await balanceSol());
     return;
   }
 
@@ -1963,7 +1806,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
     );
     console.log(`     Nothing to do until then. This run was off-schedule (a redeploy runs a`);
     console.log(`     full cycle immediately), and an off-schedule run must never close a live round.`);
-    printSummary(summary, await balanceSol(), await treasuryBalanceSol());
+    printSummary(summary, await balanceSol());
     return;
   } else {
     console.log(`  ↪ skipping close — round already ${ROUND_STATUS_NAME[r.status]}`);
@@ -2066,36 +1909,26 @@ async function openRoundPotAccounts(nextRoundId: number) {
   // manually revealed round, a resumed run and a crashed run all now converge here and get
   // paid, instead of each falling through a different branch into silence.
   //
-  // Both payouts are attempted independently. SOL comes from the treasury and $SGD from the
+  // The pot is the only payout now; it comes from the round's own vault, and a failure
   // round's own pot vault; a failure in one must not block the other, and neither leaves a
   // marker behind unless it actually moved the money.
   r = await program.account.competitionRound.fetch(round);
   if (!r.scoringRevealed) {
-    console.log(`\n[payouts] skipping — round ${current} was never revealed, so it has no winners`);
+    console.log(`\n[pot] skipping — round ${current} was never revealed, so it has no winners`);
     summary.prizeSkipReason = "round never revealed";
   } else {
     const winnerWallets = await resolveWinnerWallets(round, r);
     if (!winnerWallets.length) {
-      console.log(`\n[payouts] skipping — round ${current} revealed no winners`);
+      console.log(`\n[pot] skipping — round ${current} revealed no winners`);
       summary.prizeSkipReason = "no winners";
+    } else if ((await settlementState(current)) !== 0) {
+      console.log(`\n[pot] skipping — round ${current}'s pot is already settled`);
+      summary.potAlreadySettled = true;
     } else {
-      if (await prizesAlreadyPaid(current)) {
-        console.log(`\n[payouts] SOL: already paid (PrizeDistribution marker on-chain)`);
-        summary.prizesAlreadyPaid = true;
-      } else {
-        console.log(`\n[payouts] SOL: paying ${winnerWallets.length} winner(s) for round ${current}...`);
-        summary.prizes = await distributePrizes(current, winnerWallets);
-      }
-      const st = await settlementState(current);
-      if (st !== 0) {
-        console.log(`[payouts] $SGD: already settled (state ${st})`);
-        summary.potAlreadySettled = true;
-      } else {
-        console.log(`[payouts] $SGD: distributing round ${current}'s pot...`);
-        const res = await distributeSgdPot(current, winnerWallets);
-        summary.potPaidSgd = res.paidSgd;
-        if (!res.ok) summary.potError = res.error;
-      }
+      console.log(`\n[pot] distributing round ${current}'s pot to ${winnerWallets.length} winner(s)...`);
+      const res = await distributeSgdPot(current, winnerWallets);
+      summary.potPaidSgd = res.paidSgd;
+      if (!res.ok) summary.potError = res.error;
     }
   }
 
@@ -2104,10 +1937,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
   await openNextRound(current);
   summary.openedRound = current + 1;
 
-  // Log treasury balance after distribution (per spec) and include it in the summary.
-  const treasuryEndSol = await treasuryBalanceSol();
-  console.log(`\n[treasury] balance after distribution: ${treasuryEndSol.toFixed(4)} SOL`);
-  printSummary(summary, await balanceSol(), treasuryEndSol);
+  printSummary(summary, await balanceSol());
 
   // --- local helpers that close over the wired-up program/provider ----------
   async function openNextRound(currentRound: number): Promise<void> {
@@ -2133,13 +1963,9 @@ async function openRoundPotAccounts(nextRoundId: number) {
       () => conn.getBalance(signer.publicKey, "confirmed"))) / LAMPORTS_PER_SOL;
   }
 
-  async function treasuryBalanceSol(): Promise<number> {
-    return (await rpcRead("treasury balance",
-      () => conn.getBalance(treasury.publicKey, "confirmed"))) / LAMPORTS_PER_SOL;
-  }
 }
 
-function printSummary(s: CycleSummary, operatorSol: number, treasurySol: number): void {
+function printSummary(s: CycleSummary, operatorSol: number): void {
   const line = "─".repeat(48);
   console.log(`\n${line}`);
   console.log(`AUTO-CYCLE COMPLETE`);
@@ -2154,35 +1980,16 @@ function printSummary(s: CycleSummary, operatorSol: number, treasurySol: number)
     + ` (round total on-chain: ${s.scoredCount}${s.entryCount === null ? "" : `/${s.entryCount}`})`);
   console.log(`  Top 3 (wallets)    : ${s.top3.length ? "" : "—"}`);
   s.top3.forEach((w, i) => console.log(`    ${i + 1}. ${w}`));
-  const noPayoutReason = s.prizesAlreadyPaid
-    ? "— already paid (PrizeDistribution marker on-chain)"
-    : s.prizeSkipReason
-      ? `— (${s.prizeSkipReason})`
-      : "— (no payouts this run)";
-  console.log(`  SOL prizes         : ${s.prizes.length ? "" : noPayoutReason}`);
-  s.prizes.forEach((p) =>
-    console.log(`    rank ${p.rank}: ${p.amountSol} SOL -> ${p.wallet}  [${p.ok ? "SENT" : "FAILED"}]`
-      + (p.ok || !p.error ? "" : ` (${p.error})`)));
-  if (s.backlogPaid.length) {
-    console.log(`  Backlog settled    :`);
-    s.backlogPaid.forEach((b) => console.log(`    ${b}`));
-  }
   console.log(`  $SGD pot           : ${
     s.potAlreadySettled ? "— already settled (RoundSettlement on-chain)"
       : s.potError ? `FAILED (${s.potError}) — next cycle retries`
         : s.potPaidSgd > 0 ? `${s.potPaidSgd} SGD paid to winners`
           : "— (nothing to distribute)"}`);
-  const failed = s.prizes.filter((p) => !p.ok);
-  if (failed.length) {
-    console.log(`    ⚠ ${failed.length} payout(s) FAILED — the next cycle retries automatically: `
-      + failed.map((p) => `rank ${p.rank} (${p.amountSol} SOL -> ${p.wallet})`).join(", "));
-  }
   console.log(`  Round finalized    : ${s.finalizedRound === null
     ? (s.externallyFinalized ? "— (was already finalized externally)" : "— (not finalized by this run)")
     : s.finalizedRound}`);
   console.log(`  New round opened   : ${s.openedRound ?? "—"}`);
   console.log(`  Operator balance   : ${operatorSol.toFixed(4)} SOL`);
-  console.log(`  Treasury balance   : ${treasurySol.toFixed(4)} SOL`);
   if (s.externallyFinalized) {
     console.log(line);
     console.log(`  ⚠ Round ${s.processedRound} was finalized OUTSIDE auto-cycle. No prizes were`);

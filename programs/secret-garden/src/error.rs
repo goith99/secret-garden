@@ -64,7 +64,7 @@ pub enum SecretGardenError {
     ExperimentAlreadyResolved,
 
     // --- Stage 4A: scoring ---
-    /// `queue_reveal_top3` called before every entry in the round was scored.
+    /// A reveal was queued before every entry in the round was scored.
     #[msg("Not all entries have been scored yet")]
     ScoringIncomplete,
     /// The round's scoring has already been revealed/finalized.
@@ -75,7 +75,7 @@ pub enum SecretGardenError {
     /// `queue_score_entry` called for an entry that has already been scored.
     #[msg("This entry has already been scored")]
     EntryAlreadyScored,
-    /// `queue_reveal_top3` received the wrong number of entry accounts (must equal the
+    /// A reveal queue instruction received the wrong number of entry accounts (must equal the
     /// round's participant_count).
     #[msg("Wrong number of entry accounts for the round")]
     WrongEntryCount,
@@ -297,14 +297,6 @@ pub enum SecretGardenError {
     /// A passed entry account belongs to a different round than the one being settled.
     #[msg("Entry belongs to a different round")]
     EntryWrongRound,
-    /// The treasury holds fewer lamports than the payout needs. Checked up front so the
-    /// failure names the problem instead of surfacing as a bare system-program error.
-    #[msg("Treasury does not hold enough SOL to pay this round's prizes")]
-    TreasuryUnderfunded,
-    /// A requested prize exceeds `SOL_PRIZE_MAX_LAMPORTS`. The ceiling exists so a mistyped or
-    /// malicious amount fails on-chain instead of emptying the treasury.
-    #[msg("Prize amount exceeds the per-winner ceiling")]
-    PrizeAmountTooLarge,
     /// A winner account does not match the wallet that placed the winning entry.
     #[msg("Payout destination does not match the winning entry's player")]
     WrongWinnerAccount,

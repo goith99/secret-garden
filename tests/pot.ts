@@ -6,6 +6,7 @@
  * every podium finisher breaks even at 3 entrants and profits above that.
  */
 import * as anchor from "@anchor-lang/core";
+import fs from "fs";
 import BN from "bn.js";
 import { assert, expect } from "chai";
 import { FIXED_UNIX_TS, Harness, ataFor, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "./harness.ts";
@@ -85,16 +86,6 @@ const ixRefund = (h: Harness, authority: PK, roundId: number, pairs: PK[], overr
     ...(override ?? {}),
   }).remainingAccounts(pairs.map((p) => ({ pubkey: p, isSigner: false, isWritable: true }))).instruction();
 
-const ixPayPrizes = (h: Harness, authority: PK, treasury: PK, roundId: number, pairs: PK[],
-                     amounts?: bigint[], override?: any) =>
-  h.program.methods.paySolPrizes(
-    (amounts ?? Array(pairs.length / 2).fill(500_000_000n)).map((a) => new BN(a.toString())),
-  ).accountsStrict({
-    authority, treasury, config: h.configPda(), round: h.roundPda(roundId),
-    prizeDistribution: h.prizeDistPda(roundId), systemProgram: h.systemProgram(),
-    ...(override ?? {}),
-  }).remainingAccounts(pairs.map((p) => ({ pubkey: p, isSigner: false, isWritable: true }))).instruction();
-
 const ixClosePotVault = (h: Harness, authority: PK, roundId: number, override?: any) =>
   h.program.methods.closePotVault().accountsStrict({
     authority, config: h.configPda(), round: h.roundPda(roundId),
@@ -161,16 +152,14 @@ const ERR_BATCH_LONG = "0x17b6"; // 6070 RefundBatchTooLong
 const ERR_REFUND_INCOMPLETE = "0x17b7"; // 6071 RefundIncomplete
 const ERR_NOT_SETTLED = "0x17b8"; // 6072 PotNotSettled
 const ERR_WRONG_ROUND = "0x17b9"; // 6073 EntryWrongRound
-const ERR_TREASURY_LOW = "0x17ba"; // 6074 TreasuryUnderfunded
-const ERR_PRIZE_TOO_BIG = "0x17bb"; // 6075 PrizeAmountTooLarge
-const ERR_WRONG_WINNER = "0x17bc"; // 6076 WrongWinnerAccount
+const ERR_WRONG_WINNER = "0x17ba"; // 6074 WrongWinnerAccount
 // Anchor built-in: a typed account that does not exist yet.
 const ERR_UNINIT = "0xbc4"; // 3012 AccountNotInitialized
 // Anchor built-in: a seed-derived account whose address does not match.
 const ERR_SEEDS = "0x7d6"; // 2006 ConstraintSeeds
 // Anchor built-in: an `associated_token::` pin that the passed account does not satisfy.
 const ERR_ASSOCIATED = "0x7d9"; // 2009 ConstraintAssociated
-const ERR_WRONG_DECIMALS = "0x17bd"; // 6077 WrongSgdDecimals
+const ERR_WRONG_DECIMALS = "0x17bb"; // 6075 WrongSgdDecimals
 // RoundSettlement.state values, mirroring the SETTLEMENT_* constants.
 const ST_NONE = 0, ST_REFUND_PENDING = 1, ST_PAID = 2, ST_REFUNDED = 3;
 const ERR_NOT_AUTHORITY = "0x1771"; // 6001 NotAuthority
@@ -1127,199 +1116,38 @@ describe("$SGD entry-fee pot", () => {
     });
   });
 
-  // -------------------------------------------------------------------------------------
-  // PART B — SOL prizes get a real on-chain receipt
-  // -------------------------------------------------------------------------------------
-  describe("pay_sol_prizes", () => {
-    const PRIZE = 500_000_000n;
-
-    /** A revealed round 1 with `k` winners, plus a funded treasury. */
-    async function revealedRound(k: number, treasurySol = 10) {
-      const { h, authority, players } = await bootstrap(k);
-      const subs = players.slice(0, k);
-      const entries: PK[] = [];
-      for (const p of subs) {
-        await h.send([await ixSubmit(h, p.publicKey, 1, 0)], [p]);
-        entries.push(h.entryPda(h.roundPda(1), p.publicKey));
-      }
-      await revealWith(h, 1, entries);
-      const treasury = h.fundedKeypair(treasurySol);
-      const pairs: PK[] = [];
-      subs.forEach((p, i) => { pairs.push(entries[i], p.publicKey); });
-      return { h, authority, players: subs, entries, treasury, pairs };
-    }
-    const sol = async (h: Harness, k: PK) => BigInt((await h.client.getAccount(k))!.lamports);
-
-    it("pays every revealed winner and records the payout on-chain", async () => {
-      const { h, authority, players, treasury, pairs } = await revealedRound(3);
-      const before = await Promise.all(players.map((p) => sol(h, p.publicKey)));
-      const tBefore = await sol(h, treasury.publicKey);
-
-      const r = await h.send([await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury]);
-      assert.isNull(r.result, `payout failed: ${r.result}`);
-
-      const after = await Promise.all(players.map((p) => sol(h, p.publicKey)));
-      // players[0] is the authority, which also pays fees and the marker rent, so only the
-      // non-payer winners are checked for an exact delta.
-      for (let i = 1; i < players.length; i++) {
-        expect(after[i]! - before[i]!).to.equal(PRIZE, `winner ${i} was not paid exactly 0.5 SOL`);
-      }
-      expect(tBefore - (await sol(h, treasury.publicKey))).to.equal(PRIZE * 3n,
-        "the treasury must be debited exactly the prize pool");
-
-      const m: any = await h.program.account.prizeDistribution.fetch(h.prizeDistPda(1));
-      expect(m.winnerCount).to.equal(3);
-      expect(BigInt(m.totalPaid.toString())).to.equal(PRIZE * 3n);
-      expect(m.treasury.toBase58()).to.equal(treasury.publicKey.toBase58());
+    // -------------------------------------------------------------------------------------
+    // Neither the SOL prize nor the monolithic reveal exists any more
+    // -------------------------------------------------------------------------------------
+    describe("removed instruction surface", () => {
+      it("REGRESSION (audit C-1 + H-4): the exploitable instructions are gone", () => {
+        // C-1: queue_reveal_top3 and its _v3 twin validated remaining_accounts with only
+        // "belongs to this round" and "is scored" — no ordering, no uniqueness — so an
+        // operator could pass the SAME entry participant_count times, have the circuit rank
+        // identical scores, tie-break on slot index, and write one entry into all three
+        // winner slots. distribute_pot does not dedup winners, so the whole pot paid out to a
+        // single wallet. Both deleted; the bracket, which always enforced strict ascent,
+        // subsumes them.
+        //
+        // H-4: pay_sol_prizes was an external treasury subsidy. The pot splits between
+        // k = min(entrants, 3) winners, so at three entrants or fewer EVERY entrant won and
+        // was refunded in full — the SOL on top was free money for turning up unopposed,
+        // which rounds 69 and 72 did naturally. Deleted rather than gated.
+        const idl = JSON.parse(fs.readFileSync("./target/idl/secret_garden.json", "utf8"));
+        const gone = (n: string) =>
+          idl.instructions.find((i: { name: string }) => i.name === n) === undefined;
+        expect(gone("queue_reveal_top3"), "queue_reveal_top3 must be gone").to.equal(true);
+        expect(gone("queue_reveal_top3_v3"), "queue_reveal_top3_v3 must be gone").to.equal(true);
+        expect(gone("reveal_top3_callback"), "reveal_top3_callback must be gone").to.equal(true);
+        expect(gone("pay_sol_prizes"), "pay_sol_prizes must be gone").to.equal(true);
+        expect(
+          idl.accounts.find((x: { name: string }) => x.name === "PrizeDistribution"),
+          "PrizeDistribution must be gone",
+        ).to.equal(undefined);
+        // The bracket and the pot survive — they are the reveal and the prize now.
+        for (const keep of ["queue_shard_reveal", "apply_bracket_result", "distribute_pot"]) {
+          expect(gone(keep), `${keep} must remain`).to.equal(false);
+        }
+      });
     });
-
-    it("pays a single-winner round — k=1 is the common case on a quiet day", async () => {
-      // Coverage gap found while reviewing the dev implementation: every other prize test uses
-      // 2 or 3 winners, but a round with one entrant is the shape production actually hits most
-      // (round 69 had exactly one). k=1 exercises the k*2 remaining-accounts check and the
-      // winner_count field at their lower bound.
-      const { h, authority, players, treasury, pairs } = await revealedRound(1);
-      const tBefore = await sol(h, treasury.publicKey);
-      const r = await h.send(
-        [await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury]);
-      assert.isNull(r.result, `single-winner payout failed: ${r.result}`);
-      // players[0] is the authority here, so it also pays fees and marker rent — the treasury
-      // debit is the unconfounded measurement.
-      expect(tBefore - (await sol(h, treasury.publicKey))).to.equal(PRIZE);
-      const m: any = await h.program.account.prizeDistribution.fetch(h.prizeDistPda(1));
-      expect(m.winnerCount).to.equal(1);
-      expect(BigInt(m.totalPaid.toString())).to.equal(PRIZE);
-      expect(BigInt(m.largestPaid.toString())).to.equal(PRIZE);
-    });
-
-    it("a round skipped at reveal time can still be paid cycles later", async () => {
-      // The guarantee the cron's backlog scan leans on. Round 73 failed its payout in
-      // production and eight later cycles never retried it, because the cycle only ever looked
-      // at the round it was processing. The scan fixes that off-chain — but only if the
-      // PROGRAM imposes no recency constraint. This proves it does not: a round is paid here
-      // after it has been finalized, revealed, AND superseded by a later open round.
-      const { h, authority, players, entries, treasury, pairs } = await revealedRound(2);
-      // Move the game on: round 1 is finalized, so round 2 can open on top of it.
-      await h.send([await ixOpenRound(h, authority.publicKey, 1)], [authority]);
-      const cfg: any = await h.program.account.gameConfig.fetch(h.configPda());
-      expect(Number(cfg.currentRound)).to.equal(2, "the game must have moved past round 1");
-      assert.isNull(await h.client.getAccount(h.prizeDistPda(1)), "round 1 must still be unpaid");
-
-      const before = await sol(h, players[1].publicKey);
-      const r = await h.send(
-        [await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury]);
-      assert.isNull(r.result, `a stale round must still be payable: ${r.result}`);
-      expect((await sol(h, players[1].publicKey)) - before).to.equal(PRIZE);
-      const m: any = await h.program.account.prizeDistribution.fetch(h.prizeDistPda(1));
-      expect(m.winnerCount).to.equal(2);
-      expect(BigInt(m.totalPaid.toString())).to.equal(PRIZE * 2n);
-      void entries;
-    });
-
-    it("ADVERSARIAL: a second payout for the same round cannot land", async () => {
-      const { h, authority, treasury, pairs } = await revealedRound(2);
-      assert.isNull((await h.send([await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury])).result);
-      const r = await h.send([await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury]);
-      assert.isNotNull(r.result, "the marker's init must reject a replay");
-    });
-
-    it("ADVERSARIAL: refuses a round whose winners are not revealed", async () => {
-      const { h, authority, players } = await bootstrap(2);
-      const entries: PK[] = [];
-      for (const p of players) {
-        await h.send([await ixSubmit(h, p.publicKey, 1, 0)], [p]);
-        entries.push(h.entryPda(h.roundPda(1), p.publicKey));
-      }
-      await finalizeUnrevealed(h, 1);
-      const treasury = h.fundedKeypair(10);
-      const pairs: PK[] = [];
-      players.forEach((p, i) => { pairs.push(entries[i], p.publicKey); });
-      const r = await h.send([await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury]);
-      assert.isNotNull(r.result, "an unrevealed round has no winners to pay");
-      expect(r.result).to.contain(ERR_NOT_REVEALED);
-    });
-
-    it("ADVERSARIAL: a destination that is not the winning entry's player is refused", async () => {
-      const { h, authority, entries, treasury } = await revealedRound(2);
-      const thief = Keypair.generate().publicKey;
-      const pairs = [entries[0], thief, entries[1], thief];
-      const r = await h.send([await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury]);
-      assert.isNotNull(r.result, "prizes must only reach the wallets that placed the entries");
-      expect(r.result).to.contain(ERR_WRONG_WINNER);
-    });
-
-    it("ADVERSARIAL: an entry that is not the one the reveal named is refused", async () => {
-      const { h, authority, players, entries, treasury } = await revealedRound(2);
-      const pairs = [entries[1], players[1].publicKey, entries[0], players[0].publicKey];
-      const r = await h.send([await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury]);
-      assert.isNotNull(r.result, "rank order must match the reveal");
-      expect(r.result).to.contain("0x17a6"); // 6054 EntryMismatch
-    });
-
-    it("ADVERSARIAL: an underfunded treasury fails before paying anyone", async () => {
-      const { h, authority, players, treasury, pairs } = await revealedRound(3, 1);
-      const before = await Promise.all(players.map((p) => sol(h, p.publicKey)));
-      const r = await h.send([await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs)],
-        [authority, treasury]);
-      assert.isNotNull(r.result, "1 SOL cannot cover three 0.5 SOL prizes plus rent");
-      expect(r.result).to.contain(ERR_TREASURY_LOW);
-      const after = await Promise.all(players.map((p) => sol(h, p.publicKey)));
-      for (let i = 1; i < players.length; i++) {
-        expect(after[i]).to.equal(before[i], "a failed payout must pay nobody");
-      }
-      assert.isNull(await h.client.getAccount(h.prizeDistPda(1)),
-        "a failed payout must not leave a marker claiming the round is settled");
-    });
-
-    it("honours a rarity-boosted amount, and records the largest one", async () => {
-      const { h, authority, players, treasury, pairs } = await revealedRound(2);
-      const boosted = [875_000_000n, 500_000_000n]; // 1.75x top rarity, then base
-      const before = await sol(h, players[1].publicKey);
-      const r = await h.send(
-        [await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs, boosted)],
-        [authority, treasury]);
-      assert.isNull(r.result, `boosted payout failed: ${r.result}`);
-      expect((await sol(h, players[1].publicKey)) - before).to.equal(500_000_000n);
-      const m: any = await h.program.account.prizeDistribution.fetch(h.prizeDistPda(1));
-      expect(BigInt(m.totalPaid.toString())).to.equal(1_375_000_000n);
-      expect(BigInt(m.largestPaid.toString())).to.equal(875_000_000n);
-    });
-
-    it("ADVERSARIAL: an amount above the ceiling is refused", async () => {
-      const { h, authority, treasury, pairs } = await revealedRound(2);
-      const r = await h.send(
-        [await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs,
-          [1_000_000_001n, 500_000_000n])],
-        [authority, treasury]);
-      assert.isNotNull(r.result, "a fat-fingered amount must not drain the treasury");
-      expect(r.result).to.contain(ERR_PRIZE_TOO_BIG);
-      assert.isNull(await h.client.getAccount(h.prizeDistPda(1)));
-    });
-
-    it("ADVERSARIAL: a zero amount cannot mark a winner as paid", async () => {
-      const { h, authority, treasury, pairs } = await revealedRound(2);
-      const r = await h.send(
-        [await ixPayPrizes(h, authority.publicKey, treasury.publicKey, 1, pairs, [0n, 500_000_000n])],
-        [authority, treasury]);
-      assert.isNotNull(r.result, "paying zero must not count as settling the round");
-      expect(r.result).to.contain(ERR_POT_TOO_SMALL);
-    });
-
-    it("ADVERSARIAL: a stranger cannot trigger a payout", async () => {
-      const { h, treasury, pairs } = await revealedRound(2);
-      const stranger = h.fundedKeypair();
-      const r = await h.send([await ixPayPrizes(h, stranger.publicKey, treasury.publicKey, 1, pairs)],
-        [stranger, treasury]);
-      assert.isNotNull(r.result, "only the authority or an operator may pay prizes");
-      expect(r.result).to.contain(ERR_NOT_AUTHORITY);
-    });
-  });
 });

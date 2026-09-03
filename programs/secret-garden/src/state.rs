@@ -370,7 +370,7 @@ pub struct CompetitionRound {
     /// False until Stage 4B finalizes results.
     pub scoring_revealed: bool,
     /// Count of entries scored so far. Incremented by Stage 4B's `score_entry` callback
-    /// (not written in Stage 4A); gates `queue_reveal_top3`.
+    /// (not written in Stage 4A); gates the reveal queue instructions.
     pub scored_count: u16,
 }
 
@@ -808,32 +808,6 @@ impl RoundSettlement {
     }
 }
 
-/// Proof that a round's SOL prizes have been paid. PDA seeds: `[b"prize_dist", round_id_le]`.
-///
-/// The direct twin of [`PotDistribution`], and the reason the SOL prize path moved on-chain at
-/// all. A `SystemProgram::transfer` from an off-chain treasury keypair leaves no trace in this
-/// program's account graph, so nothing could answer "was round N paid?" — the two tools that
-/// pay prizes each guessed, differently, and both guessed wrong in ways that cost real money.
-/// `init` on this account makes the answer a fact.
-#[account]
-#[derive(InitSpace)]
-pub struct PrizeDistribution {
-    /// Round whose prizes this records.
-    pub round_id: u64,
-    /// Lamports actually transferred, summed across winners.
-    pub total_paid: u64,
-    /// The largest single payout in this round, for audit. Per-winner amounts vary with the
-    /// rarity multiplier applied off-chain, so a single "per winner" figure would be a lie.
-    pub largest_paid: u64,
-    /// The wallet that funded the payout, for audit.
-    pub treasury: Pubkey,
-    /// How many winners were paid (1..=3).
-    pub winner_count: u8,
-    /// When the payout landed.
-    pub paid_at: i64,
-    /// PDA bump.
-    pub bump: u8,
-}
 
 #[cfg(test)]
 mod tests {

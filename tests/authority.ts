@@ -15,10 +15,10 @@ const { PublicKey, Keypair } = anchor.web3;
 type PK = anchor.web3.PublicKey;
 
 const ERR_NOT_AUTHORITY = "0x1771"; // 6001 NotAuthority
-const ERR_WRONG_DECIMALS = "0x17bd"; // 6077 WrongSgdDecimals
-const ERR_NO_PENDING = "0x17be"; // 6078 NoPendingAuthority
-const ERR_NOT_PENDING = "0x17bf"; // 6079 NotPendingAuthority
-const ERR_BAD_PROPOSAL = "0x17c0"; // 6080 InvalidAuthorityProposal
+const ERR_WRONG_DECIMALS = "0x17bb"; // 6075 WrongSgdDecimals
+const ERR_NO_PENDING = "0x17bc"; // 6076 NoPendingAuthority
+const ERR_NOT_PENDING = "0x17bd"; // 6077 NotPendingAuthority
+const ERR_BAD_PROPOSAL = "0x17be"; // 6078 InvalidAuthorityProposal
 
 const ixInitConfig = (h: Harness, authority: PK) =>
   h.program.methods

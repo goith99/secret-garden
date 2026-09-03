@@ -19,7 +19,6 @@ declare_id!("7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo");
 const COMP_DEF_OFFSET_BREED: u32 = comp_def_offset("breed_v5");
 /// Stage 4A scoring circuits.
 const COMP_DEF_OFFSET_SCORE_ENTRY: u32 = comp_def_offset("score_entry_v2");
-const COMP_DEF_OFFSET_REVEAL_TOP3: u32 = comp_def_offset("reveal_top3");
 /// ADDITIVE, VERIFICATION-ONLY. Own offset for the `reveal_top3_v3` candidate (the
 /// upper-triangle rewrite: 603,016,496 ACU vs the original's 702,629,424 at identical
 /// network depth). Registered alongside — never replacing — `reveal_top3`.
@@ -131,20 +130,6 @@ pub mod secret_garden {
         instructions::refund_unrevealed_pot::handler(ctx)
     }
 
-    /// Pays a finalized, revealed round's SOL prizes from the treasury and records the payout
-    /// with a `PrizeDistribution` marker, whose `init` is the replay guard.
-    ///
-    /// Replaces two off-chain "was this already paid?" heuristics with an on-chain fact. The
-    /// transfers and the marker are one atomic event. Winners arrive as remaining_accounts
-    /// paired with their entries in rank order: `[entry_1, wallet_1, entry_2, wallet_2, ...]`.
-    /// `amounts` is one lamport figure per winner, in the same rank order, each bounded by
-    /// `SOL_PRIZE_MAX_LAMPORTS` — the rarity multiplier that decides them lives off-chain.
-    pub fn pay_sol_prizes<'info>(
-        ctx: Context<'info, PaySolPrizes<'info>>,
-        amounts: Vec<u64>,
-    ) -> Result<()> {
-        instructions::pay_sol_prizes::handler(ctx, amounts)
-    }
 
     /// Reclaims a settled round's pot-vault rent — settled meaning distributed to winners OR
     /// refunded to entrants.
@@ -842,202 +827,7 @@ pub mod secret_garden {
         Ok(())
     }
 
-    /// Queues the top-3 reveal for a Closed, fully-scored round. Authority-only.
-    ///
-    /// GAP 2 fix: the encrypted scores are NOT supplied by the caller. The round's
-    /// `CompetitionEntry` accounts are passed as `remaining_accounts` (exactly
-    /// `participant_count` of them); the program validates each belongs to the round and
-    /// is scored, then builds the circuit args by reading each entry's stored score
-    /// ciphertext in-place via `ArgBuilder::account()`. Slots beyond `participant_count`
-    /// are padded with the first entry's (real, MAC-valid) score, which the circuit masks
-    /// to 0 — so a caller can never substitute arbitrary score data.
-    pub fn queue_reveal_top3(ctx: Context<QueueRevealTop3>, computation_offset: u64) -> Result<()> {
-        require!(
-            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
-            SecretGardenError::NotAuthority
-        );
-        let round_key = ctx.accounts.round.key();
-        require!(
-            ctx.accounts.round.status == ROUND_STATUS_CLOSED,
-            SecretGardenError::RoundNotClosed
-        );
-        require!(
-            !ctx.accounts.round.scoring_revealed,
-            SecretGardenError::ScoringAlreadyRevealed
-        );
-        require!(
-            ctx.accounts.round.scored_count == ctx.accounts.round.participant_count,
-            SecretGardenError::ScoringIncomplete
-        );
-        let participant_count = ctx.accounts.round.participant_count as usize;
-        require!(
-            (1..=MAX_PARTICIPANTS as usize).contains(&participant_count),
-            SecretGardenError::ScoringIncomplete
-        );
-        require!(
-            ctx.remaining_accounts.len() == participant_count,
-            SecretGardenError::WrongEntryCount
-        );
 
-        // Validate each entry belongs to the round and is scored; collect (pubkey, nonce).
-        let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
-        let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
-        for (i, info) in ctx.remaining_accounts.iter().enumerate() {
-            let entry = Account::<CompetitionEntry>::try_from(info)?;
-            require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
-            require!(entry.scored, SecretGardenError::ScoringIncomplete);
-            entry_keys[i] = info.key();
-            entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
-        }
-        // Pad unused slots with the first entry (the circuit masks them to 0).
-        for i in participant_count..MAX_PARTICIPANTS as usize {
-            entry_keys[i] = entry_keys[0];
-            entry_nonces[i] = entry_nonces[0];
-        }
-
-        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
-
-        // 16 x Enc<Mxe, u8>: each is a nonce + the 32-byte score ciphertext read in-place
-        // from the entry's account, then plaintext participant_count.
-        let mut builder = ArgBuilder::new();
-        for i in 0..MAX_PARTICIPANTS as usize {
-            builder = builder.plaintext_u128(entry_nonces[i]).account(
-                entry_keys[i],
-                ENTRY_SCORE_OFFSET,
-                ENTRY_SCORE_LEN as u32,
-            );
-        }
-        let args = builder.plaintext_u8(participant_count as u8).build();
-
-        // Register round (writable) + the real entries (read), in slot order, so the
-        // callback can map the winning SLOT indices back to entry pubkeys.
-        let mut callback_accs = vec![CallbackAccount {
-            pubkey: round_key,
-            is_writable: true,
-        }];
-        for key in entry_keys.iter().take(participant_count) {
-            callback_accs.push(CallbackAccount {
-                pubkey: *key,
-                is_writable: false,
-            });
-        }
-
-        queue_computation(
-            ctx.accounts,
-            computation_offset,
-            args,
-            vec![RevealTop3Callback::callback_ix(
-                computation_offset,
-                &ctx.accounts.mxe_account,
-                &callback_accs,
-            )?],
-            1,
-            0,
-            CALLBACK_CU_LIMIT,
-        )?;
-        Ok(())
-    }
-
-    /// ADDITIVE, VERIFICATION-ONLY twin of `queue_reveal_top3` targeting the
-    /// `reveal_top3_v3` circuit. Argument construction is a DELIBERATE copy of
-    /// `queue_reveal_top3`'s — same guards, same in-place `ArgBuilder::account()` reads at
-    /// `ENTRY_SCORE_OFFSET`, same first-entry padding — so v3 receives the byte-identical
-    /// argument vector the live circuit receives. Only the comp-def offset, the callback
-    /// and the result account differ. The live reveal path is untouched.
-    pub fn queue_reveal_top3_v3(
-        ctx: Context<QueueRevealTop3V3>,
-        computation_offset: u64,
-    ) -> Result<()> {
-        require!(
-            is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
-            SecretGardenError::NotAuthority
-        );
-        let round_key = ctx.accounts.round.key();
-        require!(
-            ctx.accounts.round.status == ROUND_STATUS_CLOSED,
-            SecretGardenError::RoundNotClosed
-        );
-        require!(
-            ctx.accounts.round.scored_count == ctx.accounts.round.participant_count,
-            SecretGardenError::ScoringIncomplete
-        );
-        let participant_count = ctx.accounts.round.participant_count as usize;
-        require!(
-            (1..=MAX_PARTICIPANTS as usize).contains(&participant_count),
-            SecretGardenError::ScoringIncomplete
-        );
-        // remaining_accounts is ONE run: the `participant_count` entries. `reveal_top3_v5`'s
-        // rarity tiebreak reads `entry.rarity_snapshot`, taken from the flower by
-        // `submit_entry`, so the flowers no longer have to be passed here at all.
-        require!(
-            ctx.remaining_accounts.len() == participant_count,
-            SecretGardenError::WrongEntryCount
-        );
-        let entry_infos = ctx.remaining_accounts;
-
-        let mut entry_keys = [Pubkey::default(); MAX_PARTICIPANTS as usize];
-        let mut entry_nonces = [0u128; MAX_PARTICIPANTS as usize];
-        let mut rarities = [0u8; MAX_PARTICIPANTS as usize];
-        for (i, info) in entry_infos.iter().enumerate() {
-            let entry = Account::<CompetitionEntry>::try_from(info)?;
-            require!(entry.round == round_key, SecretGardenError::WrongEntryCount);
-            require!(entry.scored, SecretGardenError::ScoringIncomplete);
-            entry_keys[i] = info.key();
-            entry_nonces[i] = u128::from_le_bytes(entry.score_nonce);
-            rarities[i] = entry.rarity_snapshot;
-        }
-        for i in participant_count..MAX_PARTICIPANTS as usize {
-            entry_keys[i] = entry_keys[0];
-            entry_nonces[i] = entry_nonces[0];
-            // Padding rarity is irrelevant — the circuit masks slots >= participant_count
-            // to rarity 0 — but mirror slot 0 for consistency with the other pad arrays.
-            rarities[i] = rarities[0];
-        }
-
-        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
-
-        let result = &mut ctx.accounts.result;
-        result.round = round_key;
-        result.ready = false;
-        result.error_code = 0;
-        result.bump = ctx.bumps.result;
-        result.generation = 0; // standalone verification path: no bracket, not collected
-
-        let mut builder = ArgBuilder::new();
-        for i in 0..MAX_PARTICIPANTS as usize {
-            builder = builder.plaintext_u128(entry_nonces[i]).account(
-                entry_keys[i],
-                ENTRY_SCORE_OFFSET,
-                ENTRY_SCORE_LEN as u32,
-            );
-        }
-        // Order MUST match `reveal_top3_v5(s0..s15, participant_count, r0..r15)`.
-        let mut builder = builder.plaintext_u8(participant_count as u8);
-        for i in 0..MAX_PARTICIPANTS as usize {
-            builder = builder.plaintext_u8(rarities[i]);
-        }
-        let args = builder.build();
-
-        let callback_accs = vec![CallbackAccount {
-            pubkey: ctx.accounts.result.key(),
-            is_writable: true,
-        }];
-
-        queue_computation(
-            ctx.accounts,
-            computation_offset,
-            args,
-            vec![RevealTop3V5Callback::callback_ix(
-                computation_offset,
-                &ctx.accounts.mxe_account,
-                &callback_accs,
-            )?],
-            1,
-            0,
-            CALLBACK_CU_LIMIT,
-        )?;
-        Ok(())
-    }
 
     // -----------------------------------------------------------------------
     // Bracket reveal (ADDITIVE). Reveals a round too large for a single MPC call as
@@ -1133,7 +923,7 @@ pub mod secret_garden {
 
     /// Reveals ONE shard: the shard's entries arrive as `remaining_accounts` in strictly
     /// ascending pubkey order and are fed to `reveal_top3_v3` exactly the way
-    /// `queue_reveal_top3_v3` feeds a whole round — same in-place `ArgBuilder::account()`
+    /// the retired monolithic reveal fed a whole round — same in-place `ArgBuilder::account()`
     /// reads at `ENTRY_SCORE_OFFSET`, same first-entry padding of the unused slots.
     ///
     /// The result lands in a PER-SHARD `RevealTop3V3Result` PDA, so the existing
@@ -2172,71 +1962,6 @@ pub mod secret_garden {
         Ok(())
     }
 
-    /// On success: maps each winning SLOT index back to its entry pubkey and writes
-    /// top1/top2/top3 — but `top_k` only when `participant_count >= k` (GAP 3). Unfilled
-    /// slots stay `Pubkey::default()`, which is unambiguous: a real entry is a program PDA
-    /// and can never be at the all-zero default. Sets `scoring_revealed`. Idempotent: a
-    /// duplicate callback on an already-revealed round no-ops.
-    #[arcium_callback(encrypted_ix = "reveal_top3")]
-    pub fn reveal_top3_callback(
-        ctx: Context<RevealTop3Callback>,
-        output: SignedComputationOutputs<RevealTop3Output>,
-    ) -> Result<()> {
-        if ctx.accounts.round.scoring_revealed {
-            return Ok(());
-        }
-        let RevealTop3Output { field_0: top } = output
-            .verify_output(
-                &ctx.accounts.cluster_account,
-                &ctx.accounts.computation_account,
-            )
-            .map_err(|e| {
-                msg!("reveal_top3 verify failed: {}", e);
-                SecretGardenError::AbortedComputation
-            })?;
-
-        // The winning slots index into the registered entry accounts (remaining_accounts),
-        // which are the round's entries in the same order passed to queue_reveal_top3. For
-        // every written rank, the winning slot is < participant_count (real entries always
-        // outrank the zero-padded slots), so the index is in bounds.
-        let n = ctx.remaining_accounts.len();
-        let participant_count = ctx.accounts.round.participant_count;
-
-        let mut top1 = Pubkey::default();
-        let mut top2 = Pubkey::default();
-        let mut top3 = Pubkey::default();
-        if participant_count >= 1 {
-            let s = top.field_0 as usize;
-            require!(s < n, SecretGardenError::WrongEntryCount);
-            top1 = ctx.remaining_accounts[s].key();
-        }
-        if participant_count >= 2 {
-            let s = top.field_2 as usize;
-            require!(s < n, SecretGardenError::WrongEntryCount);
-            top2 = ctx.remaining_accounts[s].key();
-        }
-        if participant_count >= 3 {
-            let s = top.field_4 as usize;
-            require!(s < n, SecretGardenError::WrongEntryCount);
-            top3 = ctx.remaining_accounts[s].key();
-        }
-
-        let round = &mut ctx.accounts.round;
-        round.top1 = top1;
-        round.top2 = top2;
-        round.top3 = top3;
-        round.scoring_revealed = true;
-
-        emit!(Top3RevealedEvent {
-            entry_index_1: top.field_0,
-            score_1: top.field_1,
-            entry_index_2: top.field_2,
-            score_2: top.field_3,
-            entry_index_3: top.field_4,
-            score_3: top.field_5,
-        });
-        Ok(())
-    }
 
     /// ADDITIVE, VERIFICATION-ONLY callback for `reveal_top3_v3`. Records the circuit's RAW
     /// output into `RevealTop3V3Result`. It deliberately does NOT
@@ -3117,63 +2842,6 @@ pub struct QueueScoreEntry<'info> {
     pub arcium_program: Program<'info, Arcium>,
 }
 
-/// Queues a `reveal_top3` computation for a Closed, fully-scored round. Authority signs.
-#[queue_computation_accounts("reveal_top3", authority)]
-#[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct QueueRevealTop3<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    /// Game config, read to enforce the pause kill-switch (Stage 5A: reveal is game
-    /// progression, so it is halted while paused; check added here, logic unchanged).
-    #[account(
-        seeds = [CONFIG_SEED],
-        bump = config.bump,
-        constraint = !config.paused @ SecretGardenError::GamePaused,
-    )]
-    pub config: Box<Account<'info, GameConfig>>,
-
-    // Authorization is the runtime operator-or-authority check in `queue_reveal_top3`
-    // (against `config`), so the round no longer pins a single `authority`.
-    #[account(
-        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
-        bump = round.bump,
-    )]
-    pub round: Box<Account<'info, CompetitionRound>>,
-
-    // --- arcium queue-side accounts ---
-    #[account(
-        init_if_needed,
-        space = SIGN_PDA_ACCOUNT_LEN,
-        payer = authority,
-        seeds = [&SIGN_PDA_SEED],
-        bump,
-        address = derive_sign_pda!(),
-    )]
-    pub sign_pda_account: Account<'info, ArciumSignerAccount>,
-    #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Box<Account<'info, MXEAccount>>,
-    #[account(mut, address = derive_mempool_pda!(mxe_account))]
-    /// CHECK: mempool_account, checked by the arcium program.
-    pub mempool_account: UncheckedAccount<'info>,
-    #[account(mut, address = derive_execpool_pda!(mxe_account))]
-    /// CHECK: executing_pool, checked by the arcium program.
-    pub executing_pool: UncheckedAccount<'info>,
-    #[account(mut, address = derive_comp_pda!(computation_offset, mxe_account))]
-    /// CHECK: computation_account, checked by the arcium program.
-    pub computation_account: UncheckedAccount<'info>,
-    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3))]
-    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
-    #[account(mut, address = derive_cluster_pda!(mxe_account))]
-    pub cluster_account: Box<Account<'info, Cluster>>,
-    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
-    pub pool_account: Account<'info, FeePool>,
-    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
-    pub clock_account: Account<'info, ClockAccount>,
-    pub system_program: Program<'info, System>,
-    pub arcium_program: Program<'info, Arcium>,
-}
 
 /// Callback context for `score_entry`. The writable `entry` + `round` (in that order,
 /// matching `queue_score_entry`'s registration) are persisted by the callback.
@@ -3229,72 +2897,6 @@ pub struct InitRevealTop3V3CompDef<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Queues a standalone `reveal_top3_v3` computation. Mirrors `QueueRevealTop3`; the only
-/// structural differences are the `result` PDA (which replaces writing to `round`) and the
-/// comp-def offset. Retained as a single-shot differential-test path; the BRACKET does not go
-/// through here — it queues the same comp def via `QueueShardReveal` and friends.
-#[queue_computation_accounts("reveal_top3_v5", authority)]
-#[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct QueueRevealTop3V3<'info> {
-    #[account(mut)]
-    pub authority: Signer<'info>,
-
-    #[account(
-        seeds = [CONFIG_SEED],
-        bump = config.bump,
-        constraint = !config.paused @ SecretGardenError::GamePaused,
-    )]
-    pub config: Box<Account<'info, GameConfig>>,
-
-    #[account(
-        seeds = [ROUND_SEED, round.round_id.to_le_bytes().as_ref()],
-        bump = round.bump,
-    )]
-    pub round: Box<Account<'info, CompetitionRound>>,
-
-    /// Per-round v3 result record. `init_if_needed` so the round can be re-run.
-    #[account(
-        init_if_needed,
-        payer = authority,
-        space = 8 + RevealTop3V3Result::INIT_SPACE,
-        seeds = [TOP3_V3_SEED, round.key().as_ref()],
-        bump,
-    )]
-    pub result: Box<Account<'info, RevealTop3V3Result>>,
-
-    // --- arcium queue-side accounts (mirror QueueRevealTop3) ---
-    #[account(
-        init_if_needed,
-        space = SIGN_PDA_ACCOUNT_LEN,
-        payer = authority,
-        seeds = [&SIGN_PDA_SEED],
-        bump,
-        address = derive_sign_pda!(),
-    )]
-    pub sign_pda_account: Account<'info, ArciumSignerAccount>,
-    #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Box<Account<'info, MXEAccount>>,
-    #[account(mut, address = derive_mempool_pda!(mxe_account))]
-    /// CHECK: mempool_account, checked by the arcium program.
-    pub mempool_account: UncheckedAccount<'info>,
-    #[account(mut, address = derive_execpool_pda!(mxe_account))]
-    /// CHECK: executing_pool, checked by the arcium program.
-    pub executing_pool: UncheckedAccount<'info>,
-    #[account(mut, address = derive_comp_pda!(computation_offset, mxe_account))]
-    /// CHECK: computation_account, checked by the arcium program.
-    pub computation_account: UncheckedAccount<'info>,
-    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3_V3))]
-    pub comp_def_account: Box<Account<'info, ComputationDefinitionAccount>>,
-    #[account(mut, address = derive_cluster_pda!(mxe_account))]
-    pub cluster_account: Box<Account<'info, Cluster>>,
-    #[account(mut, address = ARCIUM_FEE_POOL_ACCOUNT_ADDRESS)]
-    pub pool_account: Account<'info, FeePool>,
-    #[account(mut, address = ARCIUM_CLOCK_ACCOUNT_ADDRESS)]
-    pub clock_account: Account<'info, ClockAccount>,
-    pub system_program: Program<'info, System>,
-    pub arcium_program: Program<'info, Arcium>,
-}
 
 /// Callback context for `reveal_top3_v3`. ADDITIVE, VERIFICATION-ONLY. The writable
 /// `result` receives the raw output; `CompetitionRound` is deliberately absent.
@@ -3349,7 +2951,7 @@ pub struct InitBracket<'info> {
     pub system_program: Program<'info, System>,
 }
 
-/// Queues ONE shard's `reveal_top3_v3`. Mirrors `QueueRevealTop3V3` exactly, except the
+/// Queues ONE shard's `reveal_top3_v3`. Mirrors the retired monolithic queue exactly, except the
 /// result PDA is per-shard and a `bracket` account is carried. 16 context accounts + the
 /// program id + <=13 entries = <=30 keys, which is 1143 bytes — inside the 1232 limit.
 #[queue_computation_accounts("reveal_top3_v5", authority)]
@@ -3760,28 +3362,6 @@ pub struct CollectSemifinalWinners<'info> {
     pub result: Box<Account<'info, RevealTop3V3Result>>,
 }
 
-/// Callback context for `reveal_top3`. The writable `round` receives the winners; the
-/// round's entry accounts arrive as `remaining_accounts` (slot order) for slot→pubkey
-/// resolution.
-#[callback_accounts("reveal_top3")]
-#[derive(Accounts)]
-pub struct RevealTop3Callback<'info> {
-    pub arcium_program: Program<'info, Arcium>,
-    #[account(address = derive_comp_def_pda!(COMP_DEF_OFFSET_REVEAL_TOP3))]
-    pub comp_def_account: Account<'info, ComputationDefinitionAccount>,
-    #[account(address = derive_mxe_pda!())]
-    pub mxe_account: Account<'info, MXEAccount>,
-    /// CHECK: computation_account, checked by the arcium program.
-    pub computation_account: UncheckedAccount<'info>,
-    #[account(address = derive_cluster_pda!(mxe_account))]
-    pub cluster_account: Account<'info, Cluster>,
-    #[account(address = ::arcium_anchor::solana_instructions_sysvar::ID)]
-    /// CHECK: instructions_sysvar, checked by the account constraint.
-    pub instructions_sysvar: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    pub round: Box<Account<'info, CompetitionRound>>,
-}
 
 /// Emitted by the Stage 4A `score_entry` callback stub once a score verifies.
 #[event]

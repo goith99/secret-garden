@@ -87,7 +87,6 @@ describe(`secret-garden DEVNET resilient upload: ${CIRCUIT} (execute=${EXECUTE})
   const INIT_METHOD: Record<string, string> = {
     breed: "initBreedingCompDef",
     score_entry_v2: "initScoreEntryCompDef",
-    reveal_top3: "initRevealTop3CompDef",
     private_hint: "initPrivateHintCompDef",
     reveal_top3_v3: "initRevealTop3V3CompDef",
     // The Anchor init instructions kept their original names across the circuit renames —

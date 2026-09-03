@@ -9,7 +9,7 @@
  *   openRound -> submitEntry -> closeRound
  *   -> queueScoreEntry   (score_entry MPC reads the flower's Enc<Mxe> genome via
  *                         ArgBuilder::account(); callback persists `scored`)   [GATE A]
- *   -> queueRevealTop3   (reveal_top3 MPC reads the entry's stored score via
+ *   -> (reveal removed; see GATE B) the MPC reads the entry's stored score via
  *                         account(); callback sets `scoringRevealed`/top1)     [GATE B]
  *   -> finalizeRound
  *
@@ -169,7 +169,10 @@ describe("secret-garden DEVNET: scoring gate (cluster 456)", () => {
     return current + 1;
   }
 
-  it("score_entry + reveal_top3 Enc<Mxe> round-trip on cluster 456", async function () {
+  // SKIPPED: drove the reveal through queue_reveal_top3, deleted for audit C-1.
+  // Production deleted the _v3 twin too, so no single-call reveal survives; the
+  // bracket is the only path. Skipped rather than silently weakened.
+  it.skip("score_entry + reveal_top3 Enc<Mxe> round-trip on cluster 456", async function () {
     this.timeout(900_000);
 
     const roundId = await openRound();
@@ -212,14 +215,16 @@ describe("secret-garden DEVNET: scoring gate (cluster 456)", () => {
     console.log(`  [score_entry] PASS — entry.scored=true; entry keys: ${Object.keys(entryAcc).join(",")}`);
 
     // ---- GATE B: reveal_top3 (reads entry's stored score via account()) ----
-    const revealOffset = freshOffset();
-    const revealTx = await program.methods.queueRevealTop3(revealOffset)
-      .accountsPartial({ authority: authority.publicKey, round, ...queueAccsFor("reveal_top3", revealOffset) })
-      .remainingAccounts([{ pubkey: entry, isWritable: false, isSigner: false }])
-      .transaction();
-    await sendTxHttp(revealTx, "queueRevealTop3");
-    console.log(`  [reveal_top3] queued; awaiting MPC finalization...`);
-    await arcium.awaitComputationFinalization(provider, revealOffset, program.programId, "confirmed", 360000);
+    // GATE B REMOVED: queue_reveal_top3 was deleted for audit C-1, and production also
+    // deleted the _v3 twin, so no single-call reveal survives. The bracket is the only path.
+    // const revealOffset = freshOffset();
+    // const revealTx = await program.methods.queueRevealTop3(revealOffset)
+    // .accountsPartial({ authority: authority.publicKey, round, ...queueAccsFor("reveal_top3", revealOffset) })
+    // .remainingAccounts([{ pubkey: entry, isWritable: false, isSigner: false }])
+    // .transaction();
+    // await sendTxHttp(revealTx, "queueRevealTop3");
+    // console.log(`  [reveal_top3] queued; awaiting MPC finalization...`);
+    // await arcium.awaitComputationFinalization(provider, revealOffset, program.programId, "confirmed", 360000);
 
     let revealed = false;
     for (let i = 0; i < 120; i++) {

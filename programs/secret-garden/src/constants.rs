@@ -408,7 +408,7 @@ pub const ENTRY_SCORE_LEN: usize = 32;
 pub const ENTRY_SCORE_NONCE_LEN: usize = 16;
 
 /// Byte offset of `CompetitionEntry::encrypted_score` within the account data, used by
-/// `queue_reveal_top3`'s `ArgBuilder::account()` reads. The score fields are appended
+/// the reveal queue instructions' `ArgBuilder::account()` reads. The score fields are appended
 /// after the original Stage 2 layout: 8 (discriminator) + round(32) + player(32) +
 /// flower_record(32) + submitted_at(8) + status(1) + bump(1) = 114.
 pub const ENTRY_SCORE_OFFSET: u32 = 114;
@@ -671,21 +671,6 @@ pub const SGD_DECIMALS: u8 = 6;
 /// $SGD charged per `submit_entry`, in base units. 100 SGD at `SGD_DECIMALS`.
 pub const ENTRY_FEE_SGD: u64 = 100_000_000;
 
-/// PDA seed for the `PrizeDistribution` marker: `[PRIZE_DIST_SEED, round_id_le]`.
-///
-/// The SOL-prize twin of `ROUND_SETTLEMENT_SEED`, and DELIBERATELY a separate account. Pot
-/// settlement and prize payment are different money from different sources — the pot is the
-/// entrants' own fees held by a program PDA, the prizes come from an off-chain treasury — and a
-/// round can legitimately be in any combination of the two. Folding them together would force
-/// one to wait on the other for no reason. It exists because SOL prizes previously had NO
-/// on-chain record at all. They were paid by an off-chain treasury keypair with a bare
-/// `SystemProgram::transfer`, which writes nothing into the program's account graph, so
-/// "was round N paid?" could only ever be GUESSED at — by intersecting the winner's and the
-/// treasury's transaction histories. That heuristic has an unbounded forward window, so a
-/// winner paid for a LATER round reads as proof the earlier one was settled. This seed turns
-/// the question into a `getAccountInfo`.
-pub const PRIZE_DIST_SEED: &[u8] = b"prize_dist";
-
 /// How long after a round's submission deadline an unrevealed pot may be refunded.
 ///
 /// The gate exists so the authority cannot sweep a round that is merely SLOW. A real reveal
@@ -700,28 +685,6 @@ pub const PRIZE_DIST_SEED: &[u8] = b"prize_dist";
 /// is a strictly conservative reference point — it can only make the wait longer than the
 /// nominal seven days, never shorter.
 pub const POT_REFUND_MIN_AGE_SECONDS: i64 = 7 * SECONDS_PER_DAY;
-
-/// Base SOL prize per revealed winner, in lamports. 0.5 SOL.
-///
-/// The BASE, not the payout. `auto-cycle.ts` scales this by a rarity multiplier of up to 1.75x
-/// before sending, so the amount actually owed varies per winner and cannot be a single
-/// on-chain number without repricing the game — which a fund-safety fix has no business doing.
-/// `pay_sol_prizes` therefore takes the amounts as an argument and bounds them by
-/// `SOL_PRIZE_MAX_LAMPORTS` instead of dictating them.
-///
-/// It is still worth pinning here. The base previously existed only as two hand-synced
-/// TypeScript copies whose own comment admits they are "kept in step with it by hand — the two
-/// tools pay the same pool and a divergence here would silently over- or under-pay". This is
-/// the value those copies are supposed to agree with.
-pub const SOL_PRIZE_LAMPORTS: u64 = 500_000_000;
-
-/// Hard ceiling on what any single winner may be paid by `pay_sol_prizes`.
-///
-/// Twice the base, which clears the 1.75x top rarity multiplier with room to spare while still
-/// making a mistyped or malicious amount fail on-chain rather than empty the treasury. The
-/// instruction cannot police WHY an amount was chosen — the multiplier lives off-chain — but it
-/// can refuse an amount no legitimate policy would ever produce.
-pub const SOL_PRIZE_MAX_LAMPORTS: u64 = 1_000_000_000;
 
 /// Winners a pot is split between, at most. The real divisor is however many of
 /// `top1/top2/top3` are non-default, which is `participant_count.min(3)`.

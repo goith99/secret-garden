@@ -255,15 +255,6 @@ export class Harness {
     )[0];
   }
 
-  /** The PrizeDistribution marker PDA for a round's SOL prizes. */
-  prizeDistPda(roundId: number): anchor.web3.PublicKey {
-    const id = Buffer.alloc(8);
-    id.writeBigUInt64LE(BigInt(roundId));
-    return PublicKey.findProgramAddressSync(
-      [Buffer.from("prize_dist"), id],
-      this.program.programId,
-    )[0];
-  }
 
   async setFixedClock(unixTimestamp: number = FIXED_UNIX_TS): Promise<void> {
     const c = await this.client.getClock();

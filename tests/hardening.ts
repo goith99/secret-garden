@@ -7,7 +7,7 @@
  *   - cancel_stuck_score (permissionless reset of a stuck scoring computation).
  *
  * The three Arcium queue instructions (start_breeding, queue_score_entry,
- * queue_reveal_top3) cannot have their pause gate exercised under bankrun: Anchor
+ * the reveal queue) cannot have their pause gate exercised under bankrun: Anchor
  * deserializes ALL accounts before running the `config.paused` constraint, and their
  * cluster accounts (mxe, mempool, …) do not exist in bankrun, so deserialization fails
  * before the pause check is reached. Their pause rejection is verified in the live suites
