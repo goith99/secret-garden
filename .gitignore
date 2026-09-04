@@ -29,3 +29,8 @@ wallets/
 # Local AI tool config / artifacts (never commit)
 .claude/
 graphify-out/
+
+# Ad-hoc diagnostic scratch scripts (dot-prefixed, .tmp.mjs) — throwaway one-off
+# probes run from the repo root so they resolve node_modules. Reproducible, never
+# part of the source.
+.*.tmp.mjs
