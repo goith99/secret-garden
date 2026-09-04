@@ -584,8 +584,18 @@ pub struct BracketState {
     pub shard_bounds: [Pubkey; crate::constants::MAX_SHARDS],
     /// Bit `k` set once shard `k`'s winners have been collected into `finalists`.
     pub shards_collected: u8,
-    /// Shard winners in shard order, then rank order within a shard. Re-sorted into
-    /// pubkey-ascending order by `queue_final_reveal`'s caller and verified there.
+    /// Shard winners, in ONE OF TWO ORDERS depending on `needs_final_reveal()` — read that
+    /// method before touching either reader of this array.
+    ///
+    /// * one shard  — RANK order, exactly as `collect_shard_winners` wrote it. Nothing else
+    ///   ever writes it, so `apply_bracket_result` reads it positionally.
+    /// * 2+ shards  — written in rank-within-shard order by `collect_shard_winners`, then
+    ///   REPLACED by `queue_shard_reveal(FINAL)` with the same set in pubkey-ascending order,
+    ///   which is the order the final reveal's slot indices address.
+    ///
+    /// The two orders must never be crossed: the ascending rewrite applied to a one-shard
+    /// bracket would silently redefine "rank" as "sorts first by pubkey". `queue_shard_reveal`
+    /// rejects that outright and `apply_bracket_result` re-asserts it via `final_queued`.
     pub finalists: [Pubkey; crate::constants::MAX_FINALISTS],
     /// How many slots of `finalists` are filled.
     pub finalist_count: u8,
@@ -615,6 +625,28 @@ impl BracketState {
             (1u8 << self.shard_count) - 1
         };
         self.shards_collected == full
+    }
+
+    /// Whether the endgame needs a FINAL reveal to rank the finalists against each other.
+    ///
+    /// This is the single source of truth for the shape of the endgame, and it decides how
+    /// `finalists` is ordered and therefore how it must be read:
+    ///
+    /// * `false` — one shard, whose reveal already ranked the entire field. A final reveal is
+    ///   not merely redundant here, it is DESTRUCTIVE: it would overwrite the rank-ordered
+    ///   `finalists` with a pubkey-ascending copy, which `apply_bracket_result`'s positional
+    ///   read then serves as the ranking — handing first place to whichever finalist's entry
+    ///   PDA sorts first. Entry PDAs are `[ENTRY_SEED, round, player]`, so that is an offline
+    ///   keypair grind, and in a round of three every entrant is a finalist.
+    /// * `true` — two or more shards, whose winners have never met. The final reveal ranks
+    ///   them and its slot indices address the ascending order it persisted.
+    ///
+    /// Derived from `shard_count` alone, so the program, `operator.ts` and `auto-cycle.ts`
+    /// all decide it from the same on-chain field rather than from a separately recomputed
+    /// plan — a two-tier round whose tier-1 winners all fit one semifinal shard promotes to
+    /// `shard_count == 1` and takes the single-shard endgame like any other.
+    pub fn needs_final_reveal(&self) -> bool {
+        self.shard_count > 1
     }
 }
 
@@ -984,6 +1016,33 @@ mod tests {
             !t.insert_winner_sorted(pk(200)),
             "must refuse past capacity"
         );
+    }
+
+    /// H-1. The one-shard bracket is the common case at today's participation (any round of
+    /// <= MAX_SHARD_SIZE entrants), and it is exactly the case where a final reveal must be
+    /// refused — it would reorder `finalists` out of rank order. Pinned as a unit test because
+    /// the handler guard is unreachable from the TS suite (queueing needs live Arcium
+    /// accounts), so this is the only place the rule itself gets exercised in isolation.
+    #[test]
+    fn a_one_shard_bracket_never_needs_a_final_reveal() {
+        let mut b = BracketState {
+            round: Pubkey::default(),
+            shard_count: 1,
+            shard_sizes: [0; crate::constants::MAX_SHARDS],
+            shard_bounds: [Pubkey::default(); crate::constants::MAX_SHARDS],
+            shards_collected: 0,
+            finalists: [Pubkey::default(); crate::constants::MAX_FINALISTS],
+            finalist_count: 0,
+            final_queued: false,
+            applied: false,
+            bump: 0,
+            generation: 0,
+        };
+        assert!(!b.needs_final_reveal(), "one shard is already ranked");
+        for n in 2..=crate::constants::MAX_SHARDS as u8 {
+            b.shard_count = n;
+            assert!(b.needs_final_reveal(), "{n} shards must be ranked against each other");
+        }
     }
 
     #[test]

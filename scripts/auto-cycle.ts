@@ -1295,12 +1295,18 @@ async function openRoundPotAccounts(nextRoundId: number) {
     // ---- FINAL reveal + apply. Identical for both tiers: by this point BracketState holds the
     // finalists either way, so the two-tier path rejoins the single-tier code here.
     const bracket = bracketPda(round);
-    const single = plan.shards.length === 1 && plan.tier === "single";
+    // Decide the endgame from ON-CHAIN state, not from the local plan. The program's rule is
+    // `BracketState::needs_final_reveal()` (shard_count > 1) and it now REJECTS a final reveal
+    // on a one-shard bracket, so anything derived separately here can only drift out of
+    // agreement with it. It already could: a two-tier round whose tier-1 winners all fit one
+    // semifinal shard promotes to shard_count == 1, which `plan.tier === "two"` would have
+    // sent down the final-reveal path.
+    const b: any = await program.account.bracketState.fetch(bracket);
+    const single = b.shardCount === 1;
     const finalIndex = single ? 0 : FINAL_SHARD_INDEX;
     const finalResult = shardResultPda(round, finalIndex);
 
     if (!single) {
-      const b: any = await program.account.bracketState.fetch(bracket);
       if (!b.finalQueued) {
         // The program checks the supplied finalists against BracketState.finalists and requires
         // them ascending, so they are re-sorted here — collection order is rank order, not

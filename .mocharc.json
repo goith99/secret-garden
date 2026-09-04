@@ -9,6 +9,7 @@
     "tests/private-hint.ts",
     "tests/mutation.ts",
     "tests/bracket-generation.ts",
+    "tests/final-reveal-order.ts",
     "tests/pot.ts",
     "tests/authority.ts"
   ],

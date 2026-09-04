@@ -524,10 +524,10 @@ async function openRoundPotAccounts(nextRoundId: number) {
       const chunks: PK[][] = [];
       let cursor = 0;
       for (const s of sizes) { chunks.push(allEntries.slice(cursor, cursor + s)); cursor += s; }
-      const single = chunks.length === 1;
+      const plannedSingle = chunks.length === 1;
       const bracket = bracketPda(round);
       console.log(`\n[bracket] ${allEntries.length} entries -> ${chunks.length} shard(s) [${sizes.join(", ")}]` +
-        `${single ? " (single shard: final reveal skipped)" : ""}`);
+        `${plannedSingle ? " (single shard: final reveal skipped)" : ""}`);
 
       const bState: any = await program.account.bracketState.fetchNullable(bracket);
       if (!bState) {
@@ -569,9 +569,15 @@ async function openRoundPotAccounts(nextRoundId: number) {
       }
 
       // Multi-shard rounds need one more MPC call to rank the shard winners against each
-      // other. A single-shard round does NOT: that shard's ranking already IS the round's.
+      // other. A single-shard round does NOT: that shard's ranking already IS the round's,
+      // and the program now REJECTS a final reveal there (it would reorder the finalists out
+      // of rank order into pubkey order). Take this from the PINNED bracket rather than from
+      // `plannedSingle`: an already-existing bracket is not re-pinned above, so the on-chain
+      // partition is the one that counts and the local plan may simply disagree with it.
+      const pinned: any = await program.account.bracketState.fetch(bracket);
+      const single = pinned.shardCount === 1;
       if (!single) {
-        const bb: any = await program.account.bracketState.fetch(bracket);
+        const bb: any = pinned;
         if (!bb.finalQueued) {
           const finalists = (bb.finalists as PK[]).slice(0, bb.finalistCount)
             .sort((a, b) => (a.toBase58() < b.toBase58() ? -1 : 1));

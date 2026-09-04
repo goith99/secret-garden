@@ -959,6 +959,17 @@ pub mod secret_garden {
         let is_final = shard_index == FINAL_SHARD_INDEX;
         let k = shard_index as usize;
         let n = if is_final {
+            // A one-shard bracket has nothing left to rank — shard 0 already ordered the whole
+            // field, and `collect_shard_winners` left `finalists` in RANK order for
+            // `apply_bracket_result` to read positionally. Running the final reveal anyway
+            // would rewrite `finalists` into pubkey-ascending order below, turning that
+            // positional read into "first place goes to the smallest entry PDA". Nothing in
+            // `operator.ts` or `auto-cycle.ts` does this, but the invariant lived only in
+            // those scripts; this is where it belongs. See `BracketState::needs_final_reveal`.
+            require!(
+                bracket.needs_final_reveal(),
+                SecretGardenError::FinalRevealNotApplicable
+            );
             require!(
                 bracket.all_shards_collected(),
                 SecretGardenError::BracketNotReady
@@ -1249,6 +1260,16 @@ pub mod secret_garden {
             //
             // `result_index` must name shard 0 here: there is no final-reveal record.
             require!(result_index == 0, SecretGardenError::InvalidShardIndex);
+            // The paragraph above is a claim about state, so check it rather than trust it:
+            // the rank ordering holds only while nothing has rewritten `finalists`, and the
+            // one thing that could is the final reveal. `queue_shard_reveal` now refuses that
+            // on a one-shard bracket, which makes this unreachable — it stays because the
+            // positional read below is only sound while it is, and a future edit to either
+            // side should fail loudly here rather than quietly mis-rank a round.
+            require!(
+                !ctx.accounts.bracket.final_queued,
+                SecretGardenError::FinalRevealNotApplicable
+            );
             for (k, slot) in top.iter_mut().enumerate() {
                 if k >= n {
                     break;

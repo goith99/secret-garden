@@ -313,4 +313,9 @@ pub enum SecretGardenError {
     /// A proposal named the zero address (the "none" sentinel) or the current authority.
     #[msg("Proposed authority must be a real address and not the current authority")]
     InvalidAuthorityProposal,
+    /// A FINAL reveal was queued on a bracket that has only one shard, or a one-shard bracket
+    /// was found carrying `final_queued`. Both mean the same thing: something tried to rank
+    /// finalists that are already ranked, which would replace the ranking with pubkey order.
+    #[msg("This bracket has a single shard; its ranking is already final and cannot be re-ranked")]
+    FinalRevealNotApplicable,
 }
