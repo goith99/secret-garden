@@ -163,6 +163,7 @@ const ERR_WRONG_DECIMALS = "0x17bb"; // 6075 WrongSgdDecimals
 // RoundSettlement.state values, mirroring the SETTLEMENT_* constants.
 const ST_NONE = 0, ST_REFUND_PENDING = 1, ST_PAID = 2, ST_REFUNDED = 3;
 const ERR_NOT_AUTHORITY = "0x1771"; // 6001 NotAuthority
+const ERR_HAD_ENTRANTS = "0x17c0"; // 6080 RoundHadEntrants
 
 /** Well past `POT_REFUND_MIN_AGE_SECONDS` after round 1's deadline. */
 const LATE = FIXED_UNIX_TS + 10 * 86400;
@@ -924,14 +925,103 @@ describe("$SGD entry-fee pot", () => {
   });
 
   describe("close_pot_vault", () => {
-    it("ADVERSARIAL: refuses a vault with no settlement at all", async () => {
-      const { h, authority } = await bootstrap(1);
+    it("ADVERSARIAL: refuses a round that TOOK ENTRIES and has no settlement", async () => {
+      // This is the guard that matters. A round with entrants has real fees in its history, so
+      // it must go through distribute or refund before its vault can be closed — no matter how
+      // long it sits unsettled.
+      //
+      // This test used to call `bootstrap(1)` and never submit, which made it a round with ZERO
+      // participants — the one case that is now legally closable. It was passing for a reason
+      // that has since become the exception, so it now submits an entry and asserts the real
+      // rule. The empty-round path it used to cover by accident is tested deliberately below.
+      const { h, authority, players } = await bootstrap(1);
+      await h.send([await ixSubmit(h, players[0].publicKey, 1, 0)], [players[0]]);
       await finalizeUnrevealed(h, 1);
       const r = await h.send([await ixClosePotVault(h, authority.publicKey, 1)], [authority], LATE);
-      assert.isNotNull(r.result, "an unsettled pot must not be closable");
-      // With one typed settlement account instead of two raw probes, "never settled" now means
-      // the account does not exist, and Anchor rejects it before the handler runs.
-      expect(r.result).to.contain(ERR_UNINIT);
+      assert.isNotNull(r.result, "an unsettled pot with entrants must not be closable");
+      expect(r.result).to.contain(ERR_HAD_ENTRANTS);
+      assert.isNotNull(await h.client.getAccount(ataFor(h.potAuthorityPda(1), SGD_MINT)),
+        "the vault must survive a refused close");
+    });
+
+    it("closes a round NOBODY ENTERED — the one case that can never reach a settlement", async () => {
+      // open_round funds a vault for every round before anyone enters, so an empty round gets
+      // one too. With no entries it is never scored, so never revealed, so distribute_pot
+      // refuses it forever and no RoundSettlement is ever written. Without this path its rent
+      // is stranded permanently — one vault per empty round, for as long as the game runs.
+      const { h, authority } = await bootstrap(1);
+      await finalizeUnrevealed(h, 1);
+
+      const round: any = await h.program.account.competitionRound.fetch(h.roundPda(1));
+      expect(round.participantCount).to.equal(0, "precondition: nobody entered");
+      assert.isNull(await h.client.getAccount(h.settlementPda(1)),
+        "precondition: no settlement account exists");
+
+      const vault = ataFor(h.potAuthorityPda(1), SGD_MINT);
+      const rent = (await h.client.getAccount(vault))!.lamports;
+      const before = (await h.client.getAccount(authority.publicKey))!.lamports;
+
+      const r = await h.send([await ixClosePotVault(h, authority.publicKey, 1)], [authority], LATE);
+      assert.isNull(r.result, `close failed: ${r.result}`);
+
+      assert.isNull(await h.client.getAccount(vault), "the vault must be gone");
+      const gained = (await h.client.getAccount(authority.publicKey))!.lamports - before;
+      // The rent goes to the caller, who is the key that paid it in open_round. Transaction
+      // fees come out of the same balance, so this brackets rather than equates.
+      expect(gained).to.be.greaterThan(rent - 100_000,
+        "the caller must receive essentially the whole rent back");
+      expect(gained).to.be.at.most(rent, "the caller must not receive more than the rent");
+    });
+
+    it("closing an empty round's vault leaves every other round untouched", async () => {
+      const { h, authority, players } = await bootstrap(2);
+      // Round 1: real entrants, revealed and distributed, so it reaches a terminal settlement.
+      const entries: PK[] = [];
+      for (const p of players) {
+        await h.send([await ixSubmit(h, p.publicKey, 1, 0)], [p]);
+        entries.push(h.entryPda(h.roundPda(1), p.publicKey));
+      }
+      await revealWith(h, 1, entries);
+      const pairs: PK[] = [];
+      players.forEach((p, i) => { pairs.push(entries[i], ataFor(p.publicKey, SGD_MINT)); });
+      assert.isNull((await h.send([await ixDistribute(h, authority.publicKey, 1, pairs)], [authority])).result);
+
+      // Round 2: opened, never entered, finalized — the new closable shape.
+      assert.isNull((await h.send([await ixOpenRound(h, authority.publicKey, 1)], [authority])).result);
+      await finalizeUnrevealed(h, 2);
+
+      const vault1 = ataFor(h.potAuthorityPda(1), SGD_MINT);
+      const vault1Before = await h.client.getAccount(vault1);
+      const settle1Before = await h.client.getAccount(h.settlementPda(1));
+      const round1Before = await h.client.getAccount(h.roundPda(1));
+      const configBefore = await h.client.getAccount(h.configPda());
+
+      const r = await h.send([await ixClosePotVault(h, authority.publicKey, 2)], [authority], LATE);
+      assert.isNull(r.result, `close failed: ${r.result}`);
+      assert.isNull(await h.client.getAccount(ataFor(h.potAuthorityPda(2), SGD_MINT)),
+        "round 2's vault must be closed");
+
+      // Round 1 is entirely undisturbed — vault, settlement, record — and so is the config.
+      const vault1After = await h.client.getAccount(vault1);
+      assert.isNotNull(vault1After, "round 1's vault must survive");
+      expect(vault1After!.lamports).to.equal(vault1Before!.lamports);
+      const same = (a: any, b: any, what: string) =>
+        expect(Buffer.from(a!.data).toString("hex")).to.equal(
+          Buffer.from(b!.data).toString("hex"), `${what} must not change`);
+      same(await h.client.getAccount(vault1), vault1Before, "round 1's vault");
+      same(await h.client.getAccount(h.settlementPda(1)), settle1Before, "round 1's settlement");
+      same(await h.client.getAccount(h.roundPda(1)), round1Before, "round 1's record");
+      same(await h.client.getAccount(h.configPda()), configBefore, "the config");
+    });
+
+    it("refuses an empty round that has NOT been finalized yet", async () => {
+      // participant_count == 0 alone is not enough: an OPEN round is still taking entries, and
+      // closing its vault would break the very next submit_entry.
+      const { h, authority } = await bootstrap(1);
+      const r = await h.send([await ixClosePotVault(h, authority.publicKey, 1)], [authority], LATE);
+      assert.isNotNull(r.result, "an unfinalized round's vault must not be closable");
+      expect(r.result).to.contain(ERR_NOT_SETTLED);
+      assert.isNotNull(await h.client.getAccount(ataFor(h.potAuthorityPda(1), SGD_MINT)));
     });
 
     it("ADVERSARIAL: refuses while a refund is still in progress", async () => {

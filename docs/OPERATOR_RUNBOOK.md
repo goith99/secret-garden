@@ -202,6 +202,113 @@ can't both take effect — the callback's first-line guard (`callback_processed`
 [`docs/ERROR_AND_STATUS_REFERENCE.md`](./ERROR_AND_STATUS_REFERENCE.md) §2 — use those as
 the monitoring checklist.
 
+**Pot-vault rent.** `open_round` creates each round's $SGD vault with `init_if_needed`, paid by
+the operator, so every round costs the operator one rent-exempt token account. `close_pot_vault`
+gives it back, and the daily cycle now calls it automatically (step 4c) — but it can only close a
+round that reached a **terminal `RoundSettlement`** (`PotPaid` or `PotRefunded`).
+
+To sweep by hand, or to see what is outstanding:
+
+```bash
+set -a; source .env; set +a
+export OPERATOR_KEYPAIR=~/.config/solana/railway-operator-mine.json
+node scripts/close-pot-vaults.mjs              # dry run — lists closable and blocked
+node scripts/close-pot-vaults.mjs --execute    # close everything closable
+```
+
+A **registered operator is enough** — `close_pot_vault` takes `is_operator_or_authority`, so no
+Squads flow is needed. The rent returns to the signer (the key that paid it in `open_round`); any
+unclaimed $SGD surplus goes to `config.authority`'s token account, which no caller can redirect.
+
+A round nobody entered **is** closable, as of the `RoundHadEntrants` change. It can never reach
+a settlement — nothing to score, so never revealed, so `distribute_pot` refuses it forever — and
+with `participant_count == 0` no entrant ever paid into that vault, so the close only reclaims
+the operator's own rent. It still has to be FINALIZED first; an OPEN or CLOSED round is refused
+with `PotNotSettled` (6072).
+
+> ⚠️ **A round that TOOK ENTRIES still cannot skip settlement.** It is refused with
+> `RoundHadEntrants` (6080) until `distribute_pot` or `refund_unrevealed_pot` has run. That is
+> the guard, not a limitation — those rounds have real entrant fees in their history.
+
+---
+
+## 3b. Upgrading the program under the Squads authority
+
+The production program's **upgrade authority is the Squads vault**
+(`dayvecX4GrHn8mv3jN9R9v2iMrNue5xtVjc2HiDYSX8`), not a local keypair:
+
+```
+$ solana program show 7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo --url "$HELIUS_RPC_URL"
+Authority: dayvecX4GrHn8mv3jN9R9v2iMrNue5xtVjc2HiDYSX8
+```
+
+So `solana program deploy` cannot upgrade production — the `Upgrade` instruction has to be
+signed by the vault, which means a Squads propose → approve → execute. Only the **buffer write**
+is permissionless. Dev's authority (`8L9SoH5K…`) is still a plain keypair, so dev upgrades
+normally.
+
+### Sequence
+
+**1. Build.** Use `anchor build`, NOT `arcium build`, unless a circuit actually changed.
+`arcium build` recompiles the circuits, and the macros embed each circuit's byte length — a
+recompile that produces different bytes (which has been observed from unchanged source) makes
+the new binary disagree with the comp-defs already on chain. Confirm afterwards:
+
+```bash
+sha256sum build/*.arcis      # must match what was deployed
+```
+
+**2. Check it fits.** The programdata account has a fixed capacity; a larger binary needs
+`solana program extend` FIRST, and the loader's minimum extend is **10240 bytes** (a smaller
+request fails with `invalid program argument`).
+
+```bash
+solana program show <PROGRAM_ID> --url "$HELIUS_RPC_URL" | grep "Data Length"
+ls -l target/deploy/secret_garden.so
+# if the binary is larger:
+solana program extend <PROGRAM_ID> 10240 --url "$HELIUS_RPC_URL" --keypair <PAYER>
+```
+
+**3. Write the buffer**, and hand it to the vault so the multisig can consume it:
+
+```bash
+solana program write-buffer target/deploy/secret_garden.so \
+  --url "$HELIUS_RPC_URL" --keypair <PAYER>
+solana program set-buffer-authority <BUFFER> \
+  --new-buffer-authority dayvecX4GrHn8mv3jN9R9v2iMrNue5xtVjc2HiDYSX8 \
+  --url "$HELIUS_RPC_URL" --keypair <PAYER>
+```
+
+**4. Verify the buffer before proposing anything.** The buffer account is
+`UpgradeableLoaderState::Buffer`: a 4-byte tag plus `Option<Pubkey>` authority (1 + 32) = a
+**37-byte header**, then the raw program bytes. Compare that payload against the local `.so`:
+
+```bash
+# payload = account data minus the 37-byte header, truncated to the .so length;
+# anything past the .so length must be zero.
+```
+
+A mismatch here means the upload was truncated or corrupted — do not propose the upgrade.
+
+**5. Propose + approve + execute in Squads**: a `BPFLoaderUpgradeable::Upgrade` instruction with
+the vault as upgrade authority, the buffer from step 3, and a spill account for the reclaimed
+buffer rent.
+
+**6. Verify what actually landed**, rather than trusting the execution receipt:
+
+```bash
+solana program dump <PROGRAM_ID> /tmp/deployed.so --url "$HELIUS_RPC_URL"
+head -c $(stat -c%s target/deploy/secret_garden.so) /tmp/deployed.so | sha256sum
+sha256sum target/deploy/secret_garden.so     # must be identical
+```
+
+`program dump` returns the whole padded programdata, so truncate to the local `.so` length
+before hashing.
+
+> If the upgrade is abandoned, close the buffer to get its rent back:
+> `solana program close <BUFFER> --url "$HELIUS_RPC_URL"` (signed by the buffer authority — the
+> vault, if step 3's transfer already ran).
+
 ---
 
 ## 4. Known infrastructure caveat — WSL/localnet MXE keygen (DKG) flake

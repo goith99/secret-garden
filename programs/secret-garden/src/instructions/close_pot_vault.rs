@@ -9,11 +9,26 @@ use crate::state::{is_operator_or_authority, CompetitionRound, GameConfig, Round
 
 /// Reclaims the rent under a settled round's pot vault, sweeping any unclaimed surplus first.
 ///
-/// SETTLED means one thing now: `RoundSettlement::is_terminal()`. There used to be two raw
-/// account probes here — one for a distribution marker, one for a refund marker, each
-/// deserialized by hand and each with its own round-id check — to answer a question that is now
-/// a single field read. Which of the two ways a pot ended no longer matters to this
-/// instruction, and it no longer has to know.
+/// SETTLED means `RoundSettlement::is_terminal()`. There used to be two raw account probes here
+/// — one for a distribution marker, one for a refund marker, each deserialized by hand and each
+/// with its own round-id check — to answer a question that is now a single field read. Which of
+/// the two ways a pot ended no longer matters to this instruction, and it no longer has to know.
+///
+/// # The round that can never settle
+///
+/// One shape of round has no terminal settlement and never will: one that FINALIZED with
+/// `participant_count == 0`. `open_round` creates a vault for every round, funded by the
+/// operator, before anyone has entered — so an empty round still gets one. With no entries
+/// there is nothing to score, `scoring_revealed` never becomes true, and `distribute_pot`
+/// refuses it forever. Its rent used to be stranded permanently, one vault per empty round,
+/// accumulating for as long as the game runs.
+///
+/// So this instruction accepts a second, tightly-drawn case: a FINALIZED round with zero
+/// participants and no settlement account at all. `participant_count == 0` is what makes it
+/// safe — it proves no entrant ever paid a fee into this vault, so there is nothing to
+/// distribute and nobody to refund, and the close is only reclaiming the operator's own rent.
+/// Any round that took even one entry still has to go through `distribute_pot` or
+/// `refund_unrevealed_pot` first, and is rejected here with `RoundHadEntrants`.
 ///
 /// # The surplus sweep
 ///
@@ -46,13 +61,23 @@ pub struct ClosePotVault<'info> {
     )]
     pub round: Account<'info, CompetitionRound>,
 
-    /// The single settlement state. Typed, so a wrong or absent account fails on the
-    /// discriminator rather than on a hand-rolled emptiness probe.
+    /// CHECK: the address is pinned by the seeds below, so nothing else can be presented here.
+    /// Its EMPTINESS is the signal (see the handler); the non-empty case is handed straight to
+    /// `Account::try_from`, which still checks owner and discriminator before anything is read.
+    ///
+    /// This was `Account<'info, RoundSettlement>` — typed, so an absent settlement failed on the
+    /// discriminator. It cannot stay typed, because Anchor rejects an uninitialized typed account
+    /// with `AccountNotInitialized` (3012) BEFORE the handler runs, and "no settlement exists" is
+    /// now a legal, closable state for exactly one shape of round.
+    ///
+    /// It is not a return to the old two-marker probing. That code hand-deserialized two
+    /// different accounts to work out WHICH one existed; this reads one account's length to work
+    /// out WHETHER it exists, and answers the rest with the typed deserializer as before.
     #[account(
         seeds = [ROUND_SETTLEMENT_SEED, round.round_id.to_le_bytes().as_ref()],
-        bump = settlement.bump,
+        bump,
     )]
-    pub settlement: Account<'info, RoundSettlement>,
+    pub settlement: UncheckedAccount<'info>,
 
     /// CHECK: PDA authority for the vault; derived, never a keypair.
     #[account(seeds = [POT_SEED, round.round_id.to_le_bytes().as_ref()], bump)]
@@ -90,20 +115,69 @@ pub(crate) fn handler(ctx: Context<ClosePotVault>) -> Result<()> {
         SecretGardenError::NotAuthority
     );
 
-    // The whole settlement question, in one line.
-    require_eq!(
-        ctx.accounts.settlement.round_id,
-        ctx.accounts.round.round_id,
-        SecretGardenError::PotNotSettled
-    );
-    require!(
-        ctx.accounts.settlement.is_terminal(),
-        if ctx.accounts.settlement.state == SETTLEMENT_POT_REFUND_PENDING {
-            SecretGardenError::RefundIncomplete
-        } else {
+    // A vault is closable two ways, and the settlement account tells them apart by whether it
+    // exists at all.
+    if ctx.accounts.settlement.data_is_empty() {
+        // NEVER SETTLED — legal for exactly one shape of round: one that finalized with nobody
+        // in it. Such a round can never reach a settlement, so without this it would hold its
+        // rent forever. With no entries there is nothing to score, so `scoring_revealed` stays
+        // false, so `distribute_pot` refuses it permanently; `refund_unrevealed_pot` can reach
+        // it, but it is authority-only and pays a flat per-head figure to zero entrants, which
+        // is a multisig ceremony to write a marker saying nothing happened.
+        //
+        // Nothing is read out of the empty account — only its length is consulted — so a stray
+        // lamport transfer to the PDA (which leaves it System-owned with no data) changes
+        // nothing here.
+        require!(
+            ctx.accounts.round.status == ROUND_STATUS_FINALIZED,
             SecretGardenError::PotNotSettled
-        }
-    );
+        );
+        // The whole safety of this branch. A round with entrants has real fees in its history
+        // and must go through distribute or refund; only `participant_count == 0` proves there
+        // were never any entrant funds to account for.
+        require_eq!(
+            ctx.accounts.round.participant_count,
+            0u16,
+            SecretGardenError::RoundHadEntrants
+        );
+        // Deliberately NO `pot_vault.amount == 0` check. It reads like the obvious belt-and-
+        // braces and is in fact the griefing vector this instruction already closed once: SPL
+        // refuses to close a non-empty account, so requiring emptiness would let one donated
+        // base unit wedge an empty round's vault permanently. The sweep below handles it — and
+        // with `participant_count == 0` every base unit in there IS surplus by construction,
+        // owed to nobody, which is exactly what the sweep is for.
+    } else {
+        // SETTLED — the original question, asked of the same bytes the typed account read.
+        //
+        // Deserialized here rather than through `Account::try_from` because `UncheckedAccount`
+        // is invariant over its lifetime, so borrowing one back into a typed `Account` forces a
+        // named-lifetime signature on this handler and on its call site in `lib.rs`. The two
+        // things the typed form gave us are both kept explicitly: `try_deserialize` checks the
+        // 8-byte discriminator, and the owner check below is what stops a lookalike account
+        // being deserialized as a settlement. (In practice the seeds already guarantee it — only
+        // this program can sign for its own PDA, so only this program can have put data there —
+        // but the guarantee is worth stating rather than inferring.)
+        require_keys_eq!(
+            *ctx.accounts.settlement.owner,
+            crate::ID,
+            SecretGardenError::PotNotSettled
+        );
+        let data = ctx.accounts.settlement.try_borrow_data()?;
+        let settlement = RoundSettlement::try_deserialize(&mut &data[..])?;
+        require_eq!(
+            settlement.round_id,
+            ctx.accounts.round.round_id,
+            SecretGardenError::PotNotSettled
+        );
+        require!(
+            settlement.is_terminal(),
+            if settlement.state == SETTLEMENT_POT_REFUND_PENDING {
+                SecretGardenError::RefundIncomplete
+            } else {
+                SecretGardenError::PotNotSettled
+            }
+        );
+    }
 
     let round_id_le = ctx.accounts.round.round_id.to_le_bytes();
     let seeds: &[&[u8]] = &[POT_SEED, round_id_le.as_ref(), &[ctx.bumps.pot_authority]];

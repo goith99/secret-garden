@@ -7,9 +7,14 @@
  *   1. close_round   (skipped if the round is already closed/finalized)
  *   2. score         (auto-score every unscored CompetitionEntry)
  *   3. bracket reveal (partition -> shard reveals -> final reveal -> apply)
- *   3b. distribute   (pay the round's $SGD pot to the top 3 winners)
  *   4. finalize_round
+ *   4b. distribute   (pay the round's $SGD pot to the top 3 winners)
+ *   4c. reclaim      (close settled pot vaults and take their rent back)
  *   5. open_round    (open the next round)
+ *
+ * The payout steps sit BELOW finalize, not above it: both `distribute_pot` and
+ * `close_pot_vault` require a FINALIZED round. The list said `3b` for a while after they
+ * moved; it did not survive contact with the code.
  *
  * REVEAL IS A BRACKET, NOT ONE CALL. The monolithic reveal is deleted entirely: Arcium
  * rejects a queue_computation referencing 15+ distinct accounts (error 6202), and the program
@@ -650,6 +655,11 @@ interface CycleSummary {
   prizeSkipReason: string | null;
   /** What the pre-close backlog scan settled, for rounds earlier runs left owing. */
   backlogPaid: string[];
+  /** Pot vaults closed by this run, and the rent that came back to the operator. */
+  vaultsClosed: number;
+  rentReclaimedLamports: number;
+  /** Vaults that exist but can never be closed — see `reclaimVaultRent`. */
+  vaultsStranded: number;
   /** True when the round was already FINALIZED when the cycle started — i.e. finalized
    *  OUTSIDE auto-cycle, so no prize distribution was ever run by a cycle. */
   externallyFinalized: boolean;
@@ -1522,6 +1532,115 @@ async function openRoundPotAccounts(nextRoundId: number) {
     }
   }
 
+  /**
+   * Close every settled round's pot vault and take its rent back.
+   *
+   * `open_round` creates the vault with `init_if_needed`, paid by the operator, so the operator
+   * is out one rent-exempt token account per round (0.00148844 SOL on devnet at the current
+   * rate). `close_pot_vault` returns it — and nothing has ever called that instruction. Twelve
+   * vaults had accumulated by round 81 because the daily cycle opened one every day and closed
+   * none.
+   *
+   * The reason it was never called is worth keeping: `close_pot_vault` pins
+   * `surplus_destination` to `config.authority`'s $SGD associated token account, which stopped
+   * existing when the authority moved behind the Squads vault, and which is declared as a plain
+   * `Account<TokenAccount>` rather than `init_if_needed`. Every call failed at account
+   * resolution before reaching the handler. `ensureAtas` creates it here, which is a
+   * permissionless ATA-program call — the vault owner does not sign to receive an account.
+   *
+   * Signing is the operator's own: `close_pot_vault` takes `is_operator_or_authority`, so no
+   * Squads flow is involved and this can run unattended. The rent lands with the signer, which
+   * is the same key that paid it in `open_round`, and the $SGD surplus (always zero so far) goes
+   * to the authority where no caller can redirect it.
+   *
+   * Scans from round 1 rather than `POT_LEDGER_FIRST_ROUND`. That bound exists to stop the
+   * PAYOUT scan walking back into rounds its marker cannot speak for and paying them twice;
+   * closing carries no such risk, because a closed vault is simply gone and a second attempt
+   * finds nothing. Bounding this the same way would silently strand older rent.
+   *
+   * Two vault shapes are closable: a round with a terminal `RoundSettlement`, and a FINALIZED
+   * round that took NO entries. The second can never reach a settlement — nothing to score, so
+   * never revealed, so `distribute_pot` refuses it forever — and with `participant_count == 0`
+   * there were never entrant funds to account for. A round that DID take entries and has no
+   * settlement stays put; the program rejects it with `RoundHadEntrants`.
+   *
+   * A failure never aborts the cycle: the vault stays, and the next run tries again.
+   */
+  async function reclaimVaultRent(currentRound: number): Promise<void> {
+    const cfg: any = await program.account.gameConfig.fetch(configPda);
+    const sgdMint: PK = cfg.sgdMint;
+
+    const ids: number[] = [];
+    for (let i = 1; i <= currentRound; i++) ids.push(i);
+
+    // Three batched reads rather than 3N round-trips.
+    const [rounds, settles, vaults] = await Promise.all([
+      conn.getMultipleAccountsInfo(ids.map(roundPda), "confirmed"),
+      conn.getMultipleAccountsInfo(ids.map(settlementPda), "confirmed"),
+      conn.getMultipleAccountsInfo(ids.map((i) => ataFor(potAuthorityPda(i), sgdMint)), "confirmed"),
+    ]);
+
+    const closable: number[] = [];
+    let stranded = 0;
+    for (let i = 0; i < ids.length; i++) {
+      if (!rounds[i] || !vaults[i]) continue;      // round never existed, or vault already closed
+      const st = settles[i];
+      // SETTLEMENT_POT_PAID (2) and _POT_REFUNDED (3) are the terminal states close_pot_vault
+      // accepts; `state` sits at offset 16 (8 discriminator + 8 round_id).
+      if (st && (st.data[16] === 2 || st.data[16] === 3)) {
+        closable.push(ids[i]);
+        continue;
+      }
+      // No settlement. That is closable for exactly one shape of round: FINALIZED with no
+      // entrants, which can never reach a settlement at all (nothing to score → never revealed
+      // → distribute_pot refuses it forever). CompetitionRound layout: `status` at offset 16,
+      // `participant_count` at offset 35.
+      const rd = rounds[i]!.data;
+      if (!st && rd[16] === ROUND_STATUS_FINALIZED && rd.readUInt16LE(35) === 0) closable.push(ids[i]);
+      else stranded++;
+    }
+    summary.vaultsStranded = stranded;
+
+    if (!closable.length) {
+      if (stranded) {
+        console.log(`\n[reclaim] nothing closable; ${stranded} vault(s) not yet settleable`);
+        console.log(`    (a round that took entries must be distributed or refunded first;`);
+        console.log(`     an empty round becomes closable once it is FINALIZED)`);
+      }
+      return;
+    }
+
+    console.log(`\n[reclaim] closing ${closable.length} settled pot vault(s): ${closable.join(", ")}`);
+    // The one account whose absence made every close fail.
+    await ensureAtas(sgdMint, [cfg.authority]);
+    const surplusDestination = ataFor(cfg.authority, sgdMint);
+
+    for (const id of closable) {
+      const potVault = ataFor(potAuthorityPda(id), sgdMint);
+      const rent = (await conn.getAccountInfo(potVault, "confirmed"))?.lamports ?? 0;
+      try {
+        const tx = await program.methods.closePotVault()
+          .accountsPartial({
+            authority: signer.publicKey,
+            config: configPda,
+            round: roundPda(id),
+            settlement: settlementPda(id),
+            potAuthority: potAuthorityPda(id),
+            potVault,
+            sgdMint,
+            surplusDestination,
+          }).transaction();
+        const sig = await sendTxHttp(tx, `closePotVault(${id})`);
+        summary.vaultsClosed++;
+        summary.rentReclaimedLamports += rent;
+        console.log(`  \u2713 round ${id}: +${(rent / 1e9).toFixed(9)} SOL (sig ${short(sig)})`);
+      } catch (e) {
+        console.error(`  \u2717 round ${id}: close failed \u2014 ${(e as Error).message.split("\n")[0]}`);
+        console.error(`    The vault is untouched; the next cycle retries it.`);
+      }
+    }
+  }
+
   // --- balance gate (operator fees) ----------------------------------------
   // Both checked BEFORE any cycle work so a low balance skips the day cleanly rather than
   // closing a round and then stalling.
@@ -1741,6 +1860,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
     scoredCount: 0, scoredThisRun: 0, top3: [],
     revealedPreviously: false, potAlreadySettled: false,
     potPaidSgd: 0, prizeSkipReason: null, backlogPaid: [], externallyFinalized: false,
+    vaultsClosed: 0, rentReclaimedLamports: 0, vaultsStranded: 0,
     finalizedRound: null, openedRound: null,
   };
 
@@ -1938,6 +2058,12 @@ async function openRoundPotAccounts(nextRoundId: number) {
     }
   }
 
+  // ------------------------------------ 4c. RECLAIM (pot-vault rent, idempotent)
+  //
+  // Runs AFTER 4b so the round just settled is swept in the same cycle, and BEFORE 5 so the
+  // next round's brand-new empty vault is not in the survey at all.
+  await reclaimVaultRent(current);
+
   // ----------------------------------------------------------------- 5. OPEN
   console.log(`\n[open] opening round ${current + 1}`);
   await openNextRound(current);
@@ -1994,6 +2120,9 @@ function printSummary(s: CycleSummary, operatorSol: number): void {
   console.log(`  Round finalized    : ${s.finalizedRound === null
     ? (s.externallyFinalized ? "— (was already finalized externally)" : "— (not finalized by this run)")
     : s.finalizedRound}`);
+  console.log(`  Vault rent back    : ${s.vaultsClosed > 0
+    ? `${(s.rentReclaimedLamports / 1e9).toFixed(9)} SOL from ${s.vaultsClosed} vault(s)`
+    : "— (none closable)"}${s.vaultsStranded > 0 ? `, ${s.vaultsStranded} stranded` : ""}`);
   console.log(`  New round opened   : ${s.openedRound ?? "—"}`);
   console.log(`  Operator balance   : ${operatorSol.toFixed(4)} SOL`);
   if (s.externallyFinalized) {

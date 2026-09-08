@@ -318,4 +318,11 @@ pub enum SecretGardenError {
     /// finalists that are already ranked, which would replace the ranking with pubkey order.
     #[msg("This bracket has a single shard; its ranking is already final and cannot be re-ranked")]
     FinalRevealNotApplicable,
+    /// `close_pot_vault` was called on a round that has no `RoundSettlement` but DID take
+    /// entries. Only a round nobody entered may skip settlement, because only such a round can
+    /// never reach one: with no entries there is nothing to score, so it is never revealed, so
+    /// `distribute_pot` refuses it forever. A round with entrants has real money in its history
+    /// and must go through `distribute_pot` or `refund_unrevealed_pot` first.
+    #[msg("This round took entries, so its pot must be distributed or refunded before closing")]
+    RoundHadEntrants,
 }
