@@ -12,6 +12,35 @@
 import * as anchor from "@anchor-lang/core";
 import { assert, expect } from "chai";
 import { Harness, FIXED_UNIX_TS } from "./harness.ts";
+
+// --- token-lock helpers for submit_entry's freeze (design doc §B site table) -------------
+// `master_edition` is a Metaplex PDA, so Anchor cannot resolve it and accountsStrict needs it
+// spelled out. For a never-minted flower it is never read -- the freeze helper returns on the
+// mint's emptiness first -- but it is derived properly so these call sites stay correct when
+// the flower IS minted.
+const SG_MPL = new anchor.web3.PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+const sgMintAuth = (h: Harness) =>
+  anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("mint_auth")], h.program.programId)[0];
+// The token account address for a flower's (possibly non-existent) mint. Must be a REAL
+// derived address, not a placeholder: `flower_token` is `mut` now, and the program account
+// itself can never satisfy that -- Solana demotes the invoked program to read-only, which
+// surfaces as ConstraintMut rather than anything mentioning executability.
+const SG_ATA_PROG = new anchor.web3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const SG_TOKEN_PROG = new anchor.web3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const sgFlowerToken = (flower: anchor.web3.PublicKey, owner: anchor.web3.PublicKey, h: Harness) => {
+  const mint = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("flower_mint"), flower.toBuffer()], h.program.programId)[0];
+  return anchor.web3.PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), SG_TOKEN_PROG.toBuffer(), mint.toBuffer()], SG_ATA_PROG)[0];
+};
+const sgMasterEdition = (flower: anchor.web3.PublicKey, h: Harness) => {
+  const mint = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("flower_mint"), flower.toBuffer()], h.program.programId)[0];
+  return anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("metadata"), SG_MPL.toBuffer(), mint.toBuffer(), Buffer.from("edition")],
+    SG_MPL)[0];
+};
 import { seedSgd, feeAccounts, ixSetSgdMint, SGD_MINT, ENTRY_FEE_SGD, openRoundAccounts } from "./sgd.ts";
 
 const { PublicKey } = anchor.web3;
@@ -34,8 +63,8 @@ const MIN_ROUND_DURATION_SECONDS = 43_200; // 12h
 /**
  * TS mirror of `open_round::round_end_time`. A round no longer ends a fixed 24h after it
  * opens: it ends at the next 10:00 UTC that is at least 12h out, which is what stops the
- * daily schedule drifting later every cycle. Kept as an independent transcription (not
- * imported from anywhere) so it witnesses the on-chain behaviour rather than restating it.
+ * daily schedule drifting later every cycle. Kept as an independent transcription so it
+ * witnesses the on-chain behaviour rather than restating it.
  */
 function roundEndTime(now: number): number {
   const dayStart = now - ((now % SECONDS_PER_DAY) + SECONDS_PER_DAY) % SECONDS_PER_DAY;
@@ -44,10 +73,9 @@ function roundEndTime(now: number): number {
   if (anchor - now < MIN_ROUND_DURATION_SECONDS) anchor += SECONDS_PER_DAY;
   return anchor;
 }
-// What a round ACCEPTS — `open_round` writes this into `max_participants`. Deliberately
-// distinct from the program's `MAX_PARTICIPANTS` (still 16), which is the reveal CIRCUIT's
-// fixed slot width. The bracket decoupled the two: a round is now revealed as several
-// shard reveals rather than one call, so acceptance is no longer bounded by circuit width.
+// Round ACCEPTANCE cap (open_round writes this into max_participants). Distinct from the
+// program
+// NOT what a round is opened with any more — the bracket decoupled the two.
 const ROUND_CAPACITY = 221;
 const FLOWER_STATUS_ACTIVE = 0;
 const FLOWER_STATUS_SUBMITTED = 2;
@@ -141,6 +169,16 @@ const ixSubmit = (
       profile: h.profilePda(player),
       round,
       flowerRecord: h.flowerPda(player, flowerIndex),
+      flowerMint: anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("flower_mint"), h.flowerPda(player, flowerIndex).toBuffer()],
+        h.program.programId,
+      )[0],
+      flowerToken: sgFlowerToken(h.flowerPda(player, flowerIndex), player, h),
+      previousProfile: h.profilePda(player),
+      newProfile: h.profilePda(player),
+      masterEdition: sgMasterEdition(h.flowerPda(player, flowerIndex), h),
+      mintAuthority: sgMintAuth(h),
+      tokenMetadataProgram: new anchor.web3.PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"),
       entry: h.entryPda(round, player),
       systemProgram: h.systemProgram(),
       ...feeAccounts(h, player, roundId),
@@ -290,6 +328,19 @@ describe("secret-garden Stage 2: competition rounds", () => {
       expect(entry.status).to.equal(0); // Submitted (only value in Stage 2)
       expect(entry.submittedAt.toNumber()).to.be.greaterThan(0);
 
+      // Stage 5E: the rarity snapshot `reveal_top3_v5` ranks on (`score * 8 + rarity`).
+      // Guarded here because this single write is the one piece of production-only logic the
+      // NFT-layer port had to reinstate by hand: dev's `submit_entry` has no such field, so a
+      // wholesale copy of it drops this line silently and the reveal's tiebreak degrades to
+      // score-only with nothing failing loudly. Assert it against the flower it came from
+      // rather than a constant, so it stays honest if starter rarities are ever rebalanced.
+      const submitted = await h.program.account.flowerRecord.fetch(
+        h.flowerPda(authority.publicKey, 0),
+      );
+      expect(entry.raritySnapshot, "rarity_snapshot must mirror the flower's rarity").to.equal(
+        submitted.rarity,
+      );
+
       const flower = await h.program.account.flowerRecord.fetch(
         h.flowerPda(authority.publicKey, 0),
       );
@@ -345,7 +396,7 @@ describe("secret-garden Stage 2: competition rounds", () => {
 
     it("fails after the round deadline has passed", async () => {
       const { h, authority } = await bootstrapWithOpenRound();
-      // Round opened at FIXED_UNIX_TS; submit one second past its SNAPPED end_time.
+      // Round opened at FIXED_UNIX_TS; submit one second past end_time.
       const afterDeadline = roundEndTime(FIXED_UNIX_TS) + 1;
       const r = await h.send(
         [await ixSubmit(h, authority.publicKey, 1, 0)],

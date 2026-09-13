@@ -62,6 +62,23 @@ describe("breed mutation math — divide-by-2 fix", () => {
 
 describe("breed mutation — threshold-trait clear-rates restored", () => {
   // TRAIT_TABLE >= thresholds for the 7 pick()-based genes affected by the mutation branch.
+  //
+  // CANONICAL SOURCE: `trait_satisfied` in `encrypted-ixs/src/lib.rs` — the single Arcis free
+  // function shared by the `score_entry_v2` and `private_hint` circuits. The numbers below are a
+  // NON-EXECUTABLE mirror (nothing compiles them against the circuit) and cover only the 7
+  // threshold traits this test exercises; Pale (`<`), Recessive Carrier and Mutant (parity) are
+  // absent because the mutation branch does not move their genes. If a threshold changes in the
+  // circuit, change it here too — `tools/trait-satisfied-difftest` guards the Rust-side copies
+  // but cannot see this TypeScript one.
+  //
+  // MUTANT IS COVERED ELSEWHERE, and the reason is worth recording. Excluding it here was
+  // correct about `pick()` but left the trait with no coverage anywhere, which is how the
+  // Soil->Mutant bug survived: `breed_v3` fed soil into `mutation_affinity` and then threw the
+  // signal away in an integer `/2` before the parity test read it, so P(Mutant) was exactly 0.5
+  // for all 256 soil values while the source claimed "soil tilts mutation". Soil now biases the
+  // parity directly (`breed_v5`), and `tools/soil-mutant-difftest` asserts that it genuinely
+  // moves the odds — including a test that the OLD formula still measures as flat, so the new
+  // one cannot pass vacuously.
   const THRESHOLDS: Array<[string, number]> = [
     ["Crimson (color>=180)", 180], ["Full Bloom (petal>=150)", 150],
     ["Broadleaf (leaf>=128)", 128], ["Tall (stem>=160)", 160],

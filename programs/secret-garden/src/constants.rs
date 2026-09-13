@@ -689,3 +689,52 @@ pub const POT_REFUND_MIN_AGE_SECONDS: i64 = 7 * SECONDS_PER_DAY;
 /// Winners a pot is split between, at most. The real divisor is however many of
 /// `top1/top2/top3` are non-default, which is `participant_count.min(3)`.
 pub const MAX_POT_WINNERS: usize = 3;
+
+// ---------------------------------------------------------------------------
+// NFT layer (design doc §B). Flowers stay plain PDAs; an NFT is minted lazily,
+// only when a player wants to list one, via `mint_flower_nft`.
+// ---------------------------------------------------------------------------
+
+/// PDA seed for a flower's mint: `[MINT_SEED, flower_record_pubkey]`.
+///
+/// Seeded on the FLOWER PDA, never on `flower_index`. The index is per-player —
+/// `claim_starters` hardcodes 0..=5 for every wallet — so `[MINT_SEED, index]` would
+/// derive the same address for every player's first starter and the second minter would
+/// collide on `init`. The flower PDA is globally unique and never changes, which also
+/// makes the mint address stable for a marketplace to index.
+pub const MINT_SEED: &[u8] = b"flower_mint";
+
+/// PDA seed for the program's single NFT authority: `[MINT_AUTH_SEED]`.
+///
+/// One PDA for the whole collection, not one per flower. It is the mint and freeze
+/// authority at `initialize_mint2`, the update authority on every metadata account, and
+/// the collection authority that verifies membership. It is ALSO the delegate the
+/// freeze/thaw design approves later — see the design doc §A.
+///
+/// Note it does NOT keep mint/freeze authority: `create_master_edition_v3` transfers both
+/// to the Master Edition PDA (measured, devnet spike #1). That is expected and is why the
+/// lock design goes through Metaplex's delegated freeze rather than SPL Token directly.
+pub const MINT_AUTH_SEED: &[u8] = b"mint_auth";
+
+/// PDA seed for the one-time collection mint: `[COLLECTION_SEED]`.
+///
+/// Derived rather than stored in `GameConfig` on purpose. Appending a `collection_mint`
+/// field would grow the config, which un-suppresses `migrate_config`'s early return and
+/// would let the next migration restamp a live `mutant_weight` back to 255.
+pub const COLLECTION_SEED: &[u8] = b"collection";
+
+/// Symbol on every flower NFT. Within Metaplex's `MAX_SYMBOL_LENGTH` (10).
+pub const NFT_SYMBOL: &str = "SGF";
+
+/// Name prefix. `"SG Hybrid #"` (11) + a u32's worth of digits (10) = 21, inside
+/// Metaplex's `MAX_NAME_LENGTH` (32) at every possible index.
+pub const NFT_NAME_PREFIX: &str = "SG Hybrid #";
+
+/// Metaplex's `MAX_URI_LENGTH`. Validated in `mint_flower_nft` so an over-long URI fails
+/// with our named error instead of deep inside the Metaplex CPI.
+pub const NFT_MAX_URI_LEN: usize = 200;
+
+/// Royalty on secondary sales, in basis points. Zero for now — a non-zero value is a
+/// product decision that has not been taken, and the program keeps `update_authority`, so
+/// it can be changed later via `update_metadata_accounts_v2` without re-minting.
+pub const NFT_SELLER_FEE_BASIS_POINTS: u16 = 0;

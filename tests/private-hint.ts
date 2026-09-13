@@ -98,6 +98,16 @@ const ixQueueHint = (h: Harness, player: PK, roundId: number, flowerIndex: numbe
       player,
       round: h.roundPda(roundId),
       flower: h.flowerPda(player, flowerIndex),
+      // Ownership-sync accounts (§B). The flower is unminted in these suites, so the mint
+      // PDA is empty and the helper returns early — but it is still REQUIRED, because
+      // making it optional would let a caller skip the sync and use a stale owner.
+      flowerMint: anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("flower_mint"), h.flowerPda(player, flowerIndex).toBuffer()],
+        h.program.programId,
+      )[0],
+      flowerToken: h.program.programId,
+      previousProfile: h.profilePda(player),
+      newProfile: h.profilePda(player),
       hintResult: hintPda(h, player),
       signPdaAccount: dummy(),
       mxeAccount: dummy(),

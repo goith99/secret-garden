@@ -226,6 +226,8 @@ pub enum SecretGardenError {
     /// entry would otherwise pull a flower out of a LIVE later round.
     #[msg("That entry has already released its flower")]
     EntryAlreadyReleased,
+
+    // --- start_breeding: per-flower breeding-parent budget ---
     /// A parent has already been bred `MAX_BREEDS_AS_PARENT` times. The cap is per flower
     /// and permanent — it is not refunded by cancelling or by a failed callback, and it is
     /// not reset between rounds (unlike `MAX_BREEDS_PER_ROUND`, which is a per-player,
@@ -233,7 +235,6 @@ pub enum SecretGardenError {
     #[msg("That flower has been used as a breeding parent the maximum number of times")]
     FlowerParentLimitReached,
 
-    // --- $SGD entry fee / pot (Phase 2) ---
     /// The player's $SGD token account holds less than `ENTRY_FEE_SGD`. Checked explicitly
     /// before the transfer CPI so the failure is legible on-chain instead of surfacing as an
     /// opaque SPL Token 0x1.
@@ -325,4 +326,53 @@ pub enum SecretGardenError {
     /// and must go through `distribute_pot` or `refund_unrevealed_pot` first.
     #[msg("This round took entries, so its pot must be distributed or refunded before closing")]
     RoundHadEntrants,
+    /// `mint_flower_nft` was handed a URI longer than Metaplex's `MAX_URI_LENGTH` (200).
+    /// Caught here so it fails with a named error rather than inside the Metaplex CPI.
+    #[msg("Metadata URI is longer than 200 bytes")]
+    UriTooLong,
+    /// `mint_flower_nft` was called on a starter. Only hybrids are mintable — see the
+    /// design doc §E: starters arrive free from `claim_starters`, so making them sellable
+    /// would allow an instant cash-out with no breeding, and it would also break the
+    /// `total_flowers - STARTER_COUNT` collection-cap invariant.
+    #[msg("Starters cannot be minted as NFTs; only bred hybrids are eligible")]
+    StarterNotMintable,
+    /// `close_flower` was called on a flower whose NFT is still live (`mint.supply == 1`).
+    /// Closing the record would orphan a tradeable token backed by nothing — burn it first
+    /// with `burn_flower_nft`.
+    #[msg("This flower still has a live NFT; burn it with burn_flower_nft before closing")]
+    FlowerStillMinted,
+    /// `burn_flower_nft` was called on a flower with no live NFT to burn.
+    #[msg("This flower has no live NFT to burn")]
+    FlowerNotMinted,
+    /// A token account was presented that does not hold this flower's mint.
+    #[msg("That token account is not for this flower's mint")]
+    WrongFlowerMint,
+    /// A token account was presented that does not hold the flower (amount != 1).
+    #[msg("That token account does not hold this flower")]
+    NotFlowerHolder,
+    /// `thaw_flower_nft` was called on a token that is not frozen — nothing to do.
+    #[msg("This flower's token is not frozen")]
+    FlowerNotFrozen,
+    /// `thaw_flower_nft` was called on a token this program is not the delegate of, so the
+    /// freeze was not placed by this program and is not its to lift.
+    #[msg("This program is not the delegate on that token account")]
+    NotFlowerDelegate,
+    /// The flower has an NFT, so its token account MUST be supplied — omitting it would let
+    /// a caller fall back on a stale `FlowerRecord.owner`. See `sync.rs`.
+    #[msg("This flower has an NFT; its token account must be supplied")]
+    FlowerTokenRequired,
+    /// The flower has changed hands and the new holder has no `PlayerProfile`. Refusing is
+    /// deliberate: skipping the counter would let it drift silently. Run `create_profile`.
+    #[msg("The new owner has no profile yet; call create_profile before using this flower")]
+    NewOwnerHasNoProfile,
+    /// A profile account was passed that is not the PDA for the owner it is meant to be.
+    #[msg("Profile account does not match the owner it is supposed to belong to")]
+    ProfileAccountInvalid,
+
+    /// `start_breeding` was called on a flower that changed hands during the round still
+    /// running. The flash-rent cooldown (§E): renting a parent consumes one of the owner's
+    /// three breeding charges, so a flower must settle with its new holder for a full
+    /// competition round before it can breed.
+    #[msg("This flower changed hands too recently; it can breed again next round")]
+    FlowerRecentlyTransferred,
 }

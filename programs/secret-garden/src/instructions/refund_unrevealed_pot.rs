@@ -22,9 +22,9 @@ use crate::state::{CompetitionEntry, CompetitionRound, GameConfig, RoundSettleme
 /// That is not a hypothetical failure: rounds already sit in exactly this state, and the whole
 /// class of it is one Arcium outage wide.
 ///
-/// # Why the entrants and not the treasury
+/// # Why the entrants and not the operator
 ///
-/// A lump-sum sweep to the treasury would have been perhaps a third of this code — one
+/// A lump-sum sweep to the operator would have been perhaps a third of this code — one
 /// transfer, an immutable marker, no cursor, no batching. It was rejected because the money is
 /// not the operator's. An unrevealed round is one where the game FAILED TO RUN: nobody won,
 /// because nothing was ever scored. Every lamport in that vault arrived as an entry fee from a

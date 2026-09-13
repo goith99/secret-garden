@@ -1,6 +1,8 @@
 pub mod constants;
 pub mod error;
 pub mod instructions;
+pub mod freeze;
+pub mod sync;
 pub mod state;
 
 use anchor_lang::prelude::*;
@@ -57,6 +59,37 @@ pub mod secret_garden {
     /// Grants the caller their six starter flowers in a single approval. Callable once.
     pub fn claim_starters(ctx: Context<ClaimStarters>) -> Result<()> {
         instructions::claim_starters::handler(ctx)
+    }
+
+
+    /// One-time, authority-only: creates the Metaplex collection every flower NFT is
+    /// verified into. Must run before the first `mint_flower_nft`.
+    pub fn init_flower_collection(
+        ctx: Context<InitFlowerCollection>,
+        name: String,
+        symbol: String,
+        uri: String,
+    ) -> Result<()> {
+        instructions::init_flower_collection::handler(ctx, name, symbol, uri)
+    }
+
+    /// Permissionless crank: thaws a flower whose status says Active but whose token is
+    /// still frozen from a breed. Same category as `release_flower` — see that instruction.
+    pub fn thaw_flower_nft(ctx: Context<ThawFlowerNft>) -> Result<()> {
+        instructions::thaw_flower_nft::handler(ctx)
+    }
+
+    /// Burns a flower's NFT, returning it to a plain `FlowerRecord`. Owner-only, and the
+    /// precondition for `close_flower` on any flower that was ever minted.
+    pub fn burn_flower_nft(ctx: Context<BurnFlowerNft>) -> Result<()> {
+        instructions::burn_flower_nft::handler(ctx)
+    }
+
+    /// Mints one of the caller's ACTIVE hybrids as a collection-verified NFT. Lazy and
+    /// opt-in — see the instruction for why starters are excluded and why the URI is an
+    /// argument while the name is not.
+    pub fn mint_flower_nft(ctx: Context<MintFlowerNft>, uri: String) -> Result<()> {
+        instructions::mint_flower_nft::handler(ctx, uri)
     }
 
     /// Operator kill-switch: sets `GameConfig::paused`. Authority-only (Stage 5A). The
@@ -371,13 +404,76 @@ pub mod secret_garden {
         water_ciphertext: [u8; 32],
         soil_ciphertext: [u8; 32],
     ) -> Result<()> {
+        // Reconcile both parents before either ownership check. Two calls, one helper — the
+        // three sync duties cannot drift apart between the parents.
+        // The mint PDA check that USED to be an Anchor constraint.
+        //
+        // `flower_*_sync.mint` carried `seeds = [MINT_SEED, flower_x.key().as_ref()]` while the
+        // sync accounts were flat fields. They are now in a composite, and a composite cannot
+        // see the parent struct's `flower_a`/`flower_b`, so Anchor can no longer express it.
+        // It is reinstated here BY HAND because it is not decoration — it is the property that
+        // makes the sync unskippable (design doc §B): the mint's address is DERIVED from the
+        // flower, so a caller cannot lie about whether it exists. Without it, a seller who had
+        // transferred the NFT could pass an unrelated empty account as `mint`, the sync would
+        // take its never-minted early return, and the stale `flower.owner` would let them breed
+        // with a flower they no longer hold.
+        //
+        // It runs BEFORE `sync_flower_owner`, and that ordering is as load-bearing as the check
+        // itself: the sync reads these accounts, so verifying them afterwards would be
+        // verifying input that has already been trusted.
+        {
+            let (expected_a, _) = Pubkey::find_program_address(
+                &[MINT_SEED, ctx.accounts.game.flower_a.key().as_ref()],
+                &crate::ID,
+            );
+            require_keys_eq!(
+                ctx.accounts.flower_a_sync.mint.key(),
+                expected_a,
+                SecretGardenError::WrongFlowerMint
+            );
+            let (expected_b, _) = Pubkey::find_program_address(
+                &[MINT_SEED, ctx.accounts.game.flower_b.key().as_ref()],
+                &crate::ID,
+            );
+            require_keys_eq!(
+                ctx.accounts.flower_b_sync.mint.key(),
+                expected_b,
+                SecretGardenError::WrongFlowerMint
+            );
+        }
+
+        crate::sync::sync_flower_owner(
+            &mut ctx.accounts.game.flower_a,
+            &ctx.accounts.flower_a_sync.mint,
+            &ctx.accounts.flower_a_sync.token,
+            &ctx.accounts.flower_a_sync.previous_profile,
+            &ctx.accounts.flower_a_sync.new_profile,
+        )?;
+        crate::sync::sync_flower_owner(
+            &mut ctx.accounts.game.flower_b,
+            &ctx.accounts.flower_b_sync.mint,
+            &ctx.accounts.flower_b_sync.token,
+            &ctx.accounts.flower_b_sync.previous_profile,
+            &ctx.accounts.flower_b_sync.new_profile,
+        )?;
+        require_keys_eq!(
+            ctx.accounts.game.flower_a.owner,
+            ctx.accounts.player.key(),
+            SecretGardenError::FlowerNotOwned
+        );
+        require_keys_eq!(
+            ctx.accounts.game.flower_b.owner,
+            ctx.accounts.player.key(),
+            SecretGardenError::FlowerNotOwned
+        );
+
         let now = Clock::get()?.unix_timestamp;
         let player_key = ctx.accounts.player.key();
 
         // Stage 5D: enforce the per-round breeding limit BEFORE queuing the computation or
         // creating the experiment/offspring accounts (fail fast, no wasted rent or MPC).
         // The counter resets lazily inside `register_breed_attempt` when the round changes.
-        let current_round = ctx.accounts.config.current_round as u32;
+        let current_round = ctx.accounts.game.config.current_round as u32;
         ctx.accounts.profile.register_breed_attempt(current_round)?;
 
         // V1: enforce the hard hybrid-collection cap in the same fail-fast spot. Breeding a
@@ -391,36 +487,36 @@ pub mod secret_garden {
         // budget. Self-breeding is impossible (`flower_a`/`flower_b` are distinct PDAs and
         // the existing guards reject a Locked parent), so the two increments below cannot
         // target the same account and double-count.
-        ctx.accounts.flower_a.check_breed_as_parent()?;
-        ctx.accounts.flower_b.check_breed_as_parent()?;
+        ctx.accounts.game.flower_a.check_breed_as_parent()?;
+        ctx.accounts.game.flower_b.check_breed_as_parent()?;
         // Both validated, so neither spend can leave the other's budget consumed by a
         // rejected breed. Spent at QUEUE time, not in the callback, and never refunded —
         // see `register_breed_as_parent`.
-        ctx.accounts.flower_a.register_breed_as_parent()?;
-        ctx.accounts.flower_b.register_breed_as_parent()?;
+        ctx.accounts.game.flower_a.register_breed_as_parent()?;
+        ctx.accounts.game.flower_b.register_breed_as_parent()?;
 
         // Read both parents' public kind/species and their stored genome nonces.
-        let flower_a_key = ctx.accounts.flower_a.key();
-        let flower_b_key = ctx.accounts.flower_b.key();
-        let a_kind = ctx.accounts.flower_a.genome_status;
-        let a_species = ctx.accounts.flower_a.visual_species_id;
-        let a_nonce = u128::from_le_bytes(ctx.accounts.flower_a.encryption_metadata);
-        let b_kind = ctx.accounts.flower_b.genome_status;
-        let b_species = ctx.accounts.flower_b.visual_species_id;
-        let b_nonce = u128::from_le_bytes(ctx.accounts.flower_b.encryption_metadata);
+        let flower_a_key = ctx.accounts.game.flower_a.key();
+        let flower_b_key = ctx.accounts.game.flower_b.key();
+        let a_kind = ctx.accounts.game.flower_a.genome_status;
+        let a_species = ctx.accounts.game.flower_a.visual_species_id;
+        let a_nonce = u128::from_le_bytes(ctx.accounts.game.flower_a.encryption_metadata);
+        let b_kind = ctx.accounts.game.flower_b.genome_status;
+        let b_species = ctx.accounts.game.flower_b.visual_species_id;
+        let b_nonce = u128::from_le_bytes(ctx.accounts.game.flower_b.encryption_metadata);
 
         // Public offspring metadata (the genome itself is produced by the MPC and
         // written later by the callback).
-        let a_generation = ctx.accounts.flower_a.generation;
-        let b_generation = ctx.accounts.flower_b.generation;
-        let a_stability = ctx.accounts.flower_a.stability;
-        let b_stability = ctx.accounts.flower_b.stability;
+        let a_generation = ctx.accounts.game.flower_a.generation;
+        let b_generation = ctx.accounts.game.flower_b.generation;
+        let a_stability = ctx.accounts.game.flower_a.stability;
+        let b_stability = ctx.accounts.game.flower_b.stability;
 
         // Public lineage inputs for the circuit's cosmetic rarity roll. Both parents'
         // rarity is already public account data, so passing it as plaintext reveals
         // nothing new and lets the circuit do that arithmetic in the clear.
-        let a_rarity = ctx.accounts.flower_a.rarity;
-        let b_rarity = ctx.accounts.flower_b.rarity;
+        let a_rarity = ctx.accounts.game.flower_a.rarity;
+        let b_rarity = ctx.accounts.game.flower_b.rarity;
         // The offspring's generation, computed here (it is also written to the record
         // below) and saturated into a u8 for the circuit. The circuit clamps it again to
         // RARITY_GENERATION_CAP, so the saturation point never affects the roll.
@@ -500,11 +596,70 @@ pub mod secret_garden {
         )?;
 
         // Lock both parents (the long-reserved FLOWER_STATUS_LOCKED is finally used).
-        ctx.accounts.flower_a.status = FLOWER_STATUS_LOCKED;
-        ctx.accounts.flower_b.status = FLOWER_STATUS_LOCKED;
+        ctx.accounts.game.flower_a.status = FLOWER_STATUS_LOCKED;
+        ctx.accounts.game.flower_b.status = FLOWER_STATUS_LOCKED;
+
+        // ...and lock them at the TOKEN layer too, for any parent that has been minted.
+        // Without this the status flag is advisory once flowers trade: the owner could sell a
+        // LOCKED parent mid-computation and `breed_v5_callback` would release it to someone who
+        // no longer holds it.
+        //
+        // Runs after the sync and the ownership check above, so `player` is provably the
+        // current holder — which is what `Approve` needs as its authority. A never-minted
+        // parent costs one `data_is_empty()` check and nothing else.
+        // --- flash-rent cooldown (design doc §E) ------------------------------------------
+        //
+        // A flower may not breed until the competition round that was running when it changed
+        // hands has ended. Renting a parent permanently consumes one of the owner's three
+        // MAX_BREEDS_AS_PARENT charges, so without this a rental market could spend an asset
+        // the renter does not own and concentrate rarity toward whoever can rent best.
+        //
+        // The window is expressed with `round_end_time`, the SAME pure anchor function
+        // `open_round` uses to place a round's deadline — not a new duration constant. So the
+        // rule a player hears is the one the game already runs on: "next round", not a number
+        // of hours. `last_transfer_at == 0` means never transferred, and the 1970 anchor it
+        // produces is already long past, so claimed and home-bred flowers are unaffected.
+        //
+        // Checked AFTER the sync above, which is what makes it meaningful: the sync is what
+        // stamps `last_transfer_at`, so a flower whose transfer has not been observed yet is
+        // observed right here, in this instruction, before this guard reads it.
+        {
+            let now = Clock::get()?.unix_timestamp;
+            for flower in [&ctx.accounts.game.flower_a, &ctx.accounts.game.flower_b] {
+                if flower.transfer_cooldown_active(now) {
+                    return err!(SecretGardenError::FlowerRecentlyTransferred);
+                }
+            }
+        }
+
+        let mint_auth_bump = ctx.bumps.nft_lock.mint_authority;
+        crate::freeze::freeze_flower_if_minted(
+            crate::freeze::FreezeTarget {
+                flower_mint: &ctx.accounts.flower_a_sync.mint,
+                flower_token: &ctx.accounts.flower_a_sync.token,
+                master_edition: &ctx.accounts.nft_lock.master_edition_a,
+            },
+            &ctx.accounts.player,
+            &ctx.accounts.nft_lock.mint_authority,
+            &ctx.accounts.nft_lock.token_program,
+            &ctx.accounts.nft_lock.token_metadata_program,
+            mint_auth_bump,
+        )?;
+        crate::freeze::freeze_flower_if_minted(
+            crate::freeze::FreezeTarget {
+                flower_mint: &ctx.accounts.flower_b_sync.mint,
+                flower_token: &ctx.accounts.flower_b_sync.token,
+                master_edition: &ctx.accounts.nft_lock.master_edition_b,
+            },
+            &ctx.accounts.player,
+            &ctx.accounts.nft_lock.mint_authority,
+            &ctx.accounts.nft_lock.token_program,
+            &ctx.accounts.nft_lock.token_metadata_program,
+            mint_auth_bump,
+        )?;
 
         // Pre-create the offspring with its PUBLIC metadata only. Arcium callbacks cannot
-        // init accounts, so the genome is written later by `breed_v5_callback`; the flower
+        // init accounts, so the genome is written later by `breed_callback`; the flower
         // starts Locked and is flipped to Active only on a successful callback.
         let offspring_index = ctx.accounts.profile.next_flower_index;
         let offspring_stability = (((a_stability as u16 + b_stability as u16) / 2) as u8)
@@ -514,7 +669,7 @@ pub mod secret_garden {
             flower_index: offspring_index,
             visual_species_id: HYBRID_VISUAL_SPECIES_ID,
             generation: offspring_generation,
-            // Unranked until the MPC roll lands. `breed_v5_callback` overwrites this with the
+            // Unranked until the MPC roll lands. `breed_callback` overwrites this with the
             // rolled tier; a failed or expired breed never reaches the callback, so its
             // offspring correctly keeps rarity 0 alongside its zeroed mask and genome.
             rarity: 0,
@@ -532,6 +687,8 @@ pub mod secret_garden {
             encryption_metadata: [0u8; ENCRYPTION_METADATA_LEN],
             // Stage 5E: a newly bred offspring has never itself been a parent.
             times_bred_as_parent: 0,
+            // Never changed hands: claimed/bred by this owner, so the cooldown never applies.
+            last_transfer_at: 0,
         });
 
         // Record the experiment (Queued) and advance the profile counters.
@@ -560,7 +717,7 @@ pub mod secret_garden {
     /// Permissionless recovery: after `EXPERIMENT_TIMEOUT_SECONDS`, anyone can expire a
     /// stuck Queued/Processing experiment to unlock the player's parents. This touches no
     /// Arcium/MPC state. It sets `callback_processed = true`, so if the MPC computation
-    /// later completes anyway, `breed_v5_callback`'s idempotency guard makes it a no-op —
+    /// later completes anyway, `breed_callback`'s idempotency guard makes it a no-op —
     /// preventing a double `active_experiment_count` decrement or a second resolution.
     /// (Trade-off: a successful-but-late computation is discarded; the pre-created
     /// offspring stays Locked. The priority is recovering the player's parent flowers.)
@@ -623,6 +780,30 @@ pub mod secret_garden {
     /// so the closed index is retired forever (no PDA re-init risk); the freed slot is tracked
     /// purely by the `total_flowers` decrement.
     pub fn close_flower(ctx: Context<CloseFlower>) -> Result<()> {
+        // A flower that was ever minted must have its NFT burned first, or closing the
+        // record here would orphan a tradeable token backed by nothing.
+        //
+        // The question is asked of SUPPLY, not of existence, and that distinction is
+        // load-bearing: legacy SPL Token cannot close a mint account, so a burned flower's
+        // mint PDA survives forever with `supply == 0` (measured on devnet twice). Keying
+        // on "does the PDA exist" would therefore report every burned flower as still
+        // minted and make its record permanently un-closeable.
+        //
+        // Probed by hand rather than typed, for the same reason as `close_pot_vault`'s
+        // settlement: a never-minted flower has NO mint account, and Anchor rejects an
+        // uninitialized typed account before the handler runs. Emptiness is the signal;
+        // the non-empty case is deserialized with the owner checked first.
+        let mint_info = &ctx.accounts.flower_mint;
+        if !mint_info.data_is_empty() {
+            require_keys_eq!(
+                *mint_info.owner,
+                anchor_spl::token::ID,
+                SecretGardenError::FlowerStillMinted
+            );
+            let data = mint_info.try_borrow_data()?;
+            let mint = anchor_spl::token::Mint::try_deserialize(&mut &data[..])?;
+            require!(mint.supply == 0, SecretGardenError::FlowerStillMinted);
+        }
         ctx.accounts.profile.total_flowers = ctx.accounts.profile.total_flowers.saturating_sub(1);
         Ok(())
     }
@@ -2051,6 +2232,21 @@ pub mod secret_garden {
         hint_pubkey: [u8; 32],
         hint_nonce: u128,
     ) -> Result<()> {
+        // Reconcile BEFORE the ownership check, never after: the record is a cache, and
+        // checking a stale cache is how a seller keeps using a flower they sold.
+        crate::sync::sync_flower_owner(
+            &mut ctx.accounts.flower,
+            &ctx.accounts.flower_mint,
+            &ctx.accounts.flower_token,
+            &ctx.accounts.previous_profile,
+            &ctx.accounts.new_profile,
+        )?;
+        require_keys_eq!(
+            ctx.accounts.flower.owner,
+            ctx.accounts.player.key(),
+            SecretGardenError::FlowerNotOwned
+        );
+
         let player_key = ctx.accounts.player.key();
         let flower_key = ctx.accounts.flower.key();
         let genome_nonce = u128::from_le_bytes(ctx.accounts.flower.encryption_metadata);
@@ -2447,6 +2643,130 @@ pub struct InitBreedingCompDef<'info> {
 
 /// Queues a `breed` computation. The signer (`player`) funds the new accounts and must
 /// own both Active parents; the two parents must be distinct flowers.
+// ---------------------------------------------------------------------------------------
+// `start_breeding`'s accounts are grouped into COMPOSITES, and that grouping is load-bearing
+// — it is not organisational tidiness.
+//
+// Anchor generates one `try_accounts` function per `#[derive(Accounts)]` struct, and every
+// field it validates costs stack in that function. `StartBreeding` is the largest account
+// list in the program, and flat it overflows the SBF 4 KB frame: measured at 4,672 bytes
+// before the token lock (over by 296) and 5,056 with it (over by 632).
+//
+// An overflow here does NOT fault. It corrupts the frame, and the symptom is an unrelated
+// account reading back with an all-zero owner — e.g. `config` reported as owned by
+// 11111111111111111111111111111111 no matter which accounts the caller passes. That cost a
+// full debugging cycle to trace back to the real cause, because nothing in the error names
+// the stack.
+//
+// Nesting a group into its own `#[derive(Accounts)]` struct moves its validation into a
+// separate `try_accounts` call, which LLVM does not inline back. Measured savings: the
+// per-flower grouping alone recovered 704 bytes.
+//
+// !!! THE MARGIN IS THIN. !!!
+// With all four groups the frame sits just under 4,096 — single-digit bytes of headroom.
+// ADDING ANY ACCOUNT to `StartBreeding` (or to one of these composites) is likely to push it
+// back over, and the build does NOT fail: `cargo check` never reports stack offsets, and the
+// BPF build emits only a warning-shaped "Error: Function ... Stack offset ..." line that is
+// easy to miss among the identical lines from `anchor_syn`. If you add an account here, grep
+// the build log for `secret_garden.*Stack offset` and confirm it is absent before trusting
+// anything the program does.
+//
+// Note the Arcium queue accounts CANNOT be grouped this way: `#[queue_computation_accounts]`
+// validates its twelve required fields by name against the struct's DIRECT fields and emits
+// `self.mempool_account`-style accessors, so nesting them fails the macro.
+// ---------------------------------------------------------------------------------------
+
+/// Config plus both parents. All three constrain only THEMSELVES — constant seeds, their own
+/// stored bump, their own status — so none needs a parent field and all three can nest.
+#[derive(Accounts)]
+pub struct BreedingGameState<'info> {
+    /// Game config, read to enforce the pause kill-switch.
+    #[account(
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = !config.paused @ SecretGardenError::GamePaused,
+    )]
+    pub config: Box<Account<'info, GameConfig>>,
+
+    // Parents are created full-size by `claim_starters`, so no realloc is needed here;
+    // the `realloc` constraint pattern lives in `realloc_flower_genome`.
+    //
+    // Ownership is NOT checked here. It is checked in the handler, after the sync — see the
+    // handler for why a constraint would read the stale pre-sync owner.
+    #[account(
+        mut,
+        // MUST be `== ACTIVE`, not `!= LOCKED`. The old negative form admitted a SUBMITTED
+        // parent, and `breed_callback` unconditionally writes both parents back to ACTIVE on
+        // completion — so breeding mid-round silently laundered a Submitted flower back into
+        // an Active one regardless of round state, bypassing the round gate that
+        // `release_flower` exists to enforce.
+        constraint = flower_a.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
+    )]
+    pub flower_a: Box<Account<'info, FlowerRecord>>,
+    #[account(
+        mut,
+        constraint = flower_b.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
+    )]
+    pub flower_b: Box<Account<'info, FlowerRecord>>,
+}
+
+/// The four ownership-sync accounts for ONE parent (design doc §B).
+///
+/// `mint` CANNOT carry its `seeds = [MINT_SEED, flower.key()]` constraint here: a composite
+/// cannot see the parent struct's `flower_a`/`flower_b`. That check is reinstated by hand in
+/// the `start_breeding` handler and is REQUIRED, not optional — see the comment there.
+#[derive(Accounts)]
+pub struct FlowerSyncAccounts<'info> {
+    /// CHECK: PDA-verified in the handler against the flower it belongs to, BEFORE the sync.
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: verified in `sync_flower_owner` (mint match + amount == 1).
+    ///
+    /// MUT because step 4b WRITES it: `Approve` sets the delegate and Metaplex's
+    /// `freeze_delegated_account` flips the account state. Step 6's sync only read it, so
+    /// this was readonly until the lock landed; without `mut` the freeze CPI is rejected by
+    /// the runtime with "Cross-program invocation with unauthorized signer or writable
+    /// account" and a bare "<token pubkey>'s writable privilege escalated" — which names the
+    /// account but not the reason. Same failure shape as the delegate needing `mut`, and
+    /// `thaw_flower_nft` already declares its equivalent `mut` for the same reason.
+    #[account(mut)]
+    pub token: UncheckedAccount<'info>,
+    /// CHECK: PDA-checked in the helper against the PRE-sync `flower.owner`.
+    #[account(mut)]
+    pub previous_profile: UncheckedAccount<'info>,
+    /// CHECK: PDA-checked in the helper against the real holder.
+    #[account(mut)]
+    pub new_profile: UncheckedAccount<'info>,
+}
+
+/// The accounts the Metaplex token lock needs, shared across both parents (design doc §A).
+///
+/// No `metadata` account: anchor-spl's `FreezeDelegatedAccount` wrapper carries that field,
+/// but the raw Metaplex instruction it builds never lists it, so it is never passed to
+/// Metaplex and never read. The CPI reuses the flower's mint for that slot rather than
+/// spending two transaction accounts on nothing.
+#[derive(Accounts)]
+pub struct NftLockAccounts<'info> {
+    /// The approved delegate, shared by every flower. Signs the freeze CPI via `invoke_signed`.
+    ///
+    /// MUT is load-bearing, not cosmetic: Metaplex declares the delegate `[writable, signer]`
+    /// on freeze/thaw, and without `mut` the runtime rejects the CPI with "Cross-program
+    /// invocation with unauthorized signer or writable account" — naming neither the account
+    /// nor the reason. Caught for real while building `thaw_flower_nft`.
+    ///
+    /// Its seeds are a constant, so unlike the per-flower mints this constraint SURVIVES the
+    /// move into a composite.
+    /// CHECK: PDA, derived; never deserialized.
+    #[account(mut, seeds = [MINT_AUTH_SEED], bump)]
+    pub mint_authority: UncheckedAccount<'info>,
+    pub token_program: Program<'info, anchor_spl::token::Token>,
+    pub token_metadata_program: Program<'info, anchor_spl::metadata::Metadata>,
+    /// CHECK: validated by Metaplex. Holds freeze authority since `create_master_edition_v3`
+    /// took it, which is why the lock routes through Metaplex rather than SPL Token.
+    pub master_edition_a: UncheckedAccount<'info>,
+    /// CHECK: validated by Metaplex.
+    pub master_edition_b: UncheckedAccount<'info>,
+}
+
 #[queue_computation_accounts("breed_v5", player)]
 #[derive(Accounts)]
 #[instruction(computation_offset: u64)]
@@ -2454,14 +2774,6 @@ pub struct StartBreeding<'info> {
     #[account(mut)]
     pub player: Signer<'info>,
 
-    /// Game config, read to enforce the pause kill-switch (Stage 5A: this player-facing
-    /// instruction previously had no pause gate — added here, logic otherwise unchanged).
-    #[account(
-        seeds = [CONFIG_SEED],
-        bump = config.bump,
-        constraint = !config.paused @ SecretGardenError::GamePaused,
-    )]
-    pub config: Box<Account<'info, GameConfig>>,
 
     // --- game state ---
     // Boxed to keep `try_accounts` off the SBF stack: FlowerRecord is large once the
@@ -2474,27 +2786,20 @@ pub struct StartBreeding<'info> {
         bump = profile.bump,
     )]
     pub profile: Box<Account<'info, PlayerProfile>>,
-    // Parents are created full-size by `claim_starters`, so no realloc is needed here;
-    // the `realloc` constraint pattern lives in `realloc_flower_genome`.
-    #[account(
-        mut,
-        constraint = flower_a.owner == player.key() @ SecretGardenError::FlowerNotOwned,
-        // MUST be `== ACTIVE`, not `!= LOCKED`. The old negative form admitted a SUBMITTED
-        // parent, and `breed_v5_callback` unconditionally writes both parents back to ACTIVE on
-        // completion — so breeding mid-round silently laundered a Submitted flower back into
-        // an Active one regardless of round state, bypassing the round gate that
-        // `release_flower` exists to enforce.
-        constraint = flower_a.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
-    )]
-    pub flower_a: Box<Account<'info, FlowerRecord>>,
-    #[account(
-        mut,
-        constraint = flower_b.key() != flower_a.key() @ SecretGardenError::ParentsMustBeDistinct,
-        constraint = flower_b.owner == player.key() @ SecretGardenError::FlowerNotOwned,
-        // Same `== ACTIVE` requirement as `flower_a` — see the note there.
-        constraint = flower_b.status == FLOWER_STATUS_ACTIVE @ SecretGardenError::FlowerNotActive,
-    )]
-    pub flower_b: Box<Account<'info, FlowerRecord>>,
+
+    /// Config + both parents (see the note above these structs on why this is grouped).
+    pub game: BreedingGameState<'info>,
+    // In the common case (both parents unminted, same owner) the sync groups add only THREE
+    // unique keys to the transaction — the two mint PDAs plus one shared placeholder —
+    // because Solana dedupes identical pubkeys and the profile slots collapse onto the
+    // caller's own `profile`. Worst case is eight.
+    /// Ownership-sync accounts for parent A.
+    pub flower_a_sync: FlowerSyncAccounts<'info>,
+    /// Ownership-sync accounts for parent B.
+    pub flower_b_sync: FlowerSyncAccounts<'info>,
+    /// Shared Metaplex lock accounts for both parents.
+    pub nft_lock: NftLockAccounts<'info>,
+
     #[account(
         init,
         payer = player,
@@ -2509,7 +2814,7 @@ pub struct StartBreeding<'info> {
     pub experiment: Box<Account<'info, Experiment>>,
     /// Offspring flower, pre-created here (Arcium callbacks cannot init accounts). Its
     /// index is the wallet's running `total_flowers` (starters occupy 0..=5). The genome
-    /// is written by `breed_v5_callback`.
+    /// is written by `breed_callback`.
     #[account(
         init,
         payer = player,
@@ -2706,6 +3011,13 @@ pub struct CloseFlower<'info> {
             @ SecretGardenError::StarterNotDeletable,
     )]
     pub flower: Account<'info, FlowerRecord>,
+
+    /// CHECK: address pinned by the seeds, so nothing else can be presented here. Its
+    /// EMPTINESS is the signal — a flower that was never minted has no mint account at all,
+    /// which is the common case under lazy minting. The handler deserializes the non-empty
+    /// case after checking the owner.
+    #[account(seeds = [MINT_SEED, flower.key().as_ref()], bump)]
+    pub flower_mint: UncheckedAccount<'info>,
 }
 
 /// Permissionless reset of a stuck scoring computation (see `cancel_stuck_score`). No
@@ -3460,10 +3772,30 @@ pub struct QueuePrivateHint<'info> {
     /// supplied by the caller). Must be owned by the signer and not Locked — a hint is
     /// checkable for Active OR Submitted flowers, just not one that is mid-breed.
     #[account(
-        constraint = flower.owner == player.key() @ SecretGardenError::FlowerNotOwned,
+        mut,
         constraint = flower.status != FLOWER_STATUS_LOCKED @ SecretGardenError::FlowerNotActive,
     )]
     pub flower: Box<Account<'info, FlowerRecord>>,
+
+    // --- ownership sync (design doc §B). The `flower.owner == player` check moved out of
+    //     the constraint list and into the handler, because it must run AFTER the sync:
+    //     against a stale record it would accept a seller who no longer holds the flower.
+    /// CHECK: seeds-pinned, so the caller cannot hide that this flower has an NFT. Empty
+    /// means never minted, which means it cannot have changed hands.
+    #[account(seeds = [MINT_SEED, flower.key().as_ref()], bump)]
+    pub flower_mint: UncheckedAccount<'info>,
+    /// CHECK: verified in `sync_flower_owner` — mint must match and amount must be 1, which
+    /// only the true holder's account can satisfy.
+    pub flower_token: UncheckedAccount<'info>,
+    /// CHECK: PDA-checked in the helper against the PRE-sync `flower.owner`.
+    #[account(mut)]
+    pub previous_profile: UncheckedAccount<'info>,
+    /// CHECK: PDA-checked in the helper against the real holder. THIS is the site where the
+    /// no-profile refusal is load-bearing: unlike `start_breeding` and `submit_entry`, this
+    /// instruction has no profile of its own, so without this account a buyer who never
+    /// played would reach the sync with nowhere to put the increment.
+    #[account(mut)]
+    pub new_profile: UncheckedAccount<'info>,
 
     /// The single overwritable per-player hint account. `init_if_needed`: created on the
     /// first request, reused (overwritten) on every later one.

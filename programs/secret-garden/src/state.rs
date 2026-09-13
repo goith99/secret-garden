@@ -288,9 +288,38 @@ pub struct FlowerRecord {
     /// grows by one byte, so a pre-5E FlowerRecord (528 bytes) cannot be read as this struct
     /// (529 bytes) until `migrate_flower` reallocs it. See that instruction.
     pub times_bred_as_parent: u8,
+    /// Unix timestamp of the last ownership change this program OBSERVED, or 0 for a flower
+    /// that has never changed hands (claimed or bred by its current owner).
+    ///
+    /// Appended LAST, after `times_bred_as_parent`, so every existing field offset is
+    /// unchanged. The account still grows by 8 bytes (529 -> 537), so an un-migrated record
+    /// cannot be deserialised as this struct until `operator_migrate_flower` reallocs it.
+    ///
+    /// Written by `sync_flower_owner`, and only inside the branch that actually corrects
+    /// `owner` — see the note there on why stamping every touch would lock an owner out of
+    /// their own flower. Read by `start_breeding`'s flash-rent cooldown (design doc §E).
+    pub last_transfer_at: i64,
 }
 
 impl FlowerRecord {
+    /// Is this flower still inside the flash-rent cooldown at `now`? (design doc §E)
+    ///
+    /// A flower may not breed until the competition round that was running when it changed
+    /// hands has ended. Expressed with `round_end_time` — the same pure anchor function
+    /// `open_round` uses to place a deadline — rather than a duration constant, so the rule
+    /// is "next round" in the game's own terms instead of a number of hours.
+    ///
+    /// `last_transfer_at == 0` means never transferred; the 1970 anchor that produces is long
+    /// past, so claimed and home-bred flowers are never gated.
+    ///
+    /// Pure (no Anchor context), so it is unit-testable in isolation like
+    /// `check_collection_cap` and `register_breed_attempt`; the `start_breeding` body that
+    /// calls it is unreachable under bankrun, because its Arcium accounts do not exist there.
+    pub fn transfer_cooldown_active(&self, now: i64) -> bool {
+        self.last_transfer_at != 0
+            && now < crate::instructions::open_round::round_end_time(self.last_transfer_at)
+    }
+
     /// Stage 5E per-flower breeding-parent budget. Returns `Err(FlowerParentLimitReached)`
     /// once this flower has already been a parent `MAX_BREEDS_AS_PARENT` times, and
     /// otherwise spends one use.

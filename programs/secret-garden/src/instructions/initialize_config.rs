@@ -39,7 +39,8 @@ pub(crate) fn handler(ctx: Context<InitializeConfig>) -> Result<()> {
         // ever switched on deliberately, via `set_mutant_weight`.
         mutant_weight: MUTANT_WEIGHT_UNIFORM,
         restore_ts: 0,
-        // Unset sentinel — every fee path refuses to run until `set_sgd_mint` pins it.
+        // Not set at genesis: `set_sgd_mint` pins it once, and every fee path refuses to
+        // run while it is still the default, so a fresh config simply has fees disabled.
         sgd_mint: Pubkey::default(),
         // No handover in flight at genesis.
         pending_authority: Pubkey::default(),

@@ -30,6 +30,35 @@ import * as anchor from "@anchor-lang/core";
 import BN from "bn.js";
 import { assert } from "chai";
 import { Harness, FIXED_UNIX_TS } from "./harness.ts";
+
+// --- token-lock helpers for submit_entry's freeze (design doc §B site table) -------------
+// `master_edition` is a Metaplex PDA, so Anchor cannot resolve it and accountsStrict needs it
+// spelled out. For a never-minted flower it is never read -- the freeze helper returns on the
+// mint's emptiness first -- but it is derived properly so these call sites stay correct when
+// the flower IS minted.
+const SG_MPL = new anchor.web3.PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+const sgMintAuth = (h: Harness) =>
+  anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("mint_auth")], h.program.programId)[0];
+// The token account address for a flower's (possibly non-existent) mint. Must be a REAL
+// derived address, not a placeholder: `flower_token` is `mut` now, and the program account
+// itself can never satisfy that -- Solana demotes the invoked program to read-only, which
+// surfaces as ConstraintMut rather than anything mentioning executability.
+const SG_ATA_PROG = new anchor.web3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const SG_TOKEN_PROG = new anchor.web3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const sgFlowerToken = (flower: anchor.web3.PublicKey, owner: anchor.web3.PublicKey, h: Harness) => {
+  const mint = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("flower_mint"), flower.toBuffer()], h.program.programId)[0];
+  return anchor.web3.PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), SG_TOKEN_PROG.toBuffer(), mint.toBuffer()], SG_ATA_PROG)[0];
+};
+const sgMasterEdition = (flower: anchor.web3.PublicKey, h: Harness) => {
+  const mint = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("flower_mint"), flower.toBuffer()], h.program.programId)[0];
+  return anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("metadata"), SG_MPL.toBuffer(), mint.toBuffer(), Buffer.from("edition")],
+    SG_MPL)[0];
+};
 import { seedSgd, feeAccounts, ixSetSgdMint, SGD_MINT, ENTRY_FEE_SGD, openRoundAccounts } from "./sgd.ts";
 
 const { PublicKey } = anchor.web3;
@@ -124,6 +153,16 @@ const ixSubmit = (h: Harness, player: PK, roundId: number, flower: PK) => {
       profile: h.profilePda(player),
       round,
       flowerRecord: flower,
+      flowerMint: anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("flower_mint"), flower.toBuffer()],
+        h.program.programId,
+      )[0],
+      flowerToken: sgFlowerToken(flower, player, h),
+      previousProfile: h.profilePda(player),
+      newProfile: h.profilePda(player),
+      masterEdition: sgMasterEdition(flower, h),
+      mintAuthority: sgMintAuth(h),
+      tokenMetadataProgram: new anchor.web3.PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"),
       entry: h.entryPda(round, player),
       systemProgram: h.systemProgram(),
       ...feeAccounts(h, player, roundId),
@@ -143,9 +182,14 @@ const ixFinalize = (h: Harness, authority: PK, roundId: number) =>
     .accountsStrict({ authority, config: h.configPda(), round: h.roundPda(roundId) })
     .instruction();
 
+/**
+ * `submitter` is used ONLY to derive the entry PDA — release is permissionless now, so it
+ * is not a signer and does not appear in the account list. Whoever signs the transaction
+ * is irrelevant to the program.
+ */
 const ixRelease = (
   h: Harness,
-  owner: PK,
+  submitter: PK,
   roundId: number,
   flower: PK,
   entryOverride?: PK,
@@ -154,11 +198,17 @@ const ixRelease = (
   return h.program.methods
     .releaseFlower()
     .accountsStrict({
-      owner,
       config: h.configPda(),
       round,
-      entry: entryOverride ?? h.entryPda(round, owner),
+      entry: entryOverride ?? h.entryPda(round, submitter),
       flower,
+      flowerMint: anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("flower_mint"), flower.toBuffer()],
+        h.program.programId,
+      )[0],
+      flowerToken: h.program.programId,
+      previousProfile: h.profilePda(submitter),
+      newProfile: h.profilePda(submitter),
     })
     .instruction();
 };
@@ -171,6 +221,10 @@ const ixCloseFlower = (h: Harness, owner: PK, flower: PK) =>
       config: h.configPda(),
       profile: h.profilePda(owner),
       flower,
+      flowerMint: anchor.web3.PublicKey.findProgramAddressSync(
+        [Buffer.from("flower_mint"), flower.toBuffer()],
+        h.program.programId,
+      )[0],
     })
     .instruction();
 
@@ -369,31 +423,47 @@ describe("release_flower — returning a competed flower to the collection", () 
       );
     });
 
-    it("REJECTS a caller who is not the flower's owner", async () => {
+    it("PERMISSIONLESS: a stranger CAN release someone else's finalized flower", async () => {
+      // Was "REJECTS a caller who is not the flower's owner". The rule inverted deliberately:
+      // requiring the owner to sign AND deriving the entry from that signer is precisely the
+      // pair that strands a Submitted flower once it changes hands. Release now asks whether
+      // the round is finalized, not who is asking.
       const { h, authority, hybrid } = await bootstrapSubmitted();
       await h.send([await ixClose(h, authority.publicKey, 1)], [authority]);
       await h.send([await ixFinalize(h, authority.publicKey, 1)], [authority]);
 
-      // A stranger cannot pass their own entry PDA (they have none), so they must reuse
-      // the victim's — which no longer matches the [ENTRY_SEED, round, stranger] seeds.
       const stranger = h.fundedKeypair();
       const r = await h.send(
-        [
-          await ixRelease(
-            h,
-            stranger.publicKey,
-            1,
-            hybrid,
-            h.entryPda(h.roundPda(1), authority.publicKey),
-          ),
-        ],
-        [stranger],
+        [await ixRelease(h, authority.publicKey, 1, hybrid)],
+        [stranger], // signs the transaction; is not an account the program sees
       );
-      assert.isNotNull(r.result, "a stranger must not be able to release someone's flower");
+      assert.isNull(r.result, `a stranger must be able to release: ${r.result}`);
       assert.equal(
         (await h.program.account.flowerRecord.fetch(hybrid)).status,
-        FLOWER_STATUS_SUBMITTED,
+        FLOWER_STATUS_ACTIVE,
+        "the flower must come back Active",
       );
+      // ...and the flower still belongs to its owner. Release returns control, never takes it.
+      assert.equal(
+        (await h.program.account.flowerRecord.fetch(hybrid)).owner.toBase58(),
+        authority.publicKey.toBase58(),
+      );
+    });
+
+    it("PERMISSIONLESS: the release still burns the entry, so a stranger cannot replay it", async () => {
+      const { h, authority, hybrid } = await bootstrapSubmitted();
+      await h.send([await ixClose(h, authority.publicKey, 1)], [authority]);
+      await h.send([await ixFinalize(h, authority.publicKey, 1)], [authority]);
+
+      const stranger = h.fundedKeypair();
+      assert.isNull(
+        (await h.send([await ixRelease(h, authority.publicKey, 1, hybrid)], [stranger])).result,
+      );
+      const second = await h.send(
+        [await ixRelease(h, authority.publicKey, 1, hybrid)],
+        [stranger],
+      );
+      assert.isNotNull(second.result, "one-shot must survive going permissionless");
     });
 
     it("REJECTS a starter flower (starters keep the STARTER genome status)", async () => {

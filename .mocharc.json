@@ -11,7 +11,9 @@
     "tests/bracket-generation.ts",
     "tests/final-reveal-order.ts",
     "tests/pot.ts",
-    "tests/authority.ts"
+    "tests/authority.ts",
+    "tests/mint-flower-nft.ts",
+    "tests/flower-migration.ts"
   ],
   "timeout": 1000000,
   "slow": 30000

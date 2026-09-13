@@ -44,6 +44,10 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
 );
 
+export const TOKEN_METADATA_PROGRAM_ID = new anchor.web3.PublicKey(
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
+);
+
 /** Associated-token-account address for (owner, mint). */
 export function ataFor(
   owner: anchor.web3.PublicKey,
@@ -113,6 +117,13 @@ export class Harness {
         {
           name: "spl_associated_token_account",
           programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+        },
+        // mint_flower_nft CPIs into Metaplex three times (metadata, master edition,
+        // collection verification), and its `Program<'info, Metadata>` account check needs
+        // the real program to be executable here. Dumped from devnet like the two above.
+        {
+          name: "mpl_token_metadata",
+          programId: TOKEN_METADATA_PROGRAM_ID,
         },
       ],
       [],

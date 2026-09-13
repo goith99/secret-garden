@@ -74,7 +74,6 @@ pub struct OpenRound<'info> {
 
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -82,6 +81,14 @@ pub(crate) fn handler(ctx: Context<OpenRound>) -> Result<()> {
     require!(
         is_operator_or_authority(&ctx.accounts.config, &ctx.accounts.authority.key()),
         SecretGardenError::NotAuthority
+    );
+
+    // The vault is an ATA of `config.sgd_mint`, so the mint must be pinned before any round
+    // can be opened. Named error rather than a confusing constraint failure on `sgd_mint`.
+    require_keys_neq!(
+        ctx.accounts.config.sgd_mint,
+        Pubkey::default(),
+        SecretGardenError::SgdMintNotSet
     );
 
     let current = ctx.accounts.config.current_round;

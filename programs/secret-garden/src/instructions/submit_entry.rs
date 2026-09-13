@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::get_associated_token_address;
+use anchor_spl::metadata::Metadata;
 use anchor_spl::token::{transfer_checked, Mint, Token, TokenAccount, TransferChecked};
 
 use crate::constants::*;
@@ -41,9 +42,53 @@ pub struct SubmitEntry<'info> {
     )]
     pub round: Box<Account<'info, CompetitionRound>>,
 
-    /// Flower being submitted. Ownership and status are validated in the handler.
+    /// Flower being submitted. Ownership and status are validated in the handler, AFTER the
+    /// ownership sync below — checking a stale record would accept a seller who no longer
+    /// holds the flower.
     #[account(mut)]
     pub flower_record: Box<Account<'info, FlowerRecord>>,
+
+    // --- ownership sync (design doc §B) -------------------------------------------------
+    /// CHECK: seeds-pinned, so a caller cannot hide that this flower has an NFT.
+    #[account(seeds = [MINT_SEED, flower_record.key().as_ref()], bump)]
+    pub flower_mint: UncheckedAccount<'info>,
+    /// CHECK: verified in `sync_flower_owner` (mint match + amount == 1).
+    ///
+    /// MUT because the token lock below WRITES it: `Approve` sets the delegate and Metaplex's
+    /// `freeze_delegated_account` flips the account state. It was read-only while the sync was
+    /// the only thing touching it; without `mut` the freeze CPI is rejected by the runtime with
+    /// "Cross-program invocation with unauthorized signer or writable account" and a bare
+    /// "<token pubkey>'s writable privilege escalated". Exactly the bug found in
+    /// `start_breeding` during step 4b's devnet verification — same shape, same fix.
+    #[account(mut)]
+    pub flower_token: UncheckedAccount<'info>,
+    /// CHECK: PDA-checked in the helper against the PRE-sync `flower.owner`.
+    #[account(mut)]
+    pub previous_profile: UncheckedAccount<'info>,
+    /// CHECK: PDA-checked in the helper against the real holder.
+    ///
+    /// The helper's no-profile refusal is reachable here in principle but not in practice:
+    /// this instruction already takes the caller's own `profile` above, so a caller without
+    /// one fails Anchor's `AccountNotInitialized` before the handler runs. Kept uniform with
+    /// the other four sites rather than special-cased — one shape, five call sites.
+    #[account(mut)]
+    pub new_profile: UncheckedAccount<'info>,
+
+    // --- token lock (design doc §B site table: submit_entry -> SUBMITTED, freeze x1) -------
+    //
+    // The mint and token accounts are already above, supplied by the sync, so the lock adds
+    // only three. All are inert for a never-minted flower: `freeze_flower_if_minted` returns
+    // on the mint's emptiness before reading any of them.
+    /// CHECK: validated by Metaplex. Holds freeze authority since `create_master_edition_v3`
+    /// took it, which is why the lock routes through Metaplex rather than SPL Token.
+    pub master_edition: UncheckedAccount<'info>,
+    /// The approved delegate, shared by every flower. Signs the freeze CPI via `invoke_signed`.
+    ///
+    /// MUT is load-bearing: Metaplex declares the delegate `[writable, signer]`.
+    /// CHECK: PDA, derived; never deserialized.
+    #[account(mut, seeds = [MINT_AUTH_SEED], bump)]
+    pub mint_authority: UncheckedAccount<'info>,
+    pub token_metadata_program: Program<'info, Metadata>,
 
     #[account(
         init,
@@ -110,6 +155,15 @@ pub(crate) fn handler(ctx: Context<SubmitEntry>) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
     let player = ctx.accounts.player.key();
     let entry_bump = ctx.bumps.entry;
+
+    // Reconcile before the ownership check, never after.
+    crate::sync::sync_flower_owner(
+        &mut ctx.accounts.flower_record,
+        &ctx.accounts.flower_mint,
+        &ctx.accounts.flower_token,
+        &ctx.accounts.previous_profile,
+        &ctx.accounts.new_profile,
+    )?;
 
     {
         let flower = &ctx.accounts.flower_record;
@@ -214,5 +268,35 @@ pub(crate) fn handler(ctx: Context<SubmitEntry>) -> Result<()> {
     ctx.accounts.round.participant_count += 1;
     ctx.accounts.profile.final_submissions =
         ctx.accounts.profile.final_submissions.saturating_add(1);
+
+    // ...and lock it at the TOKEN layer too, for a flower that has been minted.
+    //
+    // Without this the SUBMITTED flag is advisory once flowers trade. The entry binds the
+    // round's payout to `entry.player` by key, so nothing is mis-paid — but a buyer can
+    // acquire the flower mid-round with no on-chain signal that its winnings belong to the
+    // seller, and a buyer with no `PlayerProfile` blocks `release_flower` for everyone,
+    // because the sync's no-profile refusal fires whoever calls it.
+    //
+    // Runs after the sync and the `flower.owner == player` check above, so `player` is
+    // provably the current holder — which is what `Approve` needs as its authority. A
+    // never-minted flower, the common case under lazy minting, costs one `data_is_empty()`.
+    //
+    // No thaw is added anywhere for this. `release_flower` returns the flower to ACTIVE, and
+    // the permissionless crank's trigger — ACTIVE + frozen + our delegate — does not care
+    // which instruction placed the freeze, so it collects these exactly as it collects
+    // post-breed ones.
+    crate::freeze::freeze_flower_if_minted(
+        crate::freeze::FreezeTarget {
+            flower_mint: &ctx.accounts.flower_mint,
+            flower_token: &ctx.accounts.flower_token,
+            master_edition: &ctx.accounts.master_edition,
+        },
+        &ctx.accounts.player,
+        &ctx.accounts.mint_authority,
+        &ctx.accounts.token_program,
+        &ctx.accounts.token_metadata_program,
+        ctx.bumps.mint_authority,
+    )?;
+
     Ok(())
 }

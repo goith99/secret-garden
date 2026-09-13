@@ -10,6 +10,35 @@ import fs from "fs";
 import BN from "bn.js";
 import { assert, expect } from "chai";
 import { FIXED_UNIX_TS, Harness, ataFor, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "./harness.ts";
+
+// --- token-lock helpers for submit_entry's freeze (design doc §B site table) -------------
+// `master_edition` is a Metaplex PDA, so Anchor cannot resolve it and accountsStrict needs it
+// spelled out. For a never-minted flower it is never read -- the freeze helper returns on the
+// mint's emptiness first -- but it is derived properly so these call sites stay correct when
+// the flower IS minted.
+const SG_MPL = new anchor.web3.PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
+const sgMintAuth = (h: Harness) =>
+  anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("mint_auth")], h.program.programId)[0];
+// The token account address for a flower's (possibly non-existent) mint. Must be a REAL
+// derived address, not a placeholder: `flower_token` is `mut` now, and the program account
+// itself can never satisfy that -- Solana demotes the invoked program to read-only, which
+// surfaces as ConstraintMut rather than anything mentioning executability.
+const SG_ATA_PROG = new anchor.web3.PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const SG_TOKEN_PROG = new anchor.web3.PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const sgFlowerToken = (flower: anchor.web3.PublicKey, owner: anchor.web3.PublicKey, h: Harness) => {
+  const mint = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("flower_mint"), flower.toBuffer()], h.program.programId)[0];
+  return anchor.web3.PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), SG_TOKEN_PROG.toBuffer(), mint.toBuffer()], SG_ATA_PROG)[0];
+};
+const sgMasterEdition = (flower: anchor.web3.PublicKey, h: Harness) => {
+  const mint = anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("flower_mint"), flower.toBuffer()], h.program.programId)[0];
+  return anchor.web3.PublicKey.findProgramAddressSync(
+    [Buffer.from("metadata"), SG_MPL.toBuffer(), mint.toBuffer(), Buffer.from("edition")],
+    SG_MPL)[0];
+};
 import {
   seedSgd,
   feeAccounts,
@@ -59,7 +88,18 @@ const ixSubmit = (h: Harness, player: PK, roundId: number, flowerIndex: number, 
   const round = h.roundPda(roundId);
   return h.program.methods.submitEntry().accountsStrict({
     player, config: h.configPda(), profile: h.profilePda(player), round,
-    flowerRecord: h.flowerPda(player, flowerIndex), entry: h.entryPda(round, player),
+    flowerRecord: h.flowerPda(player, flowerIndex),
+    flowerMint: PublicKey.findProgramAddressSync(
+      [Buffer.from("flower_mint"), h.flowerPda(player, flowerIndex).toBuffer()],
+      h.program.programId,
+    )[0],
+    flowerToken: sgFlowerToken(h.flowerPda(player, flowerIndex), player, h),
+    previousProfile: h.profilePda(player),
+    newProfile: h.profilePda(player),
+    masterEdition: sgMasterEdition(h.flowerPda(player, flowerIndex), h),
+    mintAuthority: sgMintAuth(h),
+    tokenMetadataProgram: new anchor.web3.PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"),
+    entry: h.entryPda(round, player),
     systemProgram: h.systemProgram(),
     ...feeAccounts(h, player, roundId), ...(override ?? {}),
   }).instruction();
@@ -152,6 +192,8 @@ const ERR_BATCH_LONG = "0x17b6"; // 6070 RefundBatchTooLong
 const ERR_REFUND_INCOMPLETE = "0x17b7"; // 6071 RefundIncomplete
 const ERR_NOT_SETTLED = "0x17b8"; // 6072 PotNotSettled
 const ERR_WRONG_ROUND = "0x17b9"; // 6073 EntryWrongRound
+const ERR_TREASURY_LOW = "0x17ba"; // 6074 TreasuryUnderfunded
+const ERR_PRIZE_TOO_BIG = "0x17bb"; // 6075 PrizeAmountTooLarge
 const ERR_WRONG_WINNER = "0x17ba"; // 6074 WrongWinnerAccount
 // Anchor built-in: a typed account that does not exist yet.
 const ERR_UNINIT = "0xbc4"; // 3012 AccountNotInitialized
@@ -198,6 +240,12 @@ async function unrevealedRound(k: number) {
   return { h, authority, players: subs, rows };
 }
 const flat = (rows: any[]) => rows.flatMap((r) => [r.entry, r.ata]);
+
+/** The program's IDL, for surface-level regression assertions. */
+const h_idl = (): any => {
+  const raw = fs.readFileSync("./target/idl/secret_garden.json", "utf8");
+  return JSON.parse(raw);
+};
 
 describe("$SGD entry-fee pot", () => {
   describe("vault provisioning", () => {
@@ -1206,9 +1254,35 @@ describe("$SGD entry-fee pot", () => {
     });
   });
 
-    // -------------------------------------------------------------------------------------
-    // Neither the SOL prize nor the monolithic reveal exists any more
-    // -------------------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // There is no SOL prize any more (audit H-4)
+  // ---------------------------------------------------------------------------
+  describe("no SOL prize exists", () => {
+    it("REGRESSION (audit H-4): pay_sol_prizes and PrizeDistribution are gone", () => {
+      // The SOL prize was an external treasury subsidy. Because the pot splits between
+      // k = min(entrants, 3) winners, at three entrants or fewer EVERY entrant won and was
+      // refunded their fee in full, so the subsidy paid out free SOL for turning up unopposed
+      // — which rounds 69 and 72 did without anyone trying. A participant threshold only
+      // raised the attacker's setup cost; deleting the subsidy removes the mechanism itself.
+      //
+      // The $SGD pot is the whole prize now, and it is the entrants' own fees: a sybil holding
+      // every entry recovers exactly what they paid, so there is nothing left to farm.
+      const idl = h_idl();
+      expect(
+        idl.instructions.find((i: any) => i.name === "pay_sol_prizes" || i.name === "paySolPrizes"),
+        "pay_sol_prizes must no longer exist",
+      ).to.equal(undefined);
+      expect(
+        idl.accounts.find((a: any) => a.name === "PrizeDistribution"),
+        "PrizeDistribution must no longer exist",
+      ).to.equal(undefined);
+      // distribute_pot survives — it is the prize now.
+      expect(
+        idl.instructions.find((i: any) => i.name === "distribute_pot" || i.name === "distributePot"),
+        "distribute_pot must remain",
+      ).to.not.equal(undefined);
+    });
+  });
     describe("removed instruction surface", () => {
       it("REGRESSION (audit C-1 + H-4): the exploitable instructions are gone", () => {
         // C-1: queue_reveal_top3 and its _v3 twin validated remaining_accounts with only
@@ -1240,4 +1314,5 @@ describe("$SGD entry-fee pot", () => {
         }
       });
     });
+
 });
