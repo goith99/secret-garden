@@ -8,6 +8,7 @@
 import * as anchor from "@anchor-lang/core";
 import BN from "bn.js";
 import { assert, expect } from "chai";
+import fs from "fs";
 import {
   Harness,
   ataFor,
@@ -64,6 +65,8 @@ const mintAuthPda = (h: Harness) =>
   PublicKey.findProgramAddressSync([seed("mint_auth")], h.program.programId)[0];
 const collectionMintPda = (h: Harness) =>
   PublicKey.findProgramAddressSync([seed("collection")], h.program.programId)[0];
+const mintGatePda = (h: Harness) =>
+  PublicKey.findProgramAddressSync([seed("mint_gate")], h.program.programId)[0];
 const flowerMintPda = (h: Harness, flower: PK) =>
   PublicKey.findProgramAddressSync([seed("flower_mint"), flower.toBuffer()], h.program.programId)[0];
 const metadataPda = (mint: PK) =>
@@ -99,6 +102,18 @@ const ixInitCollection = (h: Harness, authority: PK) => {
     .instruction();
 };
 
+/** Opens (or closes) the post-deploy minting gate. Operator-level, not authority-only. */
+const ixSetMinting = (h: Harness, signer: PK, enabled: boolean) =>
+  h.program.methods
+    .setMintingEnabled(enabled)
+    .accountsStrict({
+      authority: signer,
+      config: h.configPda(),
+      gate: mintGatePda(h),
+      systemProgram: SystemProgram.programId,
+    })
+    .instruction();
+
 const ixMint = (h: Harness, owner: PK, flower: PK, uri = "https://example.invalid/f.json") => {
   const mint = flowerMintPda(h, flower);
   const cm = collectionMintPda(h);
@@ -107,6 +122,7 @@ const ixMint = (h: Harness, owner: PK, flower: PK, uri = "https://example.invali
     .accountsStrict({
       owner,
       config: h.configPda(),
+        gate: mintGatePda(h),
       flower,
       mintAuthority: mintAuthPda(h),
       mint,
@@ -191,6 +207,9 @@ describe("mint_flower_nft — lazy, opt-in, hybrids only", () => {
   describe("the two guards rev. 6 settled", () => {
     it("REJECTS a SUBMITTED flower (ACTIVE-only guard)", async () => {
       const { h, authority } = await bootstrap();
+      // Gate is shut by default (observation period); open it so THIS test's guard is
+      // what refuses, not the gate.
+      await h.send([await ixSetMinting(h, authority.publicKey, true)], [authority]);
       const flower = await writeFlower(h, authority.publicKey, 0, {
         status: FLOWER_STATUS_SUBMITTED,
       });
@@ -201,6 +220,9 @@ describe("mint_flower_nft — lazy, opt-in, hybrids only", () => {
 
     it("REJECTS a starter (hybrids-only guard)", async () => {
       const { h, authority } = await bootstrap();
+      // Gate is shut by default (observation period); open it so THIS test's guard is
+      // what refuses, not the gate.
+      await h.send([await ixSetMinting(h, authority.publicKey, true)], [authority]);
       // genome_status left at its STARTER value — claim_starters writes it that way.
       const flower = await writeFlower(h, authority.publicKey, 1, {
         status: FLOWER_STATUS_ACTIVE,
@@ -212,6 +234,9 @@ describe("mint_flower_nft — lazy, opt-in, hybrids only", () => {
 
     it("REJECTS a caller who does not own the flower", async () => {
       const { h, authority } = await bootstrap();
+      // Gate is shut by default (observation period); open it so THIS test's guard is
+      // what refuses, not the gate.
+      await h.send([await ixSetMinting(h, authority.publicKey, true)], [authority]);
       const flower = await writeFlower(h, authority.publicKey, 2);
       const stranger = h.fundedKeypair();
       const r = await h.send([await ixMint(h, stranger.publicKey, flower)], [stranger]);
@@ -220,12 +245,96 @@ describe("mint_flower_nft — lazy, opt-in, hybrids only", () => {
 
     it("REJECTS an over-long URI", async () => {
       const { h, authority } = await bootstrap();
+      // Gate is shut by default (observation period); open it so THIS test's guard is
+      // what refuses, not the gate.
+      await h.send([await ixSetMinting(h, authority.publicKey, true)], [authority]);
       const flower = await writeFlower(h, authority.publicKey, 3);
       const r = await h.send(
         [await ixMint(h, authority.publicKey, flower, "https://x/" + "a".repeat(200))],
         [authority],
       );
       assert.isNotNull(r.result, "a URI over MAX_URI_LENGTH must be refused");
+    });
+  });
+
+  describe("the post-deploy minting gate", () => {
+    it("REFUSES to mint before the gate has ever been created (the default)", async () => {
+      const { h, authority } = await bootstrap();
+      const flower = await writeFlower(h, authority.publicKey, 0);
+      const r = await h.send([await ixMint(h, authority.publicKey, flower)], [authority]);
+      assert.isNotNull(r.result, "minting must be shut until an operator opens it");
+      expect(r.result).to.contain("0xbc4", "AccountNotInitialized (3012) — the gate is absent");
+    });
+
+    it("REFUSES while the gate is explicitly closed", async () => {
+      const { h, authority } = await bootstrap();
+      // NOTE: the collection cannot be created under bankrun (Metaplex CPI fails here — the
+      // same reason the happy-path mint is devnet-only), so this test cannot reach a SUCCESSFUL
+      // mint. What it can prove is that the gate's own state persists and that the gate is
+      // consulted; the ordering assertion below records which guard actually fires first.
+      const on = await h.send([await ixSetMinting(h, authority.publicKey, true)], [authority]);
+      assert.isNull(on.result, `opening the gate failed: ${on.result}`);
+      const off = await h.send([await ixSetMinting(h, authority.publicKey, false)], [authority]);
+      assert.isNull(off.result, `closing the gate failed: ${off.result}`);
+
+      const gate = await h.program.account.mintGate.fetch(mintGatePda(h));
+      assert.isFalse(gate.enabled, "the gate must actually be closed before we test it");
+
+      const flower = await writeFlower(h, authority.publicKey, 1);
+      const r = await h.send([await ixMint(h, authority.publicKey, flower)], [authority]);
+      assert.isNotNull(r.result, "a closed gate must refuse");
+      // The refusal here is `collection_mint` AccountNotInitialized (0xbc4), not
+      // MintingDisabled: Anchor deserialises every account before running the constraint
+      // block, and the collection cannot be created under bankrun. What is proven locally is
+      // that the gate persists its closed state and that a mint against it fails. That the
+      // refusal is specifically MintingDisabled when the collection DOES exist is verified on
+      // devnet — see scripts/verify-mint-gate-devnet.mjs.
+      expect(r.result).to.contain("0x", "must be a named program error, not a crash");
+    });
+
+    it("is OPERATOR-signable — no authority signature needed", async () => {
+      const { h, authority } = await bootstrap();
+      const operator = h.fundedKeypair();
+      const add = await h.send(
+        [
+          await h.program.methods
+            .addOperator(operator.publicKey)
+            .accountsStrict({ authority: authority.publicKey, config: h.configPda() })
+            .instruction(),
+        ],
+        [authority],
+      );
+      assert.isNull(add.result, `add_operator failed: ${add.result}`);
+      // The whole point: flipping the gate must not need the multisig authority.
+      const r = await h.send([await ixSetMinting(h, operator.publicKey, true)], [operator]);
+      assert.isNull(r.result, `an operator must be able to open the gate: ${r.result}`);
+    });
+
+    it("REJECTS a signer who is neither operator nor authority", async () => {
+      const { h } = await bootstrap();
+      const stranger = h.fundedKeypair();
+      const r = await h.send([await ixSetMinting(h, stranger.publicKey, true)], [stranger]);
+      assert.isNotNull(r.result, "a stranger must not be able to open minting");
+    });
+
+    it("a CLOSED gate does not block burning or thawing an NFT that already exists", () => {
+      // The reason this mechanism exists rather than reusing set_paused: existing NFTs must
+      // stay fully usable during the observation period. Asserted against the built IDL —
+      // neither instruction may take the gate account at all.
+      const idl = JSON.parse(
+        fs.readFileSync("./target/idl/secret_garden.json", "utf8"),
+      ) as { instructions: { name: string; accounts: { name: string }[] }[] };
+      for (const name of ["burn_flower_nft", "thaw_flower_nft"]) {
+        const ix = idl.instructions.find((i) => i.name === name);
+        assert.isDefined(ix, `${name} must exist`);
+        expect(ix!.accounts.map((a) => a.name)).to.not.include(
+          "gate",
+          `${name} must NOT be gated — existing NFTs stay usable during the observation period`,
+        );
+      }
+      // ...and mint_flower_nft MUST be.
+      const mint = idl.instructions.find((i) => i.name === "mint_flower_nft");
+      expect(mint!.accounts.map((a) => a.name)).to.include("gate", "mint must be gated");
     });
   });
 
@@ -251,6 +360,9 @@ describe("mint_flower_nft — lazy, opt-in, hybrids only", () => {
      */
     it.skip("mints an eligible hybrid into the verified collection [needs devnet]", async () => {
       const { h, authority } = await bootstrap();
+      // Gate is shut by default (observation period); open it so THIS test's guard is
+      // what refuses, not the gate.
+      await h.send([await ixSetMinting(h, authority.publicKey, true)], [authority]);
       const init = await h.send([await ixInitCollection(h, authority.publicKey)], [authority]);
       assert.isNull(init.result, `collection setup failed: ${init.result}`);
 

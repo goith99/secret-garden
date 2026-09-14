@@ -1264,3 +1264,34 @@ mod tests {
         );
     }
 }
+
+/// Whether `mint_flower_nft` is open for business.
+///
+/// # Why this exists
+///
+/// A rollback to a pre-NFT program is survivable for flower records — they simply carry eight
+/// bytes the old code ignores — but it is NOT survivable for minted NFTs. The old program has
+/// no `burn_flower_nft`, no `thaw_flower_nft`, and crucially no `FlowerStillMinted` guard on
+/// `close_flower`, so a rolled-back program lets an owner destroy the record behind a live
+/// token and leave a collection-verified NFT attached to nothing.
+///
+/// That makes "how many NFTs exist" the thing worth minimising during the period when a
+/// rollback is most likely — the hours immediately after a fresh deploy. This gate keeps the
+/// count at zero for exactly that window, without touching any other gameplay: burning,
+/// thawing, breeding, submitting and releasing all work normally while it is closed.
+///
+/// # Fail-safe by absence
+///
+/// `mint_flower_nft` takes this as a typed `Account`, so a gate that has never been created
+/// fails with `AccountNotInitialized`. Minting is therefore OFF from the instant the program
+/// is deployed, with no operator action required — the observation period is the default
+/// state, not something anyone has to remember to switch on.
+#[account]
+#[derive(InitSpace)]
+pub struct MintGate {
+    /// True once the observation period is over and minting is open.
+    pub enabled: bool,
+    /// Unix timestamp of the last toggle, for the operator log.
+    pub updated_at: i64,
+    pub bump: u8,
+}

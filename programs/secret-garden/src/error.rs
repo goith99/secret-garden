@@ -375,4 +375,8 @@ pub enum SecretGardenError {
     /// competition round before it can breed.
     #[msg("This flower changed hands too recently; it can breed again next round")]
     FlowerRecentlyTransferred,
+
+    // --- post-deploy minting observation period ---
+    #[msg("Minting is not open yet; existing NFTs are unaffected")]
+    MintingDisabled,
 }

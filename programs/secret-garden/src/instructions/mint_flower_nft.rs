@@ -10,7 +10,7 @@ use anchor_spl::token::{mint_to, Mint, MintTo, Token, TokenAccount};
 
 use crate::constants::*;
 use crate::error::SecretGardenError;
-use crate::state::{FlowerRecord, GameConfig};
+use crate::state::{FlowerRecord, GameConfig, MintGate};
 
 /// Mints one flower as a Metaplex NFT, verified into the program's collection.
 ///
@@ -75,6 +75,16 @@ pub struct MintFlowerNft<'info> {
         constraint = !config.paused @ SecretGardenError::GamePaused,
     )]
     pub config: Box<Account<'info, GameConfig>>,
+
+    /// The post-deploy minting gate. A gate that has never been created fails here with
+    /// `AccountNotInitialized`, which is the intended default: minting is shut from the moment
+    /// the program is deployed until an operator opens it. See `MintGate`.
+    #[account(
+        seeds = [MINT_GATE_SEED],
+        bump = gate.bump,
+        constraint = gate.enabled @ SecretGardenError::MintingDisabled,
+    )]
+    pub gate: Account<'info, MintGate>,
 
     #[account(
         constraint = flower.owner == owner.key() @ SecretGardenError::FlowerNotOwned,

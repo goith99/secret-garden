@@ -92,6 +92,13 @@ pub mod secret_garden {
         instructions::mint_flower_nft::handler(ctx, uri)
     }
 
+    /// Opens or closes NEW minting, without touching anything else. Operator-level, so the
+    /// post-deploy observation period can be ended without a multisig round trip. Existing
+    /// NFTs stay fully usable while it is closed — see `MintGate`.
+    pub fn set_minting_enabled(ctx: Context<SetMintingEnabled>, enabled: bool) -> Result<()> {
+        instructions::set_minting_enabled::handler(ctx, enabled)
+    }
+
     /// Operator kill-switch: sets `GameConfig::paused`. Authority-only (Stage 5A). The
     /// `paused` field has existed since Stage 1 but never had an instruction to set it.
     pub fn set_paused(ctx: Context<SetPaused>, new_value: bool) -> Result<()> {

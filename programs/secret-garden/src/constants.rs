@@ -738,3 +738,16 @@ pub const NFT_MAX_URI_LEN: usize = 200;
 /// product decision that has not been taken, and the program keeps `update_authority`, so
 /// it can be changed later via `update_metadata_accounts_v2` without re-minting.
 pub const NFT_SELLER_FEE_BASIS_POINTS: u16 = 0;
+
+/// PDA seed for the minting gate: `[MINT_GATE_SEED]`.
+///
+/// A SEPARATE account rather than a `GameConfig` field, and that is not a style choice.
+/// Appending to `GameConfig` would grow it past `migrate_config`'s
+/// `if old_len >= new_len { return Ok(()) }` early return, and that instruction
+/// unconditionally restamps `mutant_weight` to uniform when it grows a config — so adding a
+/// field here would arm a migration that silently resets live operator tuning. The same trap
+/// is documented on `COLLECTION_SEED` above, for the same reason.
+///
+/// Keeping it separate also keeps the toggle OPERATOR-signable: `migrate_config` is
+/// authority-only, so a `GameConfig` field would have dragged the multisig into every flip.
+pub const MINT_GATE_SEED: &[u8] = b"mint_gate";
