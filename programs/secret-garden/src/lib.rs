@@ -787,30 +787,37 @@ pub mod secret_garden {
     /// so the closed index is retired forever (no PDA re-init risk); the freed slot is tracked
     /// purely by the `total_flowers` decrement.
     pub fn close_flower(ctx: Context<CloseFlower>) -> Result<()> {
-        // A flower that was ever minted must have its NFT burned first, or closing the
-        // record here would orphan a tradeable token backed by nothing.
+        // A flower that was EVER minted can never be closed again. Existence of the mint PDA
+        // is the whole test — supply is deliberately not consulted.
         //
-        // The question is asked of SUPPLY, not of existence, and that distinction is
-        // load-bearing: legacy SPL Token cannot close a mint account, so a burned flower's
-        // mint PDA survives forever with `supply == 0` (measured on devnet twice). Keying
-        // on "does the PDA exist" would therefore report every burned flower as still
-        // minted and make its record permanently un-closeable.
+        // This used to ask about SUPPLY, so that a properly burned flower could still be
+        // closed and its rent reclaimed. That was exploitable, and the exploit was
+        // reproduced on devnet before this change:
         //
-        // Probed by hand rather than typed, for the same reason as `close_pot_vault`'s
-        // settlement: a never-minted flower has NO mint account, and Anchor rejects an
-        // uninitialized typed account before the handler runs. Emptiness is the signal;
-        // the non-empty case is deserialized with the owner checked first.
-        let mint_info = &ctx.accounts.flower_mint;
-        if !mint_info.data_is_empty() {
-            require_keys_eq!(
-                *mint_info.owner,
-                anchor_spl::token::ID,
-                SecretGardenError::FlowerStillMinted
-            );
-            let data = mint_info.try_borrow_data()?;
-            let mint = anchor_spl::token::Mint::try_deserialize(&mut &data[..])?;
-            require!(mint.supply == 0, SecretGardenError::FlowerStillMinted);
-        }
+        //   1. the owner mints, then transfers the NFT to a buyer. `flower.owner` is a cache
+        //      and a bare SPL transfer runs no instruction of ours, so it stays STALE;
+        //   2. the buyer burns the NFT through Metaplex directly — `burn_flower_nft` would
+        //      have refused them (`flower.owner` still names the seller), but raw
+        //      `BurnNft` only asks who holds the token, and they do;
+        //   3. supply is now 0 with the record still naming the SELLER, who calls this
+        //      instruction and deletes the buyer's flower, pocketing its rent.
+        //
+        // Syncing here cannot fix it: after a burn the token account is closed, so no
+        // on-chain evidence of the last holder survives for `sync_flower_owner` to read. The
+        // program genuinely cannot tell who the flower belongs to. Refusing outright is the
+        // only answer that is correct in every ordering.
+        //
+        // The cost is accepted deliberately: a minted flower's record becomes permanent, and
+        // its ~0.0046 SOL of rent is never reclaimable, even after an honest burn through
+        // `burn_flower_nft`. Un-closeable is strictly safer than closeable-by-the-wrong-party.
+        //
+        // Probed by hand rather than typed: a never-minted flower has NO mint account, and
+        // Anchor rejects an uninitialized typed account before the handler runs. Emptiness is
+        // the signal, and it is the ONLY signal — the account's contents are never read.
+        require!(
+            ctx.accounts.flower_mint.data_is_empty(),
+            SecretGardenError::FlowerStillMinted
+        );
         ctx.accounts.profile.total_flowers = ctx.accounts.profile.total_flowers.saturating_sub(1);
         Ok(())
     }

@@ -339,7 +339,7 @@ pub enum SecretGardenError {
     /// `close_flower` was called on a flower whose NFT is still live (`mint.supply == 1`).
     /// Closing the record would orphan a tradeable token backed by nothing — burn it first
     /// with `burn_flower_nft`.
-    #[msg("This flower still has a live NFT; burn it with burn_flower_nft before closing")]
+    #[msg("This flower was minted as an NFT and can no longer be released, even after burning")]
     FlowerStillMinted,
     /// `burn_flower_nft` was called on a flower with no live NFT to burn.
     #[msg("This flower has no live NFT to burn")]

@@ -477,15 +477,16 @@ describe("close_flower — the live-NFT guard (step 3b)", () => {
     assert.isNotNull(await h.client.getAccount(flower), "the record must survive");
   });
 
-  it("ALLOWS closing once the NFT is burned (supply == 0, mint account survives)", async () => {
+  it("REFUSES to close a BURNED flower too — existence, not supply, is the test", async () => {
     const { h, authority } = await bootstrap();
     const flower = await writeFlower(h, authority.publicKey, 2);
-    // Exactly the post-burn shape: the mint account REMAINS (legacy SPL Token cannot close
-    // a mint) but its supply is back to 0. This is the case existence-checking would have
-    // reported as "still minted" forever.
+    // Exactly the post-burn shape: the mint account REMAINS (legacy SPL Token cannot close a
+    // mint) with supply back to 0. This case USED to be closeable, and that is precisely what
+    // made the stale-owner theft possible — a buyer who burned through raw Metaplex left the
+    // record naming the seller, who could then delete their flower. See close_flower.
     const mint = flowerMintPda(h, flower);
     const data = Buffer.alloc(82);
-    data.writeBigUInt64LE(0n, 36);       // supply = 0
+    data.writeBigUInt64LE(0n, 36);       // supply = 0, i.e. properly burned
     data[45] = 1;
     h.context.setAccount(mint, {
       lamports: 1_461_600,
@@ -494,12 +495,24 @@ describe("close_flower — the live-NFT guard (step 3b)", () => {
       executable: false,
     });
     const r = await h.send([await ixClose(h, authority.publicKey, flower)], [authority]);
-    assert.isNull(r.result, `close must succeed after a burn: ${r.result}`);
-    assert.isNull(await h.client.getAccount(flower));
+    assert.isNotNull(r.result, "a flower that was ever minted must never be closeable");
+    expect(r.result).to.contain("0x17c3", "FlowerStillMinted (6083)");
     assert.isNotNull(
-      await h.client.getAccount(mint),
-      "the mint account itself survives the burn — that is why the guard reads supply",
+      await h.client.getAccount(flower),
+      "the record must survive — refusing is the whole point",
     );
+  });
+
+  it("STILL closes a flower whose mint PDA was never created at all", async () => {
+    // The other side of the same guard: never minted means no mint account, so the flower is
+    // ordinary game data and stays closeable. This is what keeps the collection cap escapable
+    // for players who never touched the NFT layer.
+    const { h, authority } = await bootstrap();
+    const flower = await writeFlower(h, authority.publicKey, 3);
+    assert.isNull(await h.client.getAccount(flowerMintPda(h, flower)), "precondition: no mint");
+    const r = await h.send([await ixClose(h, authority.publicKey, flower)], [authority]);
+    assert.isNull(r.result, `close must still work for an unminted flower: ${r.result}`);
+    assert.isNull(await h.client.getAccount(flower), "the record is gone");
   });
 });
 
