@@ -76,9 +76,22 @@ pub fn freeze_flower_if_minted<'info>(
         return Ok(());
     }
 
-    // Minted, so the token account is mandatory — same rule, and the same reason, as the
-    // sync helper's. `sync_flower_owner` has already enforced this for both parents by the
-    // time we get here; repeated so this function is correct if ever called elsewhere.
+    // Burned: the mint survives with `supply == 0`, and there is no token left to lock. The
+    // program-state LOCKED flag is the whole lock for this flower now, exactly as it is for one
+    // that was never minted. `crate::sync::nft_was_burned` carries the full reasoning.
+    //
+    // This branch has to exist here as well as in the sync helper, not instead of it: the sync
+    // runs first and would return Ok, and then THIS function would demand the same destroyed
+    // token account and refuse the breed anyway. Fixing only one of the two moves the failure
+    // rather than removing it.
+    if crate::sync::nft_was_burned(target.flower_mint)? {
+        return Ok(());
+    }
+
+    // Minted and still held, so the token account is mandatory — same rule, and the same
+    // reason, as the sync helper's. `sync_flower_owner` has already enforced this for both
+    // parents by the time we get here; repeated so this function is correct if ever called
+    // elsewhere.
     require!(
         !target.flower_token.data_is_empty(),
         SecretGardenError::FlowerTokenRequired

@@ -58,6 +58,40 @@ fn bump_total_flowers(info: &AccountInfo, up: bool) -> Result<()> {
     Ok(())
 }
 
+/// Was this flower's NFT burned? — i.e. the mint account still exists but holds no supply.
+///
+/// `burn_nft` closes the token account, the master edition and all but a marker byte of the
+/// metadata, but SPL Token has no close-mint instruction, so the mint itself survives forever
+/// with `supply == 0`. That leaves a THIRD state beyond "never minted" and "minted and held",
+/// and it is the one that used to brick a flower: the mint is not empty, so the strict path
+/// below demanded a token account that the burn had already destroyed.
+///
+/// Reads the supply straight out of the account rather than deserializing a `Mint`. This module
+/// is inlined into `start_breeding`, whose `try_accounts` has already overflowed the 4 KB SBF
+/// stack frame once; an 82-byte struct and a deserialize frame is cost worth avoiding for one
+/// `u64` at a fixed offset.
+///
+/// SPL Token `Mint` is a fixed 82-byte layout:
+///   `0..4` COption tag for `mint_authority`, `4..36` mint_authority,
+///   **`36..44` supply (u64, little-endian)**, `44` decimals, `45` is_initialized,
+///   `46..50` COption tag for `freeze_authority`, `50..82` freeze_authority.
+///
+/// Anything that is not a token-program-owned account of at least that length reports `false`,
+/// so an anomalous account falls through to the strict path and is refused there rather than
+/// silently skipping the sync. Failing closed is the only safe direction here.
+pub(crate) fn nft_was_burned(flower_mint: &AccountInfo) -> Result<bool> {
+    if *flower_mint.owner != anchor_spl::token::ID {
+        return Ok(false);
+    }
+    let data = flower_mint.try_borrow_data()?;
+    if data.len() < 44 {
+        return Ok(false);
+    }
+    let mut supply = [0u8; 8];
+    supply.copy_from_slice(&data[36..44]);
+    Ok(u64::from_le_bytes(supply) == 0)
+}
+
 /// Reconcile one flower against the chain, doing (a), (b) and (c) together.
 ///
 /// Returns `Ok(())` unchanged when the flower was never minted (it cannot have moved) or
@@ -97,8 +131,23 @@ pub fn sync_flower_owner_infos<'info>(
         return Ok(());
     }
 
-    // Minted. The token account is now MANDATORY — see the module note on why omitting it
-    // must not be a way to fall back on a stale owner.
+    // Minted once, then BURNED. Treated exactly like never-minted, and it is safe to do so
+    // for a reason the transfer case cannot claim: `burn_flower_nft` requires the signer to be
+    // BOTH `flower.owner` and the token's authority, so a burn can only happen while the record
+    // and the token already agree. The record was therefore provably correct at the moment of
+    // the burn, and with no token left in existence nothing can change hands again. There is no
+    // newer owner for the sync to discover.
+    //
+    // Without this branch a burned flower is bricked rather than merely un-tradeable: the mint
+    // is not empty, so the check below demands the token account the burn destroyed, and
+    // start_breeding, submit_entry, queue_private_hint and release_flower all refuse it forever
+    // with FlowerTokenRequired while it still occupies a collection slot.
+    if nft_was_burned(flower_mint)? {
+        return Ok(());
+    }
+
+    // Minted and still held. The token account is now MANDATORY — see the module note on why
+    // omitting it must not be a way to fall back on a stale owner.
     require!(
         !flower_token.data_is_empty(),
         SecretGardenError::FlowerTokenRequired
