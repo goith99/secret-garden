@@ -7,8 +7,16 @@
  *
  * READ-ONLY BY DEFAULT: with no argument it just reports the current flag.
  *
+ * TARGET MUST BE NAMED. The IDL is read from `./target/idl/` — a cwd-relative path — so the
+ * program this talks to depends on where it is run from, and dev and production share a
+ * devnet RPC. `EXPECTED_PROGRAM` is therefore required and is checked against the IDL before
+ * anything is read or sent; a mismatch is fatal. There is no default and no inference.
+ *
  * Usage — env must be EXPORTED (`set -a`):
  *   set -a; source .env; set +a
+ *   export EXPECTED_PROGRAM=7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo   # production
+ *   export EXPECTED_PROGRAM=34JWa5vNViWgonTKcn4CSQBhU8YFf8PyLMbCZizHFxXP   # dev
+ *
  *   node scripts/set-paused.mjs            # report only, sends nothing
  *   node scripts/set-paused.mjs true       # pause   (>>> sends a transaction <<<)
  *   node scripts/set-paused.mjs false      # unpause (>>> sends a transaction <<<)
@@ -33,10 +41,35 @@ if (arg !== undefined && arg !== "true" && arg !== "false") {
   process.exit(1);
 }
 
+// --- target assertion, BEFORE any RPC call or state read -------------------------------
+//
+// The IDL path is cwd-relative, so which PROGRAM this script talks to is decided by the
+// directory it happens to be run from. Dev and production are both on devnet and share an
+// RPC, so a wrong cwd does not fail — it silently succeeds against the wrong cluster. That
+// is ambient trust, and the same rule applied to anything touching real funds applies here:
+// the operator names the target, the script refuses anything else.
+//
+//   EXPECTED_PROGRAM=7eMfGCkXavfZeVrwRo3ZH63C7H6mZ6n1HZKJwGkZBddo   # production
+//   EXPECTED_PROGRAM=34JWa5vNViWgonTKcn4CSQBhU8YFf8PyLMbCZizHFxXP   # dev
+const idl = JSON.parse(fs.readFileSync("./target/idl/secret_garden.json").toString());
+const EXPECTED = process.env.EXPECTED_PROGRAM;
+if (!EXPECTED) {
+  console.error("FATAL: EXPECTED_PROGRAM is not set.");
+  console.error(`       This tree's IDL targets ${idl.address}`);
+  console.error("       Set EXPECTED_PROGRAM to the program you INTEND to touch and re-run.");
+  process.exit(1);
+}
+if (EXPECTED !== idl.address) {
+  console.error("FATAL: target mismatch — refusing to act.");
+  console.error(`       EXPECTED_PROGRAM : ${EXPECTED}`);
+  console.error(`       IDL in this tree : ${idl.address}`);
+  console.error("       You are probably running this from the wrong repository.");
+  process.exit(1);
+}
+
 const conn = new Connection(RPC, "confirmed");
 const authority = Keypair.fromSecretKey(new Uint8Array(JSON.parse(
   fs.readFileSync(`${os.homedir()}/.config/solana/id.json`).toString())));
-const idl = JSON.parse(fs.readFileSync("./target/idl/secret_garden.json").toString());
 const provider = new anchor.AnchorProvider(conn, new anchor.Wallet(authority), {
   commitment: "confirmed",
 });
