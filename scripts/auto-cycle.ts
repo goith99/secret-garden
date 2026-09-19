@@ -175,6 +175,44 @@ function stuckScoreAction(
   return { kind: "wait", seconds: SCORE_TIMEOUT_SECONDS - age + 3 };
 }
 
+/** The real result of one scored entry, decided purely from its on-chain state after a wait. */
+type ScoreState = "scored" | "aborted" | "cleared" | "in-flight";
+
+/**
+ * Classify what actually happened to a scoring computation, PURELY from the entry's state.
+ *
+ * This is the fix for the monitoring bug: the previous code only polled `scored`, which is set
+ * ONLY by a SUCCESSFUL callback — an ABORTED computation's callback leaves `scored=false` (it
+ * sets `score_error_code` and clears `score_queued` instead, see programs/.../lib.rs score
+ * callback and state.rs). Polling `scored` alone therefore cannot tell "an abort callback
+ * landed" from "no callback ever arrived", and mislabels every abort as "no callback / never
+ * executed".
+ *
+ * The discriminator is `score_queued`, NOT `score_error_code`. `queue_score_entry` sets
+ * score_queued=true and does NOT reset score_error_code, so the error code can be STALE from a
+ * previous attempt's abort while a fresh computation is genuinely still in flight. Keying on
+ * score_queued avoids reading that stale code as the current result:
+ *   scored=true                         -> "scored"    (success callback persisted a score)
+ *   scored=false, score_queued=true     -> "in-flight" (queued; no callback has landed yet)
+ *   scored=false, score_queued=false    -> a callback (or cancel) cleared the in-flight flag
+ *       and it was not a success. score_error_code!=0 => "aborted" (the MPC ran and FAILED);
+ *       score_error_code==0 => "cleared" (only cancel_stuck_score leaves this shape — it never
+ *       happens inside one attempt's own poll, since only a callback clears the flag there).
+ */
+function classifyScoreState(
+  e: { scored: boolean; scoreQueued: boolean; scoreErrorCode: number },
+): ScoreState {
+  if (e.scored) return "scored";
+  if (e.scoreQueued) return "in-flight";
+  return e.scoreErrorCode !== 0 ? "aborted" : "cleared";
+}
+
+/** The outcome scoreEntryWithRecovery reports back to the cycle (never thrown). */
+type ScoreOutcome =
+  | { kind: "scored" }
+  | { kind: "aborted"; errorCode: number; attempt: number }
+  | { kind: "no-callback"; attempts: number };
+
 /** What the close stage should do, decided purely from round state + wall clock. */
 type CloseAction =
   | { kind: "close" }                              // OPEN and its scheduled window has elapsed
@@ -954,11 +992,11 @@ async function openRoundPotAccounts(nextRoundId: number) {
    * The first recovery call also cleans up after a PREVIOUS run: an entry left flagged
    * in-flight by an aborted cycle is cleared here instead of throwing ScoreAlreadyQueued.
    */
-  async function scoreEntryWithRecovery(entryPk: PK, flowerRecord: PK, label: string): Promise<void> {
+  async function scoreEntryWithRecovery(entryPk: PK, flowerRecord: PK, label: string): Promise<ScoreOutcome> {
     for (let attempt = 1; attempt <= SCORE_ATTEMPTS; attempt++) {
       // Clears a leftover flag from an earlier attempt OR an earlier run.
       await recoverStuckScore(entryPk, label);
-      if ((await program.account.competitionEntry.fetch(entryPk)).scored) return;
+      if ((await program.account.competitionEntry.fetch(entryPk)).scored) return { kind: "scored" };
 
       const offset = freshOffset();
       const tx = await program.methods.queueScoreEntry(offset)
@@ -971,7 +1009,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
         }).transaction();
       await sendTxHttp(tx, `queueScoreEntry ${label}`);
 
-      // A timeout here is INFORMATION, not a fatal error — the retry path handles it. Without
+      // A timeout here is INFORMATION, not a fatal error — the poll below handles it. Without
       // this catch, one hung computation aborted the entire cycle.
       try {
         await arcium.awaitComputationFinalization(
@@ -982,21 +1020,42 @@ async function openRoundPotAccounts(nextRoundId: number) {
       }
 
       // Poll regardless of how the wait ended: the callback may land between the two.
+      // Detect the ACTUAL outcome (not just success) via classifyScoreState — an ABORT callback
+      // clears score_queued and sets score_error_code but leaves scored=false, so watching only
+      // `scored` (the old bug) reported every abort as "no callback".
       for (let k = 0; k < 120; k++) {
-        if ((await program.account.competitionEntry.fetch(entryPk)).scored) {
+        const e: any = await program.account.competitionEntry.fetch(entryPk);
+        const state = classifyScoreState({
+          scored: e.scored, scoreQueued: e.scoreQueued, scoreErrorCode: e.scoreErrorCode,
+        });
+        if (state === "scored") {
           console.log(`    ✓ scored`);
-          return;
+          return { kind: "scored" };
+        }
+        if (state === "aborted") {
+          // The callback DID land; the MPC ran and returned a failure. This is deterministic on
+          // the current cluster, so retrying inside this invocation just re-aborts and burns SOL
+          // — skip the remaining attempts and let the next scheduled run retry.
+          console.error(
+            `    ${label}: callback landed but the computation ABORTED (error code ${e.scoreErrorCode}) `
+            + `on attempt ${attempt}/${SCORE_ATTEMPTS}. This is a RETURNED FAILURE, not a missing `
+            + `callback — the MPC executed and failed. Skipping this entry; the next run retries.`);
+          return { kind: "aborted", errorCode: e.scoreErrorCode as number, attempt };
         }
         await sleep(1000);
       }
       if (attempt < SCORE_ATTEMPTS) {
-        console.log(`    ${label}: no callback — recovering and retrying`);
+        console.log(`    ${label}: no callback landed (still in flight after the wait) — recovering and retrying`);
       }
     }
-    throw new Error(
-      `entry ${label} did not score after ${SCORE_ATTEMPTS} attempts. The computation is being `
-      + `accepted but never executed, which points at the Arcium cluster rather than this round — `
-      + `check whether the cluster is serving this MXE before retrying.`);
+    // Exhausted every attempt with the computation still in flight and no callback ever landing
+    // (neither success nor an abort result). Distinct from an abort: nothing came back at all,
+    // which points at the cluster not serving this MXE rather than a computation that ran.
+    console.error(
+      `    ${label}: NO CALLBACK after ${SCORE_ATTEMPTS} attempts — the computation was queued and `
+      + `accepted but never returned any result (success or failure). Points at the Arcium cluster `
+      + `not serving this MXE, not at this round. The next run retries.`);
+    return { kind: "no-callback", attempts: SCORE_ATTEMPTS };
   }
 
   // ======================================================================================
@@ -1944,6 +2003,11 @@ async function openRoundPotAccounts(nextRoundId: number) {
   const hasEntries = r.participantCount > 0;
 
   // ---------------------------------------------------------------- 2. SCORE
+  // Per-entry failures are RECORDED, never thrown: one entry the cluster cannot score must not
+  // abort the whole invocation. Backlog settlement already ran (step 0), and vault-rent reclaim
+  // (step 4c) still needs to run below — a single stuck round must not block either.
+  const scoreFailures: { label: string; outcome: ScoreOutcome }[] = [];
+  let sawNoCallback = false;
   if (r.status === ROUND_STATUS_FINALIZED) {
     console.log(`\n[score] skipping — round ${current} already FINALIZED`);
   } else if (!hasEntries) {
@@ -1955,15 +2019,60 @@ async function openRoundPotAccounts(nextRoundId: number) {
     for (let i = 0; i < unscored.length; i++) {
       const e = unscored[i];
       const entry = entryPda(round, e.player as PK);
+      const label = `${i + 1}/${unscored.length} ${short(e.player as PK)}`;
       console.log(`  scoring ${i + 1}/${unscored.length} (wallet ${short(e.player as PK)})`);
-      // Retries + clears a hung computation itself; only throws once genuinely out of attempts.
-      await scoreEntryWithRecovery(
-        entry, e.flowerRecord as PK, `${i + 1}/${unscored.length} ${short(e.player as PK)}`);
-      summary.scoredThisRun += 1;
+      // Retries + clears a hung computation itself; returns an outcome instead of throwing, so a
+      // failure is recorded and the loop continues to the other entries.
+      const outcome = await scoreEntryWithRecovery(entry, e.flowerRecord as PK, label);
+      if (outcome.kind === "scored") {
+        summary.scoredThisRun += 1;
+      } else {
+        scoreFailures.push({ label, outcome });
+        if (outcome.kind === "no-callback") sawNoCallback = true;
+      }
     }
     const after: any = await program.account.competitionRound.fetch(round);
     summary.scoredCount = after.scoredCount;
-    console.log(`  ✓ all entries scored (scoredCount=${after.scoredCount})`);
+    if (scoreFailures.length === 0) {
+      console.log(`  ✓ all entries scored (scoredCount=${after.scoredCount})`);
+    } else {
+      const kinds = scoreFailures.map((f) => f.outcome.kind).join(", ");
+      console.error(
+        `\n[score] round ${current} could not be fully scored: ${scoreFailures.length} entr`
+        + `${scoreFailures.length === 1 ? "y" : "ies"} failed (${kinds}). `
+        + `scoredCount=${after.scoredCount}/${r.participantCount}. Reveal/finalize/open are `
+        + `deferred to a later run; the rest of THIS cycle still proceeds.`);
+    }
+  }
+
+  // ------------------------------------------------- 2b. DEFER an unscoreable round
+  //
+  // If scoring did not complete for THIS round, its reveal / finalize / payout / open cannot
+  // run this cycle: the program requires scored_count == participant_count to reveal, and
+  // open_round requires the previous round FINALIZED. Previously the score step THREW here and
+  // the top-level catch did process.exit(1), which also skipped step 4c (reclaim) and left the
+  // whole cycle looking crashed. Instead: run the round-INDEPENDENT reclaim, print the summary,
+  // and finish — the stuck round is retried on the next scheduled run.
+  //
+  // Exit code: a deterministic ABORT is an expected, retriable condition (the MPC ran and
+  // failed), so the run exits 0 — this is exactly the round-91 case, and crashing daily over it
+  // is the bug being fixed. A genuine NO-CALLBACK (queued but nothing ever came back) is a
+  // stronger "cluster is silent" signal, so after completing all other work the run is flagged
+  // non-zero for monitoring. Either way the flag is raised AFTER the other work, so it blocks
+  // nothing.
+  if (scoreFailures.length > 0) {
+    console.log(
+      `\n[reveal/finalize/open] deferred — round ${current} is not fully scored `
+      + `(${summary.scoredCount}/${summary.entryCount}). Running vault-rent reclaim, then finishing.`);
+    await reclaimVaultRent(current);
+    printSummary(summary, await balanceSol());
+    if (sawNoCallback) {
+      throw new Error(
+        `round ${current}: scoring incomplete and at least one entry received NO callback across `
+        + `${SCORE_ATTEMPTS} attempts (queued but never executed). All other cycle work completed; `
+        + `flagging the run for monitoring. The next scheduled run will retry.`);
+    }
+    return;
   }
 
   // --------------------------------------------------------------- 3. REVEAL
@@ -2167,8 +2276,8 @@ export {
   MAX_SHARD_SIZE, MAX_SHARDS, MAX_TIER1_SHARDS, SHARD_WINNERS,
   SINGLE_TIER_CAPACITY, TWO_TIER_CAPACITY, FINAL_SHARD_INDEX,
   rpcRead, rpcBackoffMs, RPC_ATTEMPTS,
-  stuckScoreAction, SCORE_TIMEOUT_SECONDS, SCORE_ATTEMPTS,
+  stuckScoreAction, classifyScoreState, SCORE_TIMEOUT_SECONDS, SCORE_ATTEMPTS,
   closeRoundAction, formatRemaining,
   lockAction, acquireLock, releaseLock, LOCK_PATH, LOCK_STALE_SECONDS,
 };
-export type { BracketPlan, ShardPlan, StuckScoreAction, CloseAction, LockAction, LockFile };
+export type { BracketPlan, ShardPlan, StuckScoreAction, ScoreState, ScoreOutcome, CloseAction, LockAction, LockFile };

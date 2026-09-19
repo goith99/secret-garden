@@ -42,6 +42,7 @@ import {
   releaseLock,
   LOCK_PATH,
   LOCK_STALE_SECONDS,
+  classifyScoreState,
 } from "../scripts/auto-cycle.ts";
 
 const { PublicKey, Keypair } = anchor.web3;
@@ -616,6 +617,40 @@ describe("auto-cycle single-instance lock", () => {
       assert.isTrue(acquireLock(NOW));
       releaseLock();
       assert.isTrue(acquireLock(NOW + 5), "a legitimate later run must not be blocked");
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------
+  // classifyScoreState — the fix for the "abort reported as no-callback" monitoring bug.
+  // Encodes the exact program semantics: `scored` is set ONLY by a successful callback; the
+  // abort callback leaves scored=false and instead sets score_error_code + clears score_queued.
+  // ---------------------------------------------------------------------------------------
+  describe("classifyScoreState (score outcome detection)", () => {
+    it("success: scored=true is 'scored' regardless of the other fields", () => {
+      assert.equal(classifyScoreState({ scored: true, scoreQueued: false, scoreErrorCode: 0 }), "scored");
+      // scored wins even if a stale error code lingers from a previous aborted attempt.
+      assert.equal(classifyScoreState({ scored: true, scoreQueued: false, scoreErrorCode: 1 }), "scored");
+    });
+
+    it("abort: callback cleared score_queued, left scored=false with an error code", () => {
+      // This is round 91's real state after each ProtocolRun abort: a callback LANDED (queued
+      // is false) and it was a failure (error code 1) — the old code called this "no callback".
+      assert.equal(classifyScoreState({ scored: false, scoreQueued: false, scoreErrorCode: 1 }), "aborted");
+    });
+
+    it("in-flight: still queued means no callback has landed yet", () => {
+      assert.equal(classifyScoreState({ scored: false, scoreQueued: true, scoreErrorCode: 0 }), "in-flight");
+    });
+
+    it("in-flight is decided by score_queued, NOT by a stale error code", () => {
+      // A fresh queue does not reset score_error_code, so a genuinely-in-flight computation can
+      // carry a stale non-zero code from a prior attempt. It must still read as in-flight.
+      assert.equal(classifyScoreState({ scored: false, scoreQueued: true, scoreErrorCode: 1 }), "in-flight");
+    });
+
+    it("cleared: not queued, not scored, no error => a cancel (never a callback outcome)", () => {
+      // Only cancel_stuck_score produces this shape; a callback always sets scored or an error.
+      assert.equal(classifyScoreState({ scored: false, scoreQueued: false, scoreErrorCode: 0 }), "cleared");
     });
   });
 });
