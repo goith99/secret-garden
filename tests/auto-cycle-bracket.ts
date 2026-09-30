@@ -34,6 +34,8 @@ import {
   rpcRead,
   rpcBackoffMs,
   RPC_ATTEMPTS,
+  getMultipleAccountsInfoChunked,
+  GET_MULTIPLE_ACCOUNTS_LIMIT,
   stuckScoreAction,
   SCORE_TIMEOUT_SECONDS,
   SCORE_ATTEMPTS,
@@ -316,6 +318,40 @@ describe("auto-cycle bracket partition planner", () => {
       assert.deepEqual(sizes.slice(0, 7), [13, 13, 13, 13, 13, 13, 13]);
       assert.deepEqual(sizes.slice(7), new Array(MAX_TIER1_SHARDS - 7).fill(0));
     });
+  });
+
+  describe("getMultipleAccountsInfoChunked — the RPC's 100-key cap", () => {
+    // The bug this guards: reclaimVaultRent reads rounds 1..current in one call, so from round
+    // 101 on every cycle died with "Too many inputs provided; max 100" before open_round.
+    /** A connection that enforces the real cap and tags each result with its own key. */
+    function fakeConn() {
+      const calls: number[] = [];
+      const conn = {
+        async getMultipleAccountsInfo(keys: PK[]) {
+          calls.push(keys.length);
+          if (keys.length > 100) throw new Error("Too many inputs provided; max 100");
+          return keys.map((k, i) => (i % 3 === 0 ? null : { data: Buffer.from(k.toBytes()) }));
+        },
+      };
+      return { conn: conn as unknown as anchor.web3.Connection, calls };
+    }
+
+    for (const n of [0, 1, 100, 101, 105, 250]) {
+      it(`reads ${n} keys in batches of <=100, preserving order`, async () => {
+        const keys = randomKeys(n);
+        const { conn, calls } = fakeConn();
+        const out = await getMultipleAccountsInfoChunked(conn, keys, "confirmed");
+        assert.equal(GET_MULTIPLE_ACCOUNTS_LIMIT, 100);
+        assert.lengthOf(out, n);
+        assert.equal(calls.length, Math.ceil(n / 100));
+        assert.isTrue(calls.every((c) => c <= 100));
+        // Nulls are per-batch-position in the fake, so recompute where they fall.
+        out.forEach((info, i) => {
+          if ((i % 100) % 3 === 0) assert.isNull(info);
+          else assert.isTrue(info!.data.equals(Buffer.from(keys[i].toBytes())), `index ${i} out of order`);
+        });
+      });
+    }
   });
 
   describe("rpcRead — transient-failure retry on the opening reads", () => {

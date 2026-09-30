@@ -484,6 +484,32 @@ async function rpcRead<T>(label: string, fn: () => Promise<T>): Promise<T> {
   throw new Error(`${label}: unreachable`); // for the type checker
 }
 
+/** The RPC's hard cap on keys per `getMultipleAccounts` call. */
+const GET_MULTIPLE_ACCOUNTS_LIMIT = 100;
+
+/**
+ * `conn.getMultipleAccountsInfo` split into batches the RPC will accept, results in input order.
+ *
+ * The raw call rejects more than 100 keys outright ("Too many inputs provided; max 100"), and
+ * the scans that use it grow by one key per round: `reclaimVaultRent` walks rounds 1..current,
+ * so the cycle crashed every run from round 101 onward, after the pot step and before
+ * `open_round`, stalling the game. Every multi-account read in this script goes through here.
+ *
+ * Exported for tests.
+ */
+async function getMultipleAccountsInfoChunked(
+  conn: anchor.web3.Connection,
+  keys: PK[],
+  commitment: anchor.web3.Commitment,
+): Promise<(anchor.web3.AccountInfo<Buffer> | null)[]> {
+  const out: (anchor.web3.AccountInfo<Buffer> | null)[] = [];
+  for (let i = 0; i < keys.length; i += GET_MULTIPLE_ACCOUNTS_LIMIT) {
+    out.push(...await conn.getMultipleAccountsInfo(
+      keys.slice(i, i + GET_MULTIPLE_ACCOUNTS_LIMIT), commitment));
+  }
+  return out;
+}
+
 /**
  * Parse a Solana-CLI JSON-array secret key from `envVar`, write it to a 0600 temp file at
  * `tmpPath` (under /tmp ONLY), and load the Keypair FROM that file path. Exits immediately on
@@ -1524,7 +1550,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
     if (!ids.length) return;
 
     // One batched read rather than N round-trips, so this stays cheap as the ledger grows.
-    const settles = await conn.getMultipleAccountsInfo(ids.map(settlementPda), "confirmed");
+    const settles = await getMultipleAccountsInfoChunked(conn, ids.map(settlementPda), "confirmed");
     const owing = ids.filter((_id, i) => settles[i] === null);
     if (!owing.length) return;
 
@@ -1634,9 +1660,9 @@ async function openRoundPotAccounts(nextRoundId: number) {
 
     // Three batched reads rather than 3N round-trips.
     const [rounds, settles, vaults] = await Promise.all([
-      conn.getMultipleAccountsInfo(ids.map(roundPda), "confirmed"),
-      conn.getMultipleAccountsInfo(ids.map(settlementPda), "confirmed"),
-      conn.getMultipleAccountsInfo(ids.map((i) => ataFor(potAuthorityPda(i), sgdMint)), "confirmed"),
+      getMultipleAccountsInfoChunked(conn, ids.map(roundPda), "confirmed"),
+      getMultipleAccountsInfoChunked(conn, ids.map(settlementPda), "confirmed"),
+      getMultipleAccountsInfoChunked(conn, ids.map((i) => ataFor(potAuthorityPda(i), sgdMint)), "confirmed"),
     ]);
 
     const closable: number[] = [];
@@ -2276,6 +2302,7 @@ export {
   MAX_SHARD_SIZE, MAX_SHARDS, MAX_TIER1_SHARDS, SHARD_WINNERS,
   SINGLE_TIER_CAPACITY, TWO_TIER_CAPACITY, FINAL_SHARD_INDEX,
   rpcRead, rpcBackoffMs, RPC_ATTEMPTS,
+  getMultipleAccountsInfoChunked, GET_MULTIPLE_ACCOUNTS_LIMIT,
   stuckScoreAction, classifyScoreState, SCORE_TIMEOUT_SECONDS, SCORE_ATTEMPTS,
   closeRoundAction, formatRemaining,
   lockAction, acquireLock, releaseLock, LOCK_PATH, LOCK_STALE_SECONDS,
