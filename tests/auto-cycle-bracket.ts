@@ -36,6 +36,19 @@ import {
   RPC_ATTEMPTS,
   getMultipleAccountsInfoChunked,
   GET_MULTIPLE_ACCOUNTS_LIMIT,
+  fetchRoundEntryAccounts,
+  settlementExists,
+  settlementStateOf,
+  owingRounds,
+  classifyPotVaults,
+  warnFinalizedOutsideCycle,
+  SETTLEMENT_NONE,
+  SETTLEMENT_POT_PAID,
+  SETTLEMENT_POT_REFUNDED,
+  reclaimThenOpen,
+  reclaimFailureMessage,
+  runNonBlocking,
+  rpcHost,
   stuckScoreAction,
   SCORE_TIMEOUT_SECONDS,
   SCORE_ATTEMPTS,
@@ -687,6 +700,311 @@ describe("auto-cycle single-instance lock", () => {
     it("cleared: not queued, not scored, no error => a cancel (never a callback outcome)", () => {
       // Only cancel_stuck_score produces this shape; a callback always sets scored or an error.
       assert.equal(classifyScoreState({ scored: false, scoreQueued: false, scoreErrorCode: 0 }), "cleared");
+    });
+  });
+});
+
+/**
+ * The off-chain hardening after the round-101 halt: reclaim can no longer block open_round,
+ * every settlement check agrees with close_pot_vault about what counts as a settlement, the
+ * public-RPC getProgramAccounts retries like every other read, and the "finalized OUTSIDE
+ * auto-cycle" warning fires only when something may still be owed. All against fake
+ * connections and hand-built AccountInfos — no chain.
+ */
+describe("auto-cycle hardening (post round 101)", () => {
+  const PROGRAM = Keypair.generate().publicKey;
+  const SYSTEM = anchor.web3.SystemProgram.programId;
+  const TOKEN = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+  const info = (owner: PK, data: Buffer, lamports = 1_000_000): anchor.web3.AccountInfo<Buffer> =>
+    ({ owner, data, lamports, executable: false, rentEpoch: 0 });
+  /** What a bare SOL transfer to a settlement PDA leaves behind: System-owned, no data. */
+  const lamportOnly = () => info(SYSTEM, Buffer.alloc(0), 890_880);
+  /** A real RoundSettlement (102 bytes) in `state`. */
+  const settlement = (state: number) => {
+    const d = Buffer.alloc(102);
+    d[16] = state;
+    return info(PROGRAM, d);
+  };
+  /** A CompetitionRound (174 bytes): `status` at 16, `participant_count` at 35. */
+  const roundAcct = (status: number, participants: number) => {
+    const d = Buffer.alloc(174);
+    d[16] = status;
+    d.writeUInt16LE(participants, 35);
+    return info(PROGRAM, d);
+  };
+  const vault = () => info(TOKEN, Buffer.alloc(165), 2_039_280);
+  const FINALIZED = 2;
+
+  describe("settlementExists — matches close_pot_vault's data_is_empty()", () => {
+    it("absent address → no settlement", () => {
+      assert.isFalse(settlementExists(null, PROGRAM));
+      assert.isFalse(settlementExists(undefined, PROGRAM));
+    });
+    it("lamport-only account (System-owned, empty data) → no settlement", () => {
+      assert.isFalse(settlementExists(lamportOnly(), PROGRAM));
+    });
+    it("program-owned but empty → no settlement (data_is_empty is the program's test)", () => {
+      assert.isFalse(settlementExists(info(PROGRAM, Buffer.alloc(0)), PROGRAM));
+    });
+    it("data owned by another program → no settlement", () => {
+      assert.isFalse(settlementExists(info(SYSTEM, Buffer.alloc(102)), PROGRAM));
+    });
+    it("program-owned with data → a settlement, and its state is read from offset 16", () => {
+      assert.isTrue(settlementExists(settlement(SETTLEMENT_POT_PAID), PROGRAM));
+      assert.equal(settlementStateOf(settlement(SETTLEMENT_POT_PAID), PROGRAM), SETTLEMENT_POT_PAID);
+      assert.equal(settlementStateOf(settlement(SETTLEMENT_POT_REFUNDED), PROGRAM), SETTLEMENT_POT_REFUNDED);
+      assert.equal(settlementStateOf(settlement(1), PROGRAM), 1);
+    });
+  });
+
+  describe("a lamport-only settlement is treated as ABSENT at every site", () => {
+    it("settlementStateOf (step 4b's already-settled check, the close-step warning) → NONE", () => {
+      assert.equal(settlementStateOf(lamportOnly(), PROGRAM), SETTLEMENT_NONE);
+    });
+
+    it("settleBacklog's owing list still includes the round", () => {
+      // Before: `settles[i] === null`, so a dusted PDA hid an unpaid round from the backlog.
+      const ids = [73, 74, 75];
+      const owing = owingRounds(ids, [settlement(SETTLEMENT_POT_PAID), lamportOnly(), null], PROGRAM);
+      assert.deepEqual(owing, [74, 75]);
+    });
+
+    it("reclaim still closes an empty FINALIZED round's vault", () => {
+      // Before: neither closable shape matched (st was truthy, st.data[16] undefined), so the
+      // vault was counted stranded on every run, forever.
+      const out = classifyPotVaults(
+        [100], [roundAcct(FINALIZED, 0)], [lamportOnly()], [vault()], PROGRAM);
+      assert.deepEqual(out, { closable: [100], stranded: [] });
+    });
+
+    it("reclaim does NOT treat it as a terminal settlement on a round that took entries", () => {
+      const out = classifyPotVaults(
+        [101], [roundAcct(FINALIZED, 3)], [lamportOnly()], [vault()], PROGRAM);
+      assert.deepEqual(out, { closable: [], stranded: [101] });
+    });
+
+    it("the finalized-outside warning treats the round as unsettled", () => {
+      assert.isTrue(warnFinalizedOutsideCycle(3, settlementStateOf(lamportOnly(), PROGRAM)));
+    });
+  });
+
+  describe("classifyPotVaults — unchanged behaviour for real accounts", () => {
+    it("paid or refunded → closable; pending refund → stranded; no vault / no round → skipped", () => {
+      const ids = [70, 71, 72, 73, 74, 75];
+      const rounds = [roundAcct(FINALIZED, 5), roundAcct(FINALIZED, 5), roundAcct(FINALIZED, 5),
+        roundAcct(FINALIZED, 5), null, roundAcct(0, 0)];
+      const settles = [settlement(SETTLEMENT_POT_PAID), settlement(SETTLEMENT_POT_REFUNDED),
+        settlement(1), null, null, null];
+      const vaults = [vault(), vault(), vault(), null, vault(), vault()];
+      const out = classifyPotVaults(ids, rounds, settles, vaults, PROGRAM);
+      // 73: vault already closed. 74: round never existed. 75: OPEN and empty is not closable.
+      assert.deepEqual(out, { closable: [70, 71], stranded: [72, 75] });
+    });
+    it("an unsettled round that took entries is stranded, not closed", () => {
+      const out = classifyPotVaults([80], [roundAcct(FINALIZED, 2)], [null], [vault()], PROGRAM);
+      assert.deepEqual(out, { closable: [], stranded: [80] });
+    });
+  });
+
+  describe("reclaimThenOpen — reclaim can never stop open_round, but still fails the run", () => {
+    /** Records the order steps ran in; `open` reports round 103 as opened. */
+    const steps = (calls: string[], reclaim: () => Promise<void>, errors: Error[] = []) => ({
+      reclaim,
+      open: async () => { calls.push("open"); return 103; },
+      finish: async () => { calls.push("summary"); },
+      onReclaimError: (e: Error) => { calls.push("report"); errors.push(e); },
+    });
+
+    it("reclaim throws → reported, round opened, summary printed, THEN the run fails (exit non-zero)", async () => {
+      const calls: string[] = [];
+      const errors: Error[] = [];
+      let runError: Error | null = null;
+      try {
+        await reclaimThenOpen(steps(calls, async () => {
+          calls.push("reclaim");
+          throw new Error("Too many inputs provided; max 100");
+        }, errors));
+      } catch (e) {
+        runError = e as Error;
+      }
+      // The open and the summary both happen BEFORE the run is failed — nothing is blocked.
+      assert.deepEqual(calls, ["reclaim", "report", "open", "summary"]);
+      assert.lengthOf(errors, 1);
+      assert.include(errors[0].message, "max 100");
+      // main's catch turns this into `AUTO-CYCLE FAILED: …` and process.exit(1), which is what
+      // Railway flags.
+      assert.isNotNull(runError, "a failed reclaim must fail the run once the work is done");
+      assert.equal(runError!.message, reclaimFailureMessage("Too many inputs provided; max 100", 103));
+      assert.include(runError!.message, "Round 103 was opened regardless");
+    });
+
+    it("reclaim's RPC read failing every retry (the round-101 shape) → open still runs, then the run fails", async () => {
+      // The real chunked reader against a connection that rejects every call: rpcRead exhausts
+      // its attempts (real backoff), the throw escapes reclaim, and open must still happen.
+      const conn = {
+        async getMultipleAccountsInfo() { throw new Error("Too many inputs provided; max 100"); },
+      } as unknown as anchor.web3.Connection;
+      const calls: string[] = [];
+      const errors: Error[] = [];
+      const ids = Array.from({ length: 101 }, (_, i) => i + 1); // reclaim surveys 1..current
+      let runError: Error | null = null;
+      await reclaimThenOpen(steps(calls, async () => {
+        await getMultipleAccountsInfoChunked(conn, randomKeys(101), "confirmed", "reclaim rounds", ids);
+      }, errors)).catch((e) => { runError = e as Error; });
+      assert.deepEqual(calls, ["report", "open", "summary"], "open_round must run after a failed reclaim");
+      // The failing batch is named by the ROUNDS it held, not by key index — in the report and
+      // in the error the run exits with.
+      assert.match(errors[0].message, /reclaim rounds \(rounds 1\.\.100\) failed after 6 attempts/);
+      assert.match((runError as Error | null)?.message ?? "",
+        /^vault-rent reclaim failed \(reclaim rounds \(rounds 1\.\.100\) failed after 6 attempts/);
+    });
+
+    it("reclaim succeeds → open, summary, and the run ends cleanly (exit 0)", async () => {
+      const calls: string[] = [];
+      await reclaimThenOpen(steps(calls, async () => { calls.push("reclaim"); }));
+      assert.deepEqual(calls, ["reclaim", "open", "summary"]);
+    });
+
+    it("a failure to OPEN still propagates at once — no summary, as before", async () => {
+      const calls: string[] = [];
+      try {
+        await reclaimThenOpen({
+          ...steps(calls, async () => { calls.push("reclaim"); }),
+          open: async () => { throw new Error("openRound(103) failed"); },
+        });
+        assert.fail("should have thrown");
+      } catch (e) {
+        assert.include((e as Error).message, "openRound(103) failed");
+      }
+      assert.deepEqual(calls, ["reclaim"]);
+    });
+
+    it("reclaim AND open both fail → the open failure is what surfaces", async () => {
+      const calls: string[] = [];
+      try {
+        await reclaimThenOpen({
+          ...steps(calls, async () => { throw new Error("survey down"); }),
+          open: async () => { throw new Error("openRound(103) failed"); },
+        });
+        assert.fail("should have thrown");
+      } catch (e) {
+        assert.include((e as Error).message, "openRound(103) failed");
+      }
+      assert.deepEqual(calls, ["report"]);
+    });
+
+    it("reclaimFailureMessage names the opened round, or none on a path that opens nothing", () => {
+      assert.equal(reclaimFailureMessage("x", 103),
+        "vault-rent reclaim failed (x). Round 103 was opened regardless and all other cycle work "
+        + "completed; flagging the run for monitoring. The next run re-surveys every vault.");
+      assert.equal(reclaimFailureMessage("x", null),
+        "vault-rent reclaim failed (x). All other cycle work completed; flagging the run for "
+        + "monitoring. The next run re-surveys every vault.");
+    });
+
+    it("runNonBlocking wraps a non-Error throw", async () => {
+      let got: Error | null = null;
+      await runNonBlocking(async () => { throw "boom"; }, (e) => { got = e; });
+      assert.instanceOf(got, Error);
+      assert.equal((got as Error | null)?.message, "boom");
+    });
+  });
+
+  describe("getMultipleAccountsInfoChunked — per-batch retry", () => {
+    it("a batch that fails transiently is retried alone and order is preserved", async () => {
+      const keys = randomKeys(150);
+      const calls: number[] = [];
+      let failedOnce = false;
+      const conn = {
+        async getMultipleAccountsInfo(ks: PK[]) {
+          calls.push(ks.length);
+          if (ks.length === 50 && !failedOnce) { failedOnce = true; throw new TypeError("fetch failed"); }
+          return ks.map((k) => ({ data: Buffer.from(k.toBytes()) }));
+        },
+      } as unknown as anchor.web3.Connection;
+      const out = await getMultipleAccountsInfoChunked(conn, keys, "confirmed");
+      assert.deepEqual(calls, [100, 50, 50], "only the failed second batch is re-read");
+      out.forEach((inf, i) => assert.isTrue(inf!.data.equals(Buffer.from(keys[i].toBytes()))));
+    });
+  });
+
+  describe("fetchRoundEntryAccounts — getProgramAccounts retries like every other read", () => {
+    const disc = { offset: 0, bytes: "3yqxZ8ZMDHm" };
+
+    it("fails transiently, then succeeds → the cycle continues with the entries", async () => {
+      const round = Keypair.generate().publicKey;
+      const entry = { pubkey: Keypair.generate().publicKey, account: info(PROGRAM, Buffer.alloc(8)) };
+      const seen: any[] = [];
+      let calls = 0;
+      const conn = {
+        async getProgramAccounts(programId: PK, config: any) {
+          calls++;
+          seen.push({ programId, config });
+          if (calls === 1) throw new Error("429 Too Many Requests");
+          return [entry];
+        },
+      } as unknown as anchor.web3.Connection;
+      const out = await fetchRoundEntryAccounts(conn, PROGRAM, disc, round);
+      assert.equal(calls, 2, "must retry the transient failure");
+      assert.deepEqual(out as any, [entry]);
+      // The filters are the load-bearing part (see entriesForRound): discriminator + round.
+      assert.isTrue(seen[1].programId.equals(PROGRAM));
+      assert.deepEqual(seen[1].config.filters, [
+        { memcmp: { offset: 0, bytes: disc.bytes } },
+        { memcmp: { offset: 8, bytes: round.toBase58() } },
+      ]);
+    });
+
+    it("gives up after RPC_ATTEMPTS and names the round", async () => {
+      const round = Keypair.generate().publicKey;
+      let calls = 0;
+      const conn = {
+        async getProgramAccounts() { calls++; throw new TypeError("fetch failed"); },
+      } as unknown as anchor.web3.Connection;
+      try {
+        await fetchRoundEntryAccounts(conn, PROGRAM, disc, round);
+        assert.fail("should have thrown");
+      } catch (e) {
+        assert.equal(calls, RPC_ATTEMPTS);
+        assert.match((e as Error).message, /^entries of round .+ failed after 6 attempts: fetch failed/);
+      }
+    });
+  });
+
+  describe("warnFinalizedOutsideCycle — only when something may still be owed", () => {
+    it("FINALIZED round whose pot was paid (state 2) → no warning (the round-101 re-run)", () => {
+      assert.isFalse(warnFinalizedOutsideCycle(1, SETTLEMENT_POT_PAID));
+    });
+    it("refunded (state 3) → no warning", () => {
+      assert.isFalse(warnFinalizedOutsideCycle(52, SETTLEMENT_POT_REFUNDED));
+    });
+    it("took entries and has no settlement → warning (the round-50 case)", () => {
+      assert.isTrue(warnFinalizedOutsideCycle(91, SETTLEMENT_NONE));
+    });
+    it("refund still in progress (state 1) → warning", () => {
+      assert.isTrue(warnFinalizedOutsideCycle(4, 1));
+    });
+    it("no entrants → nothing could be owed → no warning", () => {
+      assert.isFalse(warnFinalizedOutsideCycle(0, SETTLEMENT_NONE));
+    });
+  });
+
+  describe("rpcHost — the startup log never prints a key", () => {
+    it("Helius key in the query string is dropped", () => {
+      const out = rpcHost("https://devnet.helius-rpc.com/?api-key=00000000-SECRET-0000");
+      assert.equal(out, "devnet.helius-rpc.com");
+      assert.notInclude(out, "SECRET");
+    });
+    it("key in the path and userinfo credentials are dropped; the port is kept", () => {
+      assert.equal(rpcHost("https://solana-devnet.g.alchemy.com/v2/SECRETKEY"), "solana-devnet.g.alchemy.com");
+      assert.equal(rpcHost("https://user:SECRET@rpc.example.com:8899/x"), "rpc.example.com:8899");
+    });
+    it("public devnet", () => {
+      assert.equal(rpcHost("https://api.devnet.solana.com"), "api.devnet.solana.com");
+    });
+    it("an unparseable value never echoes itself", () => {
+      assert.equal(rpcHost("not a url SECRET"), "(unparseable URL)");
     });
   });
 });

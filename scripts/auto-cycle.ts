@@ -495,19 +495,219 @@ const GET_MULTIPLE_ACCOUNTS_LIMIT = 100;
  * so the cycle crashed every run from round 101 onward, after the pot step and before
  * `open_round`, stalling the game. Every multi-account read in this script goes through here.
  *
+ * Each batch goes through `rpcRead`, so a blip on one batch retries that batch alone rather
+ * than failing the whole scan. A cap violation is deterministic and would fail all six
+ * attempts, but batching means it cannot happen. Pass `roundIds` (aligned with `keys`) and a
+ * failing batch is named by the rounds it held, which is what an operator reading the log
+ * needs; without it the batch is named by key index.
+ *
  * Exported for tests.
  */
 async function getMultipleAccountsInfoChunked(
   conn: anchor.web3.Connection,
   keys: PK[],
   commitment: anchor.web3.Commitment,
+  label = "getMultipleAccountsInfo",
+  roundIds?: number[],
 ): Promise<(anchor.web3.AccountInfo<Buffer> | null)[]> {
   const out: (anchor.web3.AccountInfo<Buffer> | null)[] = [];
   for (let i = 0; i < keys.length; i += GET_MULTIPLE_ACCOUNTS_LIMIT) {
-    out.push(...await conn.getMultipleAccountsInfo(
-      keys.slice(i, i + GET_MULTIPLE_ACCOUNTS_LIMIT), commitment));
+    const batch = keys.slice(i, i + GET_MULTIPLE_ACCOUNTS_LIMIT);
+    const last = i + batch.length - 1;
+    const scope = roundIds ? `rounds ${roundIds[i]}..${roundIds[last]}` : `keys [${i}..${last}]`;
+    out.push(...await rpcRead(`${label} (${scope})`,
+      () => conn.getMultipleAccountsInfo(batch, commitment)));
   }
   return out;
+}
+
+/**
+ * Every CompetitionEntry of `round`, via `getProgramAccounts`, through the same retry as every
+ * other read.
+ *
+ * This is the one call that goes to the public devnet RPC, whatever HELIUS_RPC_URL says, and
+ * it sits on the path to `open_round` (score, reveal, both winner lookups). Unwrapped, a single
+ * 429 that outlasted web3.js's own retry, or any 5xx or "fetch failed", aborted the cycle
+ * before the next round opened.
+ *
+ * Exported for tests.
+ */
+async function fetchRoundEntryAccounts(
+  conn: anchor.web3.Connection,
+  programId: PK,
+  entryDiscriminator: { offset: number; bytes: string },
+  round: PK,
+): Promise<anchor.web3.GetProgramAccountsResponse> {
+  return rpcRead(`entries of round ${short(round)}`, () => conn.getProgramAccounts(programId, {
+    filters: [
+      { memcmp: { offset: entryDiscriminator.offset, bytes: entryDiscriminator.bytes } },
+      { memcmp: { offset: 8, bytes: round.toBase58() } },
+    ],
+  }));
+}
+
+/** RoundSettlement.state values, mirroring constants.rs `SETTLEMENT_*`. */
+const SETTLEMENT_NONE = 0;
+const SETTLEMENT_POT_PAID = 2;
+const SETTLEMENT_POT_REFUNDED = 3;
+/** `state` follows the 8-byte discriminator and the u64 `round_id` (state.rs `RoundSettlement`). */
+const SETTLEMENT_STATE_OFFSET = 16;
+
+/**
+ * Does `info` hold a real RoundSettlement? Every settlement check in this script asks here.
+ *
+ * AN ACCOUNT AT THE ADDRESS IS NOT ENOUGH. Anyone can send lamports to any address, and a bare
+ * transfer to a settlement PDA leaves a System-owned account with no data there — which
+ * `getMultipleAccountsInfo` returns as non-null. `close_pot_vault` asks `data_is_empty()`
+ * (close_pot_vault.rs:120) and treats that account as NO settlement, and so does Anchor's
+ * `fetchNullable`. The raw checks here used to treat it as present, which let one stray
+ * transfer strand an empty round's vault for good (neither of reclaim's closable shapes
+ * matched) and hide an unpaid round from the backlog. Only the program can put data into its
+ * own PDA, so "owned by the program and not empty" is the test.
+ *
+ * Exported for tests.
+ */
+function settlementExists(
+  info: anchor.web3.AccountInfo<Buffer> | null | undefined,
+  programId: PK,
+): info is anchor.web3.AccountInfo<Buffer> {
+  return !!info && info.owner.equals(programId) && info.data.length > 0;
+}
+
+/** The settlement's `state`, or SETTLEMENT_NONE when `settlementExists` says there is none.
+ *  Exported for tests. */
+function settlementStateOf(
+  info: anchor.web3.AccountInfo<Buffer> | null | undefined,
+  programId: PK,
+): number {
+  if (!settlementExists(info, programId)) return SETTLEMENT_NONE;
+  return info.data[SETTLEMENT_STATE_OFFSET] ?? SETTLEMENT_NONE;
+}
+
+/** The rounds among `ids` with no RoundSettlement, for the backlog scan. `settles[i]` is the
+ *  settlement account of `ids[i]`. Exported for tests. */
+function owingRounds(
+  ids: number[],
+  settles: (anchor.web3.AccountInfo<Buffer> | null)[],
+  programId: PK,
+): number[] {
+  return ids.filter((_id, i) => !settlementExists(settles[i], programId));
+}
+
+/**
+ * Sort surveyed pot vaults into the ones `close_pot_vault` will accept and the ones it never
+ * will until something settles them. `rounds[i]`, `settles[i]` and `vaults[i]` all belong to
+ * round `ids[i]`; a null vault or round is skipped (never opened, or already closed).
+ *
+ * Exported for tests.
+ */
+function classifyPotVaults(
+  ids: number[],
+  rounds: (anchor.web3.AccountInfo<Buffer> | null)[],
+  settles: (anchor.web3.AccountInfo<Buffer> | null)[],
+  vaults: (anchor.web3.AccountInfo<Buffer> | null)[],
+  programId: PK,
+): { closable: number[]; stranded: number[] } {
+  const closable: number[] = [];
+  const stranded: number[] = [];
+  for (let i = 0; i < ids.length; i++) {
+    if (!rounds[i] || !vaults[i]) continue;      // round never existed, or vault already closed
+    // SETTLEMENT_POT_PAID (2) and _POT_REFUNDED (3) are the terminal states close_pot_vault
+    // accepts.
+    const state = settlementStateOf(settles[i], programId);
+    if (state === SETTLEMENT_POT_PAID || state === SETTLEMENT_POT_REFUNDED) {
+      closable.push(ids[i]);
+      continue;
+    }
+    // No settlement. That is closable for exactly one shape of round: FINALIZED with no
+    // entrants, which can never reach a settlement at all (nothing to score → never revealed
+    // → distribute_pot refuses it forever). CompetitionRound layout: `status` at offset 16,
+    // `participant_count` at offset 35.
+    const rd = rounds[i]!.data;
+    if (!settlementExists(settles[i], programId)
+      && rd[16] === ROUND_STATUS_FINALIZED && rd.readUInt16LE(35) === 0) closable.push(ids[i]);
+    else stranded.push(ids[i]);
+  }
+  return { closable, stranded };
+}
+
+/**
+ * Should a round that was already FINALIZED when the cycle started raise the "finalized
+ * OUTSIDE auto-cycle — verify whether prizes are owed" warning?
+ *
+ * Only if something could still be owed: the round took entries AND its pot has not reached a
+ * terminal settlement. A bare FINALIZED status used to be enough, which made the warning fire
+ * on every re-run after a crash — round 101 was finalized and paid by the cycle that then
+ * crashed in reclaim, and the next run still told the operator to check its prizes by hand.
+ *
+ * Exported for tests.
+ */
+function warnFinalizedOutsideCycle(participantCount: number, settlementState: number): boolean {
+  return participantCount > 0
+    && settlementState !== SETTLEMENT_POT_PAID
+    && settlementState !== SETTLEMENT_POT_REFUNDED;
+}
+
+/**
+ * Steps 4c and 5 and the end of the run: reclaim vault rent, open the next round, print the
+ * summary — and only THEN, if reclaim failed, fail the run.
+ *
+ * Reclaim only recovers rent (0.0015 SOL a vault). Round 101 showed what it cost when it could
+ * throw: its survey hit the RPC's 100-key cap, the throw escaped to main, and no round opened
+ * for 2h30m. So a reclaim failure is handed to `onReclaimError` and the open runs regardless.
+ * It is not swallowed, though: once the round is open and the summary printed, the run throws,
+ * main exits non-zero and Railway flags it — the same after-the-work pattern as the
+ * no-callback case in step 2b. A failure to OPEN still propagates at once (no summary, as
+ * before) — that one genuinely is fatal.
+ *
+ * `open` returns the round it opened, for the failure message. Exported for tests.
+ */
+async function reclaimThenOpen(steps: {
+  reclaim: () => Promise<void>;
+  open: () => Promise<number>;
+  finish: () => Promise<void>;
+  onReclaimError: (e: Error) => void;
+}): Promise<void> {
+  const failed: { error: Error | null } = { error: null };
+  await runNonBlocking(steps.reclaim, (e) => {
+    failed.error = e;
+    steps.onReclaimError(e);
+  });
+  const opened = await steps.open();
+  await steps.finish();
+  if (failed.error) throw new Error(reclaimFailureMessage(failed.error.message.split("\n")[0], opened));
+}
+
+/** The message a run ends with when reclaim failed but everything else was done. `opened` is
+ *  the round the run opened regardless, or null on a path that opens nothing. Exported for
+ *  tests. */
+function reclaimFailureMessage(reclaimError: string, opened: number | null): string {
+  return `vault-rent reclaim failed (${reclaimError}). `
+    + (opened !== null ? `Round ${opened} was opened regardless and all other` : "All other")
+    + ` cycle work completed; flagging the run for monitoring. The next run re-surveys every vault.`;
+}
+
+/** Run `step`; hand any throw to `onError` instead of propagating it. Exported for tests. */
+async function runNonBlocking(step: () => Promise<void>, onError: (e: Error) => void): Promise<void> {
+  try {
+    await step();
+  } catch (e) {
+    onError(e instanceof Error ? e : new Error(String(e)));
+  }
+}
+
+/**
+ * Only the host of an RPC URL, for the startup log. NEVER the full URL: Helius carries its API
+ * key in the query string, and other providers put theirs in the path.
+ *
+ * Exported for tests.
+ */
+function rpcHost(url: string): string {
+  try {
+    return new URL(url).host || "(no host)";
+  } catch {
+    return "(unparseable URL)";
+  }
 }
 
 /**
@@ -724,8 +924,11 @@ interface CycleSummary {
   rentReclaimedLamports: number;
   /** Vaults that exist but can never be closed — see `reclaimVaultRent`. */
   vaultsStranded: number;
-  /** True when the round was already FINALIZED when the cycle started — i.e. finalized
-   *  OUTSIDE auto-cycle, so no prize distribution was ever run by a cycle. */
+  /** Set when reclaim itself failed. Non-blocking: the round still opened. */
+  reclaimError?: string;
+  /** True when the round was already FINALIZED when the cycle started AND prizes may still be
+   *  owed — it took entries and its pot has no terminal settlement. See
+   *  `warnFinalizedOutsideCycle`. */
   externallyFinalized: boolean;
   /** Set ONLY when this run actually sent finalize_round. */
   finalizedRound: number | null;
@@ -770,11 +973,11 @@ async function main(): Promise<void> {
   /** The one account that says what happened to a round's $SGD pot. */
   const settlementPda = (id: number) => PublicKey.findProgramAddressSync(
     [Buffer.from("round_settlement"), u64le(id)], program.programId)[0];
-  /** 0 = none, 1 = refund in progress, 2 = paid to winners, 3 = refunded to entrants. */
-  const settlementState = async (id: number): Promise<number> => {
-    const acc: any = await program.account.roundSettlement.fetchNullable(settlementPda(id));
-    return acc ? (acc.state as number) : 0;
-  };
+  /** 0 = none, 1 = refund in progress, 2 = paid to winners, 3 = refunded to entrants. Read raw
+   *  and judged by `settlementStateOf`, the same test every other settlement check uses. */
+  const settlementState = async (id: number): Promise<number> => settlementStateOf(
+    await rpcRead(`settlement ${id}`, () => conn.getAccountInfo(settlementPda(id), "confirmed")),
+    program.programId);
   /** Create any winner $SGD account that does not exist yet; distribute_pot requires them. */
   async function ensureAtas(mint: PK, owners: PK[]): Promise<void> {
     for (const o of owners) {
@@ -920,12 +1123,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
     offset: number; bytes: string;
   };
   async function entriesForRound(round: PK): Promise<any[]> {
-    const accounts = await publicConn.getProgramAccounts(program.programId, {
-      filters: [
-        { memcmp: { offset: entryDiscriminator.offset, bytes: entryDiscriminator.bytes } },
-        { memcmp: { offset: 8, bytes: round.toBase58() } },
-      ],
-    });
+    const accounts = await fetchRoundEntryAccounts(publicConn, program.programId, entryDiscriminator, round);
     const out: any[] = [];
     for (const a of accounts) {
       try {
@@ -1550,8 +1748,9 @@ async function openRoundPotAccounts(nextRoundId: number) {
     if (!ids.length) return;
 
     // One batched read rather than N round-trips, so this stays cheap as the ledger grows.
-    const settles = await getMultipleAccountsInfoChunked(conn, ids.map(settlementPda), "confirmed");
-    const owing = ids.filter((_id, i) => settles[i] === null);
+    const settles = await getMultipleAccountsInfoChunked(
+      conn, ids.map(settlementPda), "confirmed", "backlog settlements", ids);
+    const owing = owingRounds(ids, settles, program.programId);
     if (!owing.length) return;
 
     console.log(`\n[backlog] ${owing.length} round(s) with an unsettled pot: ${owing.join(", ")}`);
@@ -1649,42 +1848,40 @@ async function openRoundPotAccounts(nextRoundId: number) {
    * there were never entrant funds to account for. A round that DID take entries and has no
    * settlement stays put; the program rejects it with `RoundHadEntrants`.
    *
-   * A failure never aborts the cycle: the vault stays, and the next run tries again.
+   * A failure never aborts the cycle. A failed close leaves its vault for the next run, and
+   * anything else that throws (the survey reads, the surplus ATA, a rent read) is caught by
+   * `reclaimThenOpen` / `runNonBlocking` at the call sites and reported by
+   * `reportReclaimFailure`, with the rounds involved, while the cycle goes on to open the next
+   * round; the run then exits non-zero once all its work is done, so Railway still flags it.
+   * That is safe only because the survey keeps no memory: it covers 1..current every run, so
+   * a failed run cannot push a vault out of range.
    */
   async function reclaimVaultRent(currentRound: number): Promise<void> {
-    const cfg: any = await program.account.gameConfig.fetch(configPda);
+    reclaimProgress.surveyed = "";
+    reclaimProgress.closable = [];
+    reclaimProgress.closed = [];
+
+    const cfg: any = await rpcRead("GameConfig (reclaim)", () => program.account.gameConfig.fetch(configPda));
     const sgdMint: PK = cfg.sgdMint;
 
     const ids: number[] = [];
     for (let i = 1; i <= currentRound; i++) ids.push(i);
+    reclaimProgress.surveyed = `1..${currentRound}`;
 
-    // Three batched reads rather than 3N round-trips.
-    const [rounds, settles, vaults] = await Promise.all([
-      getMultipleAccountsInfoChunked(conn, ids.map(roundPda), "confirmed"),
-      getMultipleAccountsInfoChunked(conn, ids.map(settlementPda), "confirmed"),
-      getMultipleAccountsInfoChunked(conn, ids.map((i) => ataFor(potAuthorityPda(i), sgdMint)), "confirmed"),
-    ]);
+    // Three batched reads rather than 3N round-trips, one after another: three concurrent
+    // streams of one method is exactly what a per-method rate limit counts, and nothing here
+    // is latency-sensitive.
+    const rounds = await getMultipleAccountsInfoChunked(
+      conn, ids.map(roundPda), "confirmed", "reclaim rounds", ids);
+    const settles = await getMultipleAccountsInfoChunked(
+      conn, ids.map(settlementPda), "confirmed", "reclaim settlements", ids);
+    const vaults = await getMultipleAccountsInfoChunked(
+      conn, ids.map((i) => ataFor(potAuthorityPda(i), sgdMint)), "confirmed", "reclaim vaults", ids);
 
-    const closable: number[] = [];
-    let stranded = 0;
-    for (let i = 0; i < ids.length; i++) {
-      if (!rounds[i] || !vaults[i]) continue;      // round never existed, or vault already closed
-      const st = settles[i];
-      // SETTLEMENT_POT_PAID (2) and _POT_REFUNDED (3) are the terminal states close_pot_vault
-      // accepts; `state` sits at offset 16 (8 discriminator + 8 round_id).
-      if (st && (st.data[16] === 2 || st.data[16] === 3)) {
-        closable.push(ids[i]);
-        continue;
-      }
-      // No settlement. That is closable for exactly one shape of round: FINALIZED with no
-      // entrants, which can never reach a settlement at all (nothing to score → never revealed
-      // → distribute_pot refuses it forever). CompetitionRound layout: `status` at offset 16,
-      // `participant_count` at offset 35.
-      const rd = rounds[i]!.data;
-      if (!st && rd[16] === ROUND_STATUS_FINALIZED && rd.readUInt16LE(35) === 0) closable.push(ids[i]);
-      else stranded++;
-    }
+    const { closable, stranded: strandedIds } = classifyPotVaults(ids, rounds, settles, vaults, program.programId);
+    const stranded = strandedIds.length;
     summary.vaultsStranded = stranded;
+    reclaimProgress.closable = closable;
 
     if (!closable.length) {
       if (stranded) {
@@ -1702,8 +1899,11 @@ async function openRoundPotAccounts(nextRoundId: number) {
 
     for (const id of closable) {
       const potVault = ataFor(potAuthorityPda(id), sgdMint);
-      const rent = (await conn.getAccountInfo(potVault, "confirmed"))?.lamports ?? 0;
       try {
+        // Feeds the summary only, so one attempt and never fatal: a failed read reports 0 rent
+        // and the close still goes ahead. (Retrying it six times could stall reclaim, and with
+        // it open_round, for as long as six request timeouts on a hung RPC.)
+        const rent = (await conn.getAccountInfo(potVault, "confirmed").catch(() => null))?.lamports ?? 0;
         const tx = await program.methods.closePotVault()
           .accountsPartial({
             authority: signer.publicKey,
@@ -1718,6 +1918,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
         const sig = await sendTxHttp(tx, `closePotVault(${id})`);
         summary.vaultsClosed++;
         summary.rentReclaimedLamports += rent;
+        reclaimProgress.closed.push(id);
         console.log(`  \u2713 round ${id}: +${(rent / 1e9).toFixed(9)} SOL (sig ${short(sig)})`);
       } catch (e) {
         console.error(`  \u2717 round ${id}: close failed \u2014 ${(e as Error).message.split("\n")[0]}`);
@@ -1726,11 +1927,32 @@ async function openRoundPotAccounts(nextRoundId: number) {
     }
   }
 
+  /** How far the current `reclaimVaultRent` got, so a failure can name the rounds involved. */
+  const reclaimProgress = { surveyed: "", closable: [] as number[], closed: [] as number[] };
+
+  /** The non-blocking handler for a reclaim that threw: say what failed and on which rounds,
+   *  record it for the summary, and let the caller carry on. */
+  function reportReclaimFailure(e: Error): void {
+    const msg = e.message.split("\n")[0];
+    summary.reclaimError = msg;
+    const ids = (xs: number[]) => (xs.length ? xs.join(", ") : "none");
+    console.error(`\n[reclaim] FAILED — ${msg}`);
+    console.error(`    rounds surveyed : ${reclaimProgress.surveyed || "(survey not started)"}`);
+    console.error(`    closable        : ${ids(reclaimProgress.closable)}`);
+    console.error(`    closed this run : ${ids(reclaimProgress.closed)}`);
+    console.error(`    Non-blocking: the cycle continues, and the run is flagged failed once it has finished.`);
+    console.error(`    Every vault still open is re-surveyed next run.`);
+  }
+
   // --- balance gate (operator fees) ----------------------------------------
   // Both checked BEFORE any cycle work so a low balance skips the day cleanly rather than
   // closing a round and then stalling.
   console.log(`\n=== Secret Garden — AUTO-CYCLE (cluster ${arciumEnv.arciumClusterOffset}) ===`);
   console.log(`  revision        : ${runningRevision()}`);
+  // Hosts only — the URLs carry API keys. Which endpoint a cycle ran against is otherwise
+  // invisible: round 101's crash came from an RPC cap that the Helius URL in a local .env
+  // does not enforce, and nothing in the log said which one Railway was using.
+  console.log(`  rpc host        : ${rpcHost(heliusUrl!)} (getProgramAccounts: ${rpcHost(publicConn.rpcEndpoint)})`);
   console.log(`  program         : ${program.programId.toBase58()}`);
   console.log(`  operator wallet : ${signer.publicKey.toBase58()}`);
 
@@ -1974,18 +2196,33 @@ async function openRoundPotAccounts(nextRoundId: number) {
   summary.entryCount = r.participantCount;
   console.log(`\n[close] round ${current} is ${ROUND_STATUS_NAME[r.status]}, ${r.participantCount} entries`);
 
-  // A round already FINALIZED when the cycle STARTS was finalized by something other than a
-  // cycle — a manual bracket reveal, the operator panel, or a partial run someone finished by
-  // hand. That path has no prize step, and the reveal branch below will (correctly) skip
-  // distribution, so without this warning the run reports "no payouts this run" for a round
-  // whose winners may never have been paid at all. Devnet round 50 is exactly that case: 91
-  // entrants, finalized manually on 2026-08-09, 1.5 SOL of prizes never sent.
+  // A round already FINALIZED when the cycle STARTS was finalized by something other than
+  // THIS run — a manual bracket reveal, the operator panel, a partial run someone finished by
+  // hand, or an earlier cycle that crashed after finalizing. Only the first three can leave
+  // prizes unpaid, so the warning fires only when something may still be owed (entrants and no
+  // terminal settlement). Devnet round 50 is the case it exists for: 91 entrants, finalized
+  // manually on 2026-08-09, 1.5 SOL of prizes never sent. Round 101 is the case it must NOT
+  // fire for: finalized and paid by the cycle that then crashed in reclaim.
   if (r.status === ROUND_STATUS_FINALIZED) {
-    summary.externallyFinalized = true;
-    console.log(`\n  ⓘ round ${current} was already FINALIZED before this cycle started, so it`);
-    console.log(`    was finalized outside auto-cycle (manual reveal / operator panel).`);
-    console.log(`    Payouts are no longer this cycle's blind spot: step 4b pays any revealed`);
-    console.log(`    round with no marker, whoever revealed it.`);
+    // Advisory only, so it must not be able to abort the run: skip the read when nothing can be
+    // owed (no entrants), and on a failed read assume unsettled — that errs toward warning.
+    let st = SETTLEMENT_NONE;
+    if (r.participantCount > 0) {
+      st = await settlementState(current).catch((e) => {
+        console.log(`  (settlement ${current} unreadable — ${(e as Error).message.slice(0, 90)}; warning to be safe)`);
+        return SETTLEMENT_NONE;
+      });
+    }
+    summary.externallyFinalized = warnFinalizedOutsideCycle(r.participantCount, st);
+    if (summary.externallyFinalized) {
+      console.log(`\n  ⓘ round ${current} was already FINALIZED before this cycle started, so it`);
+      console.log(`    was finalized outside auto-cycle (manual reveal / operator panel).`);
+      console.log(`    Payouts are no longer this cycle's blind spot: step 4b pays any revealed`);
+      console.log(`    round with no marker, whoever revealed it.`);
+    } else {
+      console.log(`  ↪ round ${current} was already FINALIZED and nothing is owed `
+        + `(${r.participantCount === 0 ? "no entrants" : `settlement state ${st}`}) — a resumed run`);
+    }
   }
 
   // Anchor hands back i64 as a BN; tolerate a plain number too.
@@ -2084,20 +2321,24 @@ async function openRoundPotAccounts(nextRoundId: number) {
   // failed), so the run exits 0 — this is exactly the round-91 case, and crashing daily over it
   // is the bug being fixed. A genuine NO-CALLBACK (queued but nothing ever came back) is a
   // stronger "cluster is silent" signal, so after completing all other work the run is flagged
-  // non-zero for monitoring. Either way the flag is raised AFTER the other work, so it blocks
-  // nothing.
+  // non-zero for monitoring. So is a reclaim failure. Either way the flag is raised AFTER the
+  // other work, so it blocks nothing.
   if (scoreFailures.length > 0) {
     console.log(
       `\n[reveal/finalize/open] deferred — round ${current} is not fully scored `
       + `(${summary.scoredCount}/${summary.entryCount}). Running vault-rent reclaim, then finishing.`);
-    await reclaimVaultRent(current);
+    await runNonBlocking(() => reclaimVaultRent(current), reportReclaimFailure);
     printSummary(summary, await balanceSol());
+    // Both flags are raised only now, after all of this path's work: either one fails the run.
+    const failures: string[] = [];
     if (sawNoCallback) {
-      throw new Error(
+      failures.push(
         `round ${current}: scoring incomplete and at least one entry received NO callback across `
         + `${SCORE_ATTEMPTS} attempts (queued but never executed). All other cycle work completed; `
         + `flagging the run for monitoring. The next scheduled run will retry.`);
     }
+    if (summary.reclaimError) failures.push(reclaimFailureMessage(summary.reclaimError, null));
+    if (failures.length) throw new Error(failures.join(" Also: "));
     return;
   }
 
@@ -2106,7 +2347,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
   // path through resolveWinnerWallets, so the summary can never again print raw entry PDAs.
   r = await program.account.competitionRound.fetch(round);
   if (r.status === ROUND_STATUS_FINALIZED) {
-    console.log(`\n[reveal] skipping — round ${current} already FINALIZED (see the warning above)`);
+    console.log(`\n[reveal] skipping — round ${current} already FINALIZED (see [close] above)`);
     summary.top3 = (await resolveWinnerWallets(round, r)).map((w) => w.wallet.toBase58());
   } else if (r.scoringRevealed) {
     // Resumed run: the reveal already happened. This used to be where the cycle gave up on
@@ -2196,15 +2437,22 @@ async function openRoundPotAccounts(nextRoundId: number) {
   // ------------------------------------ 4c. RECLAIM (pot-vault rent, idempotent)
   //
   // Runs AFTER 4b so the round just settled is swept in the same cycle, and BEFORE 5 so the
-  // next round's brand-new empty vault is not in the survey at all.
-  await reclaimVaultRent(current);
-
+  // next round's brand-new empty vault is not in the survey at all. Non-blocking: whatever
+  // reclaim throws is reported and step 5 runs anyway (see reclaimThenOpen).
+  //
   // ----------------------------------------------------------------- 5. OPEN
-  console.log(`\n[open] opening round ${current + 1}`);
-  await openNextRound(current);
-  summary.openedRound = current + 1;
-
-  printSummary(summary, await balanceSol());
+  // A reclaim failure fails the run here, AFTER the open and the summary (see reclaimThenOpen).
+  await reclaimThenOpen({
+    reclaim: () => reclaimVaultRent(current),
+    open: async () => {
+      console.log(`\n[open] opening round ${current + 1}`);
+      await openNextRound(current);
+      summary.openedRound = current + 1;
+      return current + 1;
+    },
+    finish: async () => printSummary(summary, await balanceSol()),
+    onReclaimError: reportReclaimFailure,
+  });
 
   // --- local helpers that close over the wired-up program/provider ----------
   async function openNextRound(currentRound: number): Promise<void> {
@@ -2258,9 +2506,14 @@ function printSummary(s: CycleSummary, operatorSol: number): void {
   console.log(`  Vault rent back    : ${s.vaultsClosed > 0
     ? `${(s.rentReclaimedLamports / 1e9).toFixed(9)} SOL from ${s.vaultsClosed} vault(s)`
     : "— (none closable)"}${s.vaultsStranded > 0 ? `, ${s.vaultsStranded} stranded` : ""}`);
+  if (s.reclaimError) {
+    console.log(`  Reclaim            : FAILED (${s.reclaimError}) — did not block the cycle; run exits non-zero, next cycle retries`);
+  }
   console.log(`  New round opened   : ${s.openedRound ?? "—"}`);
   console.log(`  Operator balance   : ${operatorSol.toFixed(4)} SOL`);
-  if (s.externallyFinalized) {
+  // Not when step 4b paid the pot in this same run: then the prizes this warns about were just
+  // distributed, two lines up.
+  if (s.externallyFinalized && !(s.potPaidSgd > 0)) {
     console.log(line);
     console.log(`  ⚠ Round ${s.processedRound} was finalized OUTSIDE auto-cycle. No prizes were`);
     console.log(`    distributed by this cycle. Verify manually whether prizes are owed.`);
@@ -2302,7 +2555,10 @@ export {
   MAX_SHARD_SIZE, MAX_SHARDS, MAX_TIER1_SHARDS, SHARD_WINNERS,
   SINGLE_TIER_CAPACITY, TWO_TIER_CAPACITY, FINAL_SHARD_INDEX,
   rpcRead, rpcBackoffMs, RPC_ATTEMPTS,
-  getMultipleAccountsInfoChunked, GET_MULTIPLE_ACCOUNTS_LIMIT,
+  getMultipleAccountsInfoChunked, GET_MULTIPLE_ACCOUNTS_LIMIT, fetchRoundEntryAccounts,
+  settlementExists, settlementStateOf, owingRounds, classifyPotVaults, warnFinalizedOutsideCycle,
+  SETTLEMENT_NONE, SETTLEMENT_POT_PAID, SETTLEMENT_POT_REFUNDED,
+  reclaimThenOpen, reclaimFailureMessage, runNonBlocking, rpcHost,
   stuckScoreAction, classifyScoreState, SCORE_TIMEOUT_SECONDS, SCORE_ATTEMPTS,
   closeRoundAction, formatRemaining,
   lockAction, acquireLock, releaseLock, LOCK_PATH, LOCK_STALE_SECONDS,
