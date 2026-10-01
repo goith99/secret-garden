@@ -34,3 +34,5 @@ graphify-out/
 # probes run from the repo root so they resolve node_modules. Reproducible, never
 # part of the source.
 .*.tmp.mjs
+# The same kind of probe under the older .tmp.<name>.mjs spelling.
+.tmp.abts.mjs

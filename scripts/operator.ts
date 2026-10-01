@@ -43,6 +43,11 @@ import { randomBytes } from "crypto";
 import * as fs from "fs";
 import * as os from "os";
 import type { SecretGarden } from "../target/types/secret_garden";
+// The reveal and the entry scan are auto-cycle.ts's own code, not copies of it: this file's copy
+// of the bracket reveal drifted until it could not reveal at all (audit 2026-10-01, L15/M1).
+// Importing auto-cycle.ts has no side effects: its cycle, its lock and its exit cleanup (which
+// removes /tmp/operator-keypair.json) all run only when it is itself the entry point.
+import { createBracketRevealer, fetchRoundEntryAccounts } from "./auto-cycle.ts";
 
 const { PublicKey, Keypair, SystemProgram, LAMPORTS_PER_SOL } = anchor.web3;
 
@@ -189,16 +194,28 @@ async function openRoundPotAccounts(nextRoundId: number) {
     throw new Error(`${label} failed to confirm after retries`);
   }
 
-  // Enumerate every CompetitionEntry of a round (first field `round: pubkey`
-  // sits at offset 8, right after the 8-byte account discriminator).
+  // Enumerate every CompetitionEntry of a round (first field `round: pubkey` sits at offset 8,
+  // right after the 8-byte account discriminator), with auto-cycle's retry and its
+  // discriminator filter. The filter is load-bearing: BracketState, Tier1State and the reveal
+  // results also carry the round at offset 8, so without it any round that already has a
+  // bracket — exactly the round a manual reveal is needed for — threw on decode.
+  const entryDiscriminator = program.coder.accounts.memcmp("competitionEntry") as {
+    offset: number; bytes: string;
+  };
   async function entriesForRound(round: PK): Promise<any[]> {
-    const accounts = await publicConn.getProgramAccounts(program.programId, {
-      filters: [{ memcmp: { offset: 8, bytes: round.toBase58() } }],
-    });
-    return accounts.map((a) => ({
-      pubkey: a.pubkey as PK,
-      ...(program.coder.accounts.decode("competitionEntry", a.account.data) as any),
-    }));
+    const accounts = await fetchRoundEntryAccounts(publicConn, program.programId, entryDiscriminator, round);
+    const out: any[] = [];
+    for (const a of accounts) {
+      try {
+        out.push({
+          pubkey: a.pubkey as PK,
+          ...(program.coder.accounts.decode("competitionEntry", a.account.data) as any),
+        });
+      } catch {
+        console.log(`  (skipping ${a.pubkey.toBase58()} — matched the round filter but is not a CompetitionEntry)`);
+      }
+    }
+    return out;
   }
 
   // Player-facing flower name for a winner (matches the frontend's species map).
@@ -476,134 +493,26 @@ async function openRoundPotAccounts(nextRoundId: number) {
         throw new Error(`scoring incomplete: ${r.scoredCount}/${r.participantCount} scored (run COMMAND=score)`);
       }
 
-      // ---- BRACKET REVEAL (the only reveal path) -------------------------------
+      // ---- BRACKET REVEAL ---------------------------------------------------------------
       //
-      // WHY NOT `queue_reveal_top3`. A single Arcium computation may reference at most 14
-      // distinct accounts in its argument list (measured on devnet: N=14 ok, N=15 and N=16
-      // rejected with Arcium error 6202), so the legacy one-shot reveal silently stops
-      // working somewhere between 14 and 16 entries and leaves the round UNREVEALABLE.
-      // Every round therefore goes through the bracket, which is shard-sized to stay under
-      // that ceiling. The legacy instruction is still registered and callable in principle;
-      // nothing in the operational flow calls it.
-      //
-      // A round that fits in ONE shard skips the final reveal entirely (see below), so the
-      // common small-round case still costs exactly one MPC call — same as the legacy path.
+      // The cron's own reveal (createBracketRevealer in auto-cycle.ts), so this manual fallback
+      // can never drift from the path that runs daily. It covers every round size the program
+      // accepts — single-tier (<=52 entries) and two-tier (53..221) — and resumes from whatever
+      // the chain already holds: a pinned bracket, results already back, shards collected. It
+      // reads result PDAs raw, so a SOL-only account planted at one (audit M1) is treated as
+      // "not queued" rather than throwing, and it orders the final reveal's finalists byte-wise,
+      // which is what the program checks (it used to sort them as base58 text).
       const entries = await entriesForRound(round);
       const scored = entries.filter((e) => e.scored);
       if (scored.length !== r.participantCount) {
         throw new Error(`found ${scored.length} scored entries but participantCount=${r.participantCount}`);
       }
-
-      // Canonical order: entry PDAs ascending. Anyone can recompute this offline, and the
-      // program re-verifies it, so the shard partition is checked rather than trusted.
-      // BYTE-WISE sort — this must match the on-chain `Pubkey` ordering exactly. Anchor's
-      // `Pubkey` compares as [u8; 32], NOT as base58 text: a key with a leading zero byte
-      // yields a 43-char base58 string that sorts LAST as text but FIRST as bytes. Sorting
-      // by base58 silently produces a partition the program rejects (error 6037).
-      const allEntries = scored
-        .map((e) => e.pubkey as PK)
-        .sort((a, b) => Buffer.compare(a.toBuffer(), b.toBuffer()));
-
-      // `reveal_top3_v5` ranks on `score * 8 + rarity` and the program reads each rarity from
-      // the FlowerRecord the entry itself recorded, so every QUEUE reveal takes TWO runs of
-      // remaining accounts: the entries, then their flowers in the SAME order. The collect_*
-      // instructions are unchanged and still take exactly n — passing 2n there fails
-      // WrongEntryCount, so the two cases must not share a helper by accident.
-      const flowerOf = new Map<string, PK>(
-        scored.map((e) => [(e.pubkey as PK).toBase58(), e.flowerRecord as PK]));
-      const metas = (keys: PK[]) => keys.map((p) => ({ pubkey: p, isWritable: false, isSigner: false }));
-      const metasWithFlowers = (keys: PK[]) => [
-        ...metas(keys),
-        ...metas(keys.map((k) => {
-          const f = flowerOf.get(k.toBase58());
-          if (!f) throw new Error(`no FlowerRecord known for entry ${k.toBase58()}`);
-          return f;
-        })),
-      ];
-      const sizes = planShards(allEntries.length);
-      const chunks: PK[][] = [];
-      let cursor = 0;
-      for (const s of sizes) { chunks.push(allEntries.slice(cursor, cursor + s)); cursor += s; }
-      const plannedSingle = chunks.length === 1;
-      const bracket = bracketPda(round);
-      console.log(`\n[bracket] ${allEntries.length} entries -> ${chunks.length} shard(s) [${sizes.join(", ")}]` +
-        `${plannedSingle ? " (single shard: final reveal skipped)" : ""}`);
-
-      const bState: any = await program.account.bracketState.fetchNullable(bracket);
-      if (!bState) {
-        const padSizes = [0, 0, 0, 0];
-        sizes.forEach((s, i) => (padSizes[i] = s));
-        const bounds = [PublicKey.default, PublicKey.default, PublicKey.default, PublicKey.default];
-        chunks.forEach((c, i) => (bounds[i] = c[0]));
-        await sendTxHttp(await program.methods.initBracket(padSizes, bounds, chunks.length)
-          .accountsPartial({ authority: authority.publicKey, config: configPda, round, bracket })
-          .transaction(), "initBracket");
-      }
-
-      for (let k = 0; k < chunks.length; k++) {
-        const rem = chunks[k].map((p) => ({ pubkey: p, isWritable: false, isSigner: false }));
-        const existing: any = await program.account.revealTop3V3Result.fetchNullable(shardResPda(round, k));
-        if (!existing?.ready) {
-          const off = freshOffset();
-          await sendTxHttp(await program.methods.queueShardReveal(off, k)
-            .accountsPartial({
-              authority: authority.publicKey, config: configPda, round, bracket,
-              result: shardResPda(round, k), ...queueAccsFor("reveal_top3_v5", off),
-            }).remainingAccounts(metasWithFlowers(chunks[k])).transaction(), `queueShardReveal(${k})`);
-          console.log(`  [shard ${k}] queued (${chunks[k].length} entries); awaiting MPC...`);
-          await arcium.awaitComputationFinalization(provider, off, program.programId, "confirmed", 360000);
-          for (let i = 0; i < 180; i++) {
-            const res: any = await program.account.revealTop3V3Result.fetchNullable(shardResPda(round, k));
-            if (res?.ready) break;
-            await sleep(1000);
-          }
-        }
-        const bb: any = await program.account.bracketState.fetch(bracket);
-        if ((bb.shardsCollected & (1 << k)) === 0) {
-          await sendTxHttp(await program.methods.collectShardWinners(k)
-            .accountsPartial({
-              authority: authority.publicKey, config: configPda, round, bracket,
-              result: shardResPda(round, k),
-            }).remainingAccounts(rem).transaction(), `collectShardWinners(${k})`);
-        }
-      }
-
-      // Multi-shard rounds need one more MPC call to rank the shard winners against each
-      // other. A single-shard round does NOT: that shard's ranking already IS the round's,
-      // and the program now REJECTS a final reveal there (it would reorder the finalists out
-      // of rank order into pubkey order). Take this from the PINNED bracket rather than from
-      // `plannedSingle`: an already-existing bracket is not re-pinned above, so the on-chain
-      // partition is the one that counts and the local plan may simply disagree with it.
-      const pinned: any = await program.account.bracketState.fetch(bracket);
-      const single = pinned.shardCount === 1;
-      if (!single) {
-        const bb: any = pinned;
-        if (!bb.finalQueued) {
-          const finalists = (bb.finalists as PK[]).slice(0, bb.finalistCount)
-            .sort((a, b) => (a.toBase58() < b.toBase58() ? -1 : 1));
-          const off = freshOffset();
-          await sendTxHttp(await program.methods.queueShardReveal(off, FINAL_SHARD_INDEX)
-            .accountsPartial({
-              authority: authority.publicKey, config: configPda, round, bracket,
-              result: shardResPda(round, FINAL_SHARD_INDEX), ...queueAccsFor("reveal_top3_v5", off),
-            }).remainingAccounts(metasWithFlowers(finalists))
-            .transaction(), "queueFinalReveal");
-          console.log(`  [final] queued over ${finalists.length} shard winners; awaiting MPC...`);
-          await arcium.awaitComputationFinalization(provider, off, program.programId, "confirmed", 360000);
-          for (let i = 0; i < 180; i++) {
-            const res: any = await program.account.revealTop3V3Result.fetchNullable(shardResPda(round, FINAL_SHARD_INDEX));
-            if (res?.ready) break;
-            await sleep(1000);
-          }
-        }
-      }
-
-      const resultIndex = single ? 0 : FINAL_SHARD_INDEX;
-      await sendTxHttp(await program.methods.applyBracketResult(resultIndex)
-        .accountsPartial({
-          authority: authority.publicKey, config: configPda, round, bracket,
-          result: shardResPda(round, resultIndex),
-        }).transaction(), "applyBracketResult");
+      const revealer = createBracketRevealer({
+        program, conn, authority: authority.publicKey, configPda,
+        sendTx: (tx, label) => sendTxHttp(tx, label), freshOffset, queueAccsFor,
+      });
+      console.log(`\n[bracket] revealing round ${current} (${scored.length} entries)`);
+      await revealer.runBracketReveal(round, scored.map((e) => e.pubkey as PK), current);
 
       let revealed = false;
       let rr: any;

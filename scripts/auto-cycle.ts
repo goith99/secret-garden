@@ -404,10 +404,16 @@ const OPERATOR_KEYPAIR_PATH = path.join("/tmp", "operator-keypair.json");
 // exits, so no path can leave a lock behind that would block the next legitimate run.
 // Synchronous, best-effort. (SIGKILL is the one case nothing can clean up — that is precisely
 // what LOCK_STALE_SECONDS exists for.)
-process.on("exit", () => {
-  try { fs.unlinkSync(OPERATOR_KEYPAIR_PATH); } catch { /* never written, or already gone */ }
-  releaseLock();
-});
+//
+// Registered only when this file is the entry point (see the bottom of the file), never at
+// import: operator.ts and the tests import this module, and must not delete a keypair file at
+// OPERATOR_KEYPAIR_PATH that they did not write.
+function registerExitCleanup(): void {
+  process.on("exit", () => {
+    try { fs.unlinkSync(OPERATOR_KEYPAIR_PATH); } catch { /* never written, or already gone */ }
+    releaseLock();
+  });
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const u64le = (n: number | bigint) => {
@@ -571,7 +577,89 @@ function settlementExists(
   info: anchor.web3.AccountInfo<Buffer> | null | undefined,
   programId: PK,
 ): info is anchor.web3.AccountInfo<Buffer> {
-  return !!info && info.owner.equals(programId) && info.data.length > 0;
+  return accountOwnedWithData(info, programId);
+}
+
+/**
+ * Is there a real account of `owner` at this address — the one existence test this script uses
+ * for any address an outsider can fund. `settlementExists` is this with the program as owner.
+ *
+ * A non-null AccountInfo is NOT enough: a bare SOL transfer leaves a System-owned, empty account
+ * at any address, PDAs and ATAs included. The program treats that as absent (`init_if_needed`
+ * absorbs it, `data_is_empty()` checks for it), and Anchor's TS `fetchNullable` returns null for
+ * it, but `fetchMultiple` tries to decode it and throws, and a raw truthiness check calls it
+ * present. Only `owner` can put data at its own PDA, so "owned by `owner`, data non-empty" is
+ * the test.
+ *
+ * Exported for tests.
+ */
+function accountOwnedWithData(
+  info: anchor.web3.AccountInfo<Buffer> | null | undefined,
+  owner: PK,
+): info is anchor.web3.AccountInfo<Buffer> {
+  return !!info && info.owner.equals(owner) && info.data.length > 0;
+}
+
+/**
+ * Read `keys` raw and decode only the ones `accountOwnedWithData` accepts; every other key —
+ * absent, SOL-only, or owned by someone else — comes back null, in input order.
+ *
+ * This replaces Anchor's `fetchMultiple` on addresses the program may not have created yet.
+ * `fetchMultiple` decodes every non-null account, so a SOL-only account planted at a reveal
+ * result PDA made it throw "Invalid account discriminator" before anything was queued, and the
+ * cycle died at REVEAL on every run (audit 2026-10-01, M1). Planting cost one 650,240-lamport
+ * transfer and could be done ahead for any future round.
+ *
+ * A program-owned account that does NOT decode is not an outsider's doing — only the program
+ * writes there — so that still throws, naming the account: it means a layout mismatch, and
+ * treating it as absent would hide it.
+ *
+ * Exported for tests.
+ */
+async function fetchProgramAccounts<T>(
+  conn: anchor.web3.Connection,
+  keys: PK[],
+  owner: PK,
+  decode: (data: Buffer) => T,
+  label: string,
+): Promise<(T | null)[]> {
+  if (keys.length === 0) return [];
+  const infos = await getMultipleAccountsInfoChunked(conn, keys, "confirmed", label);
+  return infos.map((info, i) => {
+    if (!accountOwnedWithData(info, owner)) return null;
+    try {
+      return decode(info.data);
+    } catch (e) {
+      throw new Error(`${label}: ${keys[i].toBase58()} is owned by ${owner.toBase58()} but does not `
+        + `decode (${(e as Error).message}) — a layout mismatch, not an outsider's account`);
+    }
+  });
+}
+
+/** The SPL Token program, owner of every real token account (pot vaults, player ATAs). */
+const SPL_TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+/**
+ * Make sure each target token account exists, calling `create` for the ones that do not.
+ *
+ * "Exists" means a real token account (`accountOwnedWithData` with the Token program as owner).
+ * A bare SOL transfer to an ATA address used to read as "already created", so the ATA was never
+ * made and the payout that needed it failed — for every co-winner, since distribute_pot is
+ * atomic. The ATA program's Create adopts a pre-funded System account, so creating over one is
+ * safe. An ATA that is a real token account but whose owner was reassigned still counts as
+ * existing here; nothing off-chain can repair that (audit L8).
+ *
+ * Exported for tests.
+ */
+async function ensureTokenAccounts<T extends { ata: PK }>(
+  conn: anchor.web3.Connection,
+  targets: T[],
+  create: (target: T) => Promise<void>,
+): Promise<void> {
+  for (const t of targets) {
+    if (accountOwnedWithData(await conn.getAccountInfo(t.ata, "confirmed"), SPL_TOKEN_PROGRAM_ID)) continue;
+    await create(t);
+  }
 }
 
 /** The settlement's `state`, or SETTLEMENT_NONE when `settlementExists` says there is none.
@@ -611,7 +699,10 @@ function classifyPotVaults(
   const closable: number[] = [];
   const stranded: number[] = [];
   for (let i = 0; i < ids.length; i++) {
-    if (!rounds[i] || !vaults[i]) continue;      // round never existed, or vault already closed
+    // Round never existed, or vault already closed. A SOL-only account at a closed vault's
+    // address is no vault: close_pot_vault would reject it (Account<TokenAccount>) and, sent
+    // with skipPreflight, burn a fee on every run.
+    if (!rounds[i] || !accountOwnedWithData(vaults[i], SPL_TOKEN_PROGRAM_ID)) continue;
     // SETTLEMENT_POT_PAID (2) and _POT_REFUNDED (3) are the terminal states close_pot_vault
     // accepts.
     const state = settlementStateOf(settles[i], programId);
@@ -756,11 +847,13 @@ function loadKeypairFromEnv(envVar: string, tmpPath: string): anchor.web3.Keypai
 /**
  * Compare two entry addresses the way the PROGRAM does — as raw [u8; 32], byte by byte.
  *
- * NOT `a.toBase58() < b.toBase58()`. Base58 drops leading zero bytes, so a key beginning 0x00
- * renders as a 43-character string that sorts LAST as text while sorting FIRST as bytes.
- * Anchor's `Pubkey: Ord` is the byte order, so a base58-text sort silently produces a partition
- * the program rejects with ShardEntriesOutOfRange (6037) — and only for the ~1-in-256 rounds
- * that contain such a key, which is why it reads as an intermittent failure rather than a bug.
+ * NOT `a.toBase58() < b.toBase58()`. Base58 is not order-preserving for text compare: keys
+ * with a small first byte (about 0x01-0x0e) render as 43 characters instead of 44 and sort
+ * late as text while sorting early as bytes. (A leading 0x00 is not the trap — it becomes a
+ * '1' prefix, the lowest base58 character, and sorts first both ways.) Anchor's `Pubkey: Ord`
+ * is the byte order, so a base58-text sort produces a partition the program rejects with
+ * ShardEntriesOutOfRange (6037) — for a large share of rounds, not a rare one: about 28% of
+ * random 6-key sets and 48% of 12-key sets order differently (audit 2026-10-01, A10a-4).
  */
 function compareEntryKeys(a: PK, b: PK): number {
   const x = a.toBytes();
@@ -935,105 +1028,42 @@ interface CycleSummary {
   openedRound: number | null;
 }
 
-async function main(): Promise<void> {
-  // --- secrets + RPC wiring -------------------------------------------------
-  const signer = loadKeypairFromEnv("OPERATOR_PRIVATE_KEY", OPERATOR_KEYPAIR_PATH);
-  // No treasury key any more: the SOL prize is gone, so this script spends only the
-  // operator's own lamports (transaction fees, and the rent it pays for settlements and ATAs).
-  const preflightOnly = process.env.PREFLIGHT_ONLY === "1";
+// ======================================================================================
+// BRACKET REVEAL ORCHESTRATION
+// Port of the frontend's src/program/reveal.ts — the same sequence the Operator Panel and
+// scripts/live-reveal-round.mjs run. Every step is idempotent against the chain state it
+// reads first, so an interrupted cycle resumes rather than restarting.
+// ======================================================================================
+//
+// Module-level so the cron (main below) and the manual fallback (scripts/operator.ts
+// COMMAND=reveal) run one implementation. It used to be a closure inside main, and operator.ts
+// kept its own copy, which drifted until it could not reveal at all: 2n remaining accounts where
+// the program takes n, a base58 finalist sort, and helpers it never defined (audit 2026-10-01).
 
-  const heliusUrl = process.env.HELIUS_RPC_URL;
-  if (!heliusUrl || heliusUrl.trim() === "") {
-    fatal("HELIUS_RPC_URL is not set. It is required for transaction send/confirm.");
-  }
-  if (!process.env.ARCIUM_CLUSTER_OFFSET) process.env.ARCIUM_CLUSTER_OFFSET = "456";
-
-  // Helius for transactions + single-account reads; public devnet RPC for getProgramAccounts
-  // (Helius free tier blocks it) — the exact split proven in scripts/operator.ts.
-  const conn = new Connection(heliusUrl!, "confirmed");
-  const publicConn = new Connection("https://api.devnet.solana.com", "confirmed");
-
-  const wallet = new anchor.Wallet(signer);
-  const provider = new anchor.AnchorProvider(conn, wallet, { commitment: "confirmed" });
-  anchor.setProvider(provider);
-
-  const idl = JSON.parse(
-    fs.readFileSync(new URL("../target/idl/secret_garden.json", import.meta.url)).toString(),
-  );
-  const program = new anchor.Program<SecretGarden>(idl as SecretGarden, provider);
-
-  const arciumEnv = arcium.getArciumEnv();
-  const clusterAccount = arcium.getClusterAccAddress(arciumEnv.arciumClusterOffset);
-  const mxeAccount = arcium.getMXEAccAddress(program.programId);
-
-  const configPda = PublicKey.findProgramAddressSync(
-    [Buffer.from("config")], program.programId)[0];
-  const roundPda = (id: number) => PublicKey.findProgramAddressSync(
-    [Buffer.from("round"), u64le(id)], program.programId)[0];
-  /** The one account that says what happened to a round's $SGD pot. */
-  const settlementPda = (id: number) => PublicKey.findProgramAddressSync(
-    [Buffer.from("round_settlement"), u64le(id)], program.programId)[0];
-  /** 0 = none, 1 = refund in progress, 2 = paid to winners, 3 = refunded to entrants. Read raw
-   *  and judged by `settlementStateOf`, the same test every other settlement check uses. */
-  const settlementState = async (id: number): Promise<number> => settlementStateOf(
-    await rpcRead(`settlement ${id}`, () => conn.getAccountInfo(settlementPda(id), "confirmed")),
-    program.programId);
-  /** Create any winner $SGD account that does not exist yet; distribute_pot requires them. */
-  async function ensureAtas(mint: PK, owners: PK[]): Promise<void> {
-    for (const o of owners) {
-      const ata = ataFor(o, mint);
-      if (await conn.getAccountInfo(ata, "confirmed")) continue;
-      const ix = new anchor.web3.TransactionInstruction({
-        programId: ASSOCIATED_TOKEN_PROGRAM_ID,
-        keys: [
-          { pubkey: signer.publicKey, isSigner: true, isWritable: true },
-          { pubkey: ata, isSigner: false, isWritable: true },
-          { pubkey: o, isSigner: false, isWritable: false },
-          { pubkey: mint, isSigner: false, isWritable: false },
-          { pubkey: anchor.web3.SystemProgram.programId, isSigner: false, isWritable: false },
-          { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-        ],
-        data: Buffer.from([]),
-      });
-      await sendTxHttp(new anchor.web3.Transaction().add(ix), `createAta(${o.toBase58().slice(0, 8)})`);
-    }
-  }
-
-// --- $SGD pot vault -------------------------------------------------------------------------
-// open_round now creates the round's pot vault itself, funded by the operator, so the round's
-// first entrant is not billed rent nobody else pays. `sgd_mint` is the one account Anchor
-// cannot derive (it has neither seeds nor a fixed address in the IDL), so it must be passed
-// explicitly — accountsPartial alone would fail at runtime.
-const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
-const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-const potAuthorityPda = (roundId: number): PK =>
-  PublicKey.findProgramAddressSync([Buffer.from("pot"), u64le(roundId)], program.programId)[0];
-const ataFor = (owner: PK, mint: PK): PK =>
-  PublicKey.findProgramAddressSync(
-    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
-    ASSOCIATED_TOKEN_PROGRAM_ID,
-  )[0];
-/** The five accounts open_round needs to create the next round's pot vault. */
-async function openRoundPotAccounts(nextRoundId: number) {
-  const cfg: any = await program.account.gameConfig.fetch(configPda);
-  const sgdMint: PK = cfg.sgdMint;
-  if (sgdMint.equals(PublicKey.default)) {
-    throw new Error(
-      "GameConfig.sgd_mint is unset — run `set_sgd_mint` before opening a round, or " +
-      "open_round will fail with SgdMintNotSet.",
-    );
-  }
-  const potAuthority = potAuthorityPda(nextRoundId);
-  return {
-    potAuthority,
-    potVault: ataFor(potAuthority, sgdMint),
-    sgdMint,
-    tokenProgram: TOKEN_PROGRAM_ID,
-    associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-  };
+/** The accounts every reveal queue passes for its Arcium computation. */
+interface QueueAccounts {
+  computationAccount: PK; clusterAccount: PK; mxeAccount: PK;
+  mempoolAccount: PK; executingPool: PK; compDefAccount: PK;
 }
-  const entryPda = (round: PK, player: PK) => PublicKey.findProgramAddressSync(
-    [Buffer.from("entry"), round.toBuffer(), player.toBuffer()], program.programId)[0];
+
+/** What the bracket reveal needs from its caller. */
+interface BracketRevealDeps {
+  program: anchor.Program<SecretGarden>;
+  conn: anchor.web3.Connection;
+  /** The signing operator or authority; every reveal instruction names it as `authority`. */
+  authority: PK;
+  configPda: PK;
+  sendTx: (tx: anchor.web3.Transaction, label: string) => Promise<string>;
+  freshOffset: () => BN;
+  queueAccsFor: (circuit: string, offset: BN) => QueueAccounts;
+}
+
+/** Exported for operator.ts and for tests. */
+function createBracketRevealer(deps: BracketRevealDeps) {
+  const { program, conn, configPda, freshOffset, queueAccsFor } = deps;
+  // The code below still names the signer and the sender the way it did inside main.
+  const signer = { publicKey: deps.authority };
+  const sendTxHttp = deps.sendTx;
 
   // --- bracket-reveal PDAs (seeds per constants.rs) ---
   /** Per-round BracketState. Also the SEMIFINAL tier of a two-tier round — promote_tier1
@@ -1051,243 +1081,6 @@ async function openRoundPotAccounts(nextRoundId: number) {
   const semiResultPda = (round: PK, semiIndex: number) => PublicKey.findProgramAddressSync(
     [Buffer.from("semires"), round.toBuffer(), Buffer.from([semiIndex])], program.programId)[0];
 
-  const freshOffset = () => new BN(randomBytes(8), "hex");
-  const compDefAccOf = (circuit: string) => arcium.getCompDefAccAddress(
-    program.programId, Buffer.from(arcium.getCompDefAccOffset(circuit)).readUInt32LE());
-  const queueAccsFor = (circuit: string, offset: BN) => ({
-    computationAccount: arcium.getComputationAccAddress(arciumEnv.arciumClusterOffset, offset),
-    clusterAccount,
-    mxeAccount,
-    mempoolAccount: arcium.getMempoolAccAddress(arciumEnv.arciumClusterOffset),
-    executingPool: arcium.getExecutingPoolAccAddress(arciumEnv.arciumClusterOffset),
-    compDefAccount: compDefAccOf(circuit),
-  });
-
-  // ---- HTTP-only send + confirm (no WebSocket on this Helius endpoint) ----
-  // `payer` is the fee-payer + sole signer for the tx; defaults to the operator `signer` for
-  // program instructions; always the operator now that no payout comes from a second wallet.
-  async function sendTxHttp(
-    tx: anchor.web3.Transaction,
-    label: string,
-    payer: anchor.web3.Keypair = signer,
-    // Co-signers beyond the fee payer. Unused now that there is no SOL prize; kept because
-    // the parameter is harmless and a future instruction may need it.
-    extraSigners: anchor.web3.Keypair[] = [],
-  ): Promise<string> {
-    for (let attempt = 1; attempt <= 6; attempt++) {
-      const bh = await conn.getLatestBlockhash({ commitment: "confirmed" });
-      tx.recentBlockhash = bh.blockhash;
-      tx.lastValidBlockHeight = bh.lastValidBlockHeight;
-      tx.feePayer = payer.publicKey;
-      tx.signatures = [];
-      tx.sign(payer, ...extraSigners);
-      let sig: string;
-      try {
-        sig = await conn.sendRawTransaction(tx.serialize(), {
-          skipPreflight: true, maxRetries: 0, preflightCommitment: "confirmed",
-        });
-      } catch (e) {
-        console.log(`    ${label} send err (attempt ${attempt}): ${(e as Error).message.slice(0, 90)}`);
-        await sleep(Math.min(6000, 500 * 2 ** (attempt - 1)));
-        continue;
-      }
-      const deadline = Date.now() + 90_000;
-      while (Date.now() < deadline) {
-        const st = (await conn.getSignatureStatuses([sig])).value[0];
-        if (st) {
-          if (st.err) throw new Error(`${label} tx FAILED: ${JSON.stringify(st.err)} (sig ${sig})`);
-          if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") return sig;
-        }
-        const h = await conn.getBlockHeight({ commitment: "confirmed" });
-        if (h > bh.lastValidBlockHeight) break;
-        await sleep(800);
-      }
-      console.log(`    ${label} not confirmed (attempt ${attempt}); retrying`);
-    }
-    throw new Error(`${label} failed to confirm after retries`);
-  }
-
-  // Enumerate every CompetitionEntry of a round via the public RPC (Helius free tier blocks
-  // getProgramAccounts). The first field `round: pubkey` sits at offset 8 (after the
-  // 8-byte discriminator). Decoded with the program's own coder.
-  //
-  // THE DISCRIMINATOR FILTER IS LOAD-BEARING. `round` at offset 8 is NOT unique to
-  // CompetitionEntry: BracketState, Tier1State and RevealTop3V3Result all store the round
-  // pubkey in the same position, so a round that has been through a bracket reveal matches
-  // extra accounts — 103 instead of 91 for devnet round 50 — and decoding one of those as a
-  // CompetitionEntry throws "Invalid account discriminator", aborting the cycle mid-flight.
-  // Filtering server-side on the 8-byte discriminator returns only genuine entries; the
-  // defensive skip below is a second layer in case a future account type is added with the
-  // same discriminator prefix (it cannot be, but the cycle should degrade rather than die).
-  const entryDiscriminator = program.coder.accounts.memcmp("competitionEntry") as {
-    offset: number; bytes: string;
-  };
-  async function entriesForRound(round: PK): Promise<any[]> {
-    const accounts = await fetchRoundEntryAccounts(publicConn, program.programId, entryDiscriminator, round);
-    const out: any[] = [];
-    for (const a of accounts) {
-      try {
-        out.push({
-          pubkey: a.pubkey as PK,
-          ...(program.coder.accounts.decode("competitionEntry", a.account.data) as any),
-        });
-      } catch {
-        console.log(`  (skipping ${a.pubkey.toBase58()} — matched the round filter but is not a CompetitionEntry)`);
-      }
-    }
-    return out;
-  }
-
-  /**
-   * Resolve a round's top1/top2/top3 to PLAYER WALLETS.
-   *
-   * round.topN holds the winning ENTRY pubkey, never the player's — printing them raw is what
-   * made the round-50 summary list three addresses that looked like unknown winners but were
-   * actually the correct winners' entry PDAs. Every path that reports winners goes through
-   * here, so the healthy path and the skip paths can never disagree again. Unfilled ranks
-   * (fewer than three entrants) are omitted.
-   */
-  async function resolveWinnerWallets(
-    round: PK, r: any,
-  ): Promise<{ rank: number; wallet: PK; entry: PK }[]> {
-    const entries = await entriesForRound(round);
-    const byEntry = new Map<string, PK>(entries.map((e) => [(e.pubkey as PK).toBase58(), e.player as PK]));
-    // The ENTRY pubkey travels with the wallet now: both `pay_sol_prizes` and
-    // `distribute_pot` take [entry, destination] pairs as remaining accounts, because
-    // top1/2/3 name entries and only the entry knows which wallet placed it.
-    const out: { rank: number; wallet: PK; entry: PK }[] = [];
-    [r.top1, r.top2, r.top3].forEach((entryPk: PK, idx: number) => {
-      if (entryPk.equals(PublicKey.default)) return; // unfilled rank
-      const player = byEntry.get(entryPk.toBase58());
-      if (player) out.push({ rank: idx + 1, wallet: player, entry: entryPk });
-      else console.log(`  ⚠ rank ${idx + 1}: entry ${entryPk.toBase58()} has no matching entry account`);
-    });
-    return out;
-  }
-
-  // ======================================================================================
-  // STUCK-COMPUTATION RECOVERY (scoring)
-  //
-  // `queue_score_entry` carries `constraint = !entry.score_queued @ ScoreAlreadyQueued`, so an
-  // MPC call that never comes back permanently blocks that entry — and with it the whole
-  // round, because every reveal path requires scored_count == participant_count. The only way
-  // out is `cancel_stuck_score`, which clears the flag once SCORE_TIMEOUT_SECONDS has elapsed.
-  //
-  // Before this, that was a MANUAL step: devnet round 53 wedged at 47/53 on 2026-08-11 when
-  // Arcium stopped serving our MXE mid-cycle, and every subsequent run aborted on the same
-  // entry with ScoreAlreadyQueued until an operator ran the cancel by hand. An unattended cron
-  // has nobody to do that, so it is done here.
-  // ======================================================================================
-
-  /**
-   * Clear a hung scoring computation so its entry can be re-queued.
-   *
-   * Returns true if a cancel was actually sent. No-ops when the entry is already scored (a late
-   * callback landed while we waited) or was never queued. Waits out the remainder of the
-   * on-chain cancel window when needed, re-reading first so a late callback still wins.
-   */
-  async function recoverStuckScore(entryPk: PK, label: string): Promise<boolean> {
-    for (;;) {
-      const e: any = await program.account.competitionEntry.fetch(entryPk);
-      const action = stuckScoreAction(
-        { scored: e.scored, scoreQueued: e.scoreQueued, queuedAt: Number(e.queuedAt) },
-        Math.floor(Date.now() / 1000),
-      );
-      if (action.kind === "scored") {
-        console.log(`    ${label}: callback landed late — already scored, no cancel needed`);
-        return false;
-      }
-      if (action.kind === "not-queued") return false;
-      if (action.kind === "cancel") break;
-      // Re-read after sleeping, so a callback landing during the wait still wins.
-      console.log(`    ${label}: in flight; waiting ${action.seconds}s for the on-chain cancel window`);
-      await sleep(action.seconds * 1000);
-    }
-    console.log(`    ${label}: clearing the stuck computation (cancel_stuck_score)`);
-    const tx = await program.methods.cancelStuckScore()
-      .accountsPartial({ caller: signer.publicKey, entry: entryPk }).transaction();
-    await sendTxHttp(tx, `cancelStuckScore`);
-    return true;
-  }
-
-  /**
-   * Score one entry, recovering from a hung computation and retrying up to SCORE_ATTEMPTS.
-   *
-   * The first recovery call also cleans up after a PREVIOUS run: an entry left flagged
-   * in-flight by an aborted cycle is cleared here instead of throwing ScoreAlreadyQueued.
-   */
-  async function scoreEntryWithRecovery(entryPk: PK, flowerRecord: PK, label: string): Promise<ScoreOutcome> {
-    for (let attempt = 1; attempt <= SCORE_ATTEMPTS; attempt++) {
-      // Clears a leftover flag from an earlier attempt OR an earlier run.
-      await recoverStuckScore(entryPk, label);
-      if ((await program.account.competitionEntry.fetch(entryPk)).scored) return { kind: "scored" };
-
-      const offset = freshOffset();
-      const tx = await program.methods.queueScoreEntry(offset)
-        .accountsPartial({
-          authority: signer.publicKey,
-          round: roundPda(current),
-          entry: entryPk,
-          flowerRecord,
-          ...queueAccsFor("score_entry_v2", offset),
-        }).transaction();
-      await sendTxHttp(tx, `queueScoreEntry ${label}`);
-
-      // A timeout here is INFORMATION, not a fatal error — the poll below handles it. Without
-      // this catch, one hung computation aborted the entire cycle.
-      try {
-        await arcium.awaitComputationFinalization(
-          provider, offset, program.programId, "confirmed", SCORE_FINALIZE_TIMEOUT_MS);
-      } catch (e) {
-        console.log(`    ${label}: computation did not finalize on attempt ${attempt}/${SCORE_ATTEMPTS}`
-          + ` (${(e as Error).message.slice(0, 70)})`);
-      }
-
-      // Poll regardless of how the wait ended: the callback may land between the two.
-      // Detect the ACTUAL outcome (not just success) via classifyScoreState — an ABORT callback
-      // clears score_queued and sets score_error_code but leaves scored=false, so watching only
-      // `scored` (the old bug) reported every abort as "no callback".
-      for (let k = 0; k < 120; k++) {
-        const e: any = await program.account.competitionEntry.fetch(entryPk);
-        const state = classifyScoreState({
-          scored: e.scored, scoreQueued: e.scoreQueued, scoreErrorCode: e.scoreErrorCode,
-        });
-        if (state === "scored") {
-          console.log(`    ✓ scored`);
-          return { kind: "scored" };
-        }
-        if (state === "aborted") {
-          // The callback DID land; the MPC ran and returned a failure. This is deterministic on
-          // the current cluster, so retrying inside this invocation just re-aborts and burns SOL
-          // — skip the remaining attempts and let the next scheduled run retry.
-          console.error(
-            `    ${label}: callback landed but the computation ABORTED (error code ${e.scoreErrorCode}) `
-            + `on attempt ${attempt}/${SCORE_ATTEMPTS}. This is a RETURNED FAILURE, not a missing `
-            + `callback — the MPC executed and failed. Skipping this entry; the next run retries.`);
-          return { kind: "aborted", errorCode: e.scoreErrorCode as number, attempt };
-        }
-        await sleep(1000);
-      }
-      if (attempt < SCORE_ATTEMPTS) {
-        console.log(`    ${label}: no callback landed (still in flight after the wait) — recovering and retrying`);
-      }
-    }
-    // Exhausted every attempt with the computation still in flight and no callback ever landing
-    // (neither success nor an abort result). Distinct from an abort: nothing came back at all,
-    // which points at the cluster not serving this MXE rather than a computation that ran.
-    console.error(
-      `    ${label}: NO CALLBACK after ${SCORE_ATTEMPTS} attempts — the computation was queued and `
-      + `accepted but never returned any result (success or failure). Points at the Arcium cluster `
-      + `not serving this MXE, not at this round. The next run retries.`);
-    return { kind: "no-callback", attempts: SCORE_ATTEMPTS };
-  }
-
-  // ======================================================================================
-  // BRACKET REVEAL ORCHESTRATION
-  // Port of the frontend's src/program/reveal.ts — the same sequence the Operator Panel and
-  // scripts/live-reveal-round.mjs run. Every step is idempotent against the chain state it
-  // reads first, so an interrupted cycle resumes rather than restarting.
-  // ======================================================================================
 
   /** `tx` with an explicit compute-unit ceiling prepended. Does not mutate the input. */
   function withComputeUnitLimit(tx: anchor.web3.Transaction, units: number): anchor.web3.Transaction {
@@ -1302,8 +1095,12 @@ async function openRoundPotAccounts(nextRoundId: number) {
   /** True once the computation's callback has written a usable result. */
   const resultReady = (res: any): boolean => !!res && res.ready && res.errorCode === 0;
 
+  /** Each result PDA decoded, or null when it holds no result yet — including when an outsider
+   *  has planted a SOL-only account there (see fetchProgramAccounts). Null means "not queued",
+   *  so the shard is queued and the program's init_if_needed absorbs the planted lamports. */
   const fetchResults = async (pdas: PK[]): Promise<any[]> =>
-    pdas.length === 0 ? [] : await program.account.revealTop3V3Result.fetchMultiple(pdas);
+    fetchProgramAccounts(conn, pdas, program.programId,
+      (data) => program.coder.accounts.decode("revealTop3V3Result", data), "reveal results");
 
   /** Load a round's Tier1State. "stale" = the account exists but no longer decodes (a layout
    *  change), recoverable only by closing and re-pinning it. */
@@ -1311,8 +1108,17 @@ async function openRoundPotAccounts(nextRoundId: number) {
     try {
       return await program.account.tier1State.fetchNullable(tier1);
     } catch {
-      const info = await conn.getAccountInfo(tier1);
-      return info ? ("stale" as const) : null;
+      // Re-read raw and decide from the bytes, not from a truthy AccountInfo: a SOL-only account
+      // planted at the PDA is no Tier1State (absent, so init_tier1_bracket absorbs it), and a
+      // transient read error must not pass for a layout change either. Only a real, owned
+      // Tier1State that fails to decode is "stale" (and gets closed and re-pinned).
+      const info = await rpcRead("tier1 state", () => conn.getAccountInfo(tier1, "confirmed"));
+      if (!accountOwnedWithData(info, program.programId)) return null;
+      try {
+        return program.coder.accounts.decode("tier1State", info.data);
+      } catch {
+        return "stale" as const;
+      }
     }
   }
 
@@ -1578,7 +1384,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
    * Run the whole bracket reveal for `round`, from wherever it stands to scoring_revealed.
    * Returns the plan actually used, for the cycle log.
    */
-  async function runBracketReveal(round: PK, entryKeys: PK[]): Promise<BracketPlan> {
+  async function runBracketReveal(round: PK, entryKeys: PK[], roundId: number): Promise<BracketPlan> {
     const plan = planBracket(entryKeys);
     console.log(`  plan: ${describePlan(plan)}`);
 
@@ -1633,7 +1439,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
           + `BracketState.final_queued is set, so re-running will wait rather than re-queue. `
           + `Check the Arcium cluster is serving this MXE first; recovery then needs `
           + `final_queued cleared by re-pinning the bracket, which discards every shard result `
-          + `for round ${current} and re-runs that tier.`);
+          + `for round ${roundId} and re-runs that tier.`);
       }
     }
 
@@ -1644,6 +1450,347 @@ async function openRoundPotAccounts(nextRoundId: number) {
     await sendTxHttp(tx, "applyBracketResult");
     return plan;
   }
+
+  return { runBracketReveal, runTier, fetchResults, awaitResults, partitionMatches };
+}
+
+async function main(): Promise<void> {
+  // --- secrets + RPC wiring -------------------------------------------------
+  const signer = loadKeypairFromEnv("OPERATOR_PRIVATE_KEY", OPERATOR_KEYPAIR_PATH);
+  // No treasury key any more: the SOL prize is gone, so this script spends only the
+  // operator's own lamports (transaction fees, and the rent it pays for settlements and ATAs).
+  const preflightOnly = process.env.PREFLIGHT_ONLY === "1";
+
+  const heliusUrl = process.env.HELIUS_RPC_URL;
+  if (!heliusUrl || heliusUrl.trim() === "") {
+    fatal("HELIUS_RPC_URL is not set. It is required for transaction send/confirm.");
+  }
+  if (!process.env.ARCIUM_CLUSTER_OFFSET) process.env.ARCIUM_CLUSTER_OFFSET = "456";
+
+  // Helius for transactions + single-account reads; public devnet RPC for getProgramAccounts
+  // (Helius free tier blocks it) — the exact split proven in scripts/operator.ts.
+  const conn = new Connection(heliusUrl!, "confirmed");
+  const publicConn = new Connection("https://api.devnet.solana.com", "confirmed");
+
+  const wallet = new anchor.Wallet(signer);
+  const provider = new anchor.AnchorProvider(conn, wallet, { commitment: "confirmed" });
+  anchor.setProvider(provider);
+
+  const idl = JSON.parse(
+    fs.readFileSync(new URL("../target/idl/secret_garden.json", import.meta.url)).toString(),
+  );
+  const program = new anchor.Program<SecretGarden>(idl as SecretGarden, provider);
+
+  const arciumEnv = arcium.getArciumEnv();
+  const clusterAccount = arcium.getClusterAccAddress(arciumEnv.arciumClusterOffset);
+  const mxeAccount = arcium.getMXEAccAddress(program.programId);
+
+  const configPda = PublicKey.findProgramAddressSync(
+    [Buffer.from("config")], program.programId)[0];
+  const roundPda = (id: number) => PublicKey.findProgramAddressSync(
+    [Buffer.from("round"), u64le(id)], program.programId)[0];
+  /** The one account that says what happened to a round's $SGD pot. */
+  const settlementPda = (id: number) => PublicKey.findProgramAddressSync(
+    [Buffer.from("round_settlement"), u64le(id)], program.programId)[0];
+  /** 0 = none, 1 = refund in progress, 2 = paid to winners, 3 = refunded to entrants. Read raw
+   *  and judged by `settlementStateOf`, the same test every other settlement check uses. */
+  const settlementState = async (id: number): Promise<number> => settlementStateOf(
+    await rpcRead(`settlement ${id}`, () => conn.getAccountInfo(settlementPda(id), "confirmed")),
+    program.programId);
+  /** Create any winner $SGD account that does not exist yet; distribute_pot requires them. */
+  async function ensureAtas(mint: PK, owners: PK[]): Promise<void> {
+    const targets = owners.map((o) => ({ owner: o, ata: ataFor(o, mint) }));
+    await ensureTokenAccounts(conn, targets, async ({ owner: o, ata }) => {
+      const ix = new anchor.web3.TransactionInstruction({
+        programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+        keys: [
+          { pubkey: signer.publicKey, isSigner: true, isWritable: true },
+          { pubkey: ata, isSigner: false, isWritable: true },
+          { pubkey: o, isSigner: false, isWritable: false },
+          { pubkey: mint, isSigner: false, isWritable: false },
+          { pubkey: anchor.web3.SystemProgram.programId, isSigner: false, isWritable: false },
+          { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        ],
+        data: Buffer.from([]),
+      });
+      await sendTxHttp(new anchor.web3.Transaction().add(ix), `createAta(${o.toBase58().slice(0, 8)})`);
+    });
+  }
+
+// --- $SGD pot vault -------------------------------------------------------------------------
+// open_round now creates the round's pot vault itself, funded by the operator, so the round's
+// first entrant is not billed rent nobody else pays. `sgd_mint` is the one account Anchor
+// cannot derive (it has neither seeds nor a fixed address in the IDL), so it must be passed
+// explicitly — accountsPartial alone would fail at runtime.
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const potAuthorityPda = (roundId: number): PK =>
+  PublicKey.findProgramAddressSync([Buffer.from("pot"), u64le(roundId)], program.programId)[0];
+const ataFor = (owner: PK, mint: PK): PK =>
+  PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+  )[0];
+/** The five accounts open_round needs to create the next round's pot vault. */
+async function openRoundPotAccounts(nextRoundId: number) {
+  const cfg: any = await program.account.gameConfig.fetch(configPda);
+  const sgdMint: PK = cfg.sgdMint;
+  if (sgdMint.equals(PublicKey.default)) {
+    throw new Error(
+      "GameConfig.sgd_mint is unset — run `set_sgd_mint` before opening a round, or " +
+      "open_round will fail with SgdMintNotSet.",
+    );
+  }
+  const potAuthority = potAuthorityPda(nextRoundId);
+  return {
+    potAuthority,
+    potVault: ataFor(potAuthority, sgdMint),
+    sgdMint,
+    tokenProgram: TOKEN_PROGRAM_ID,
+    associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+  };
+}
+  const entryPda = (round: PK, player: PK) => PublicKey.findProgramAddressSync(
+    [Buffer.from("entry"), round.toBuffer(), player.toBuffer()], program.programId)[0];
+
+
+  const freshOffset = () => new BN(randomBytes(8), "hex");
+  const compDefAccOf = (circuit: string) => arcium.getCompDefAccAddress(
+    program.programId, Buffer.from(arcium.getCompDefAccOffset(circuit)).readUInt32LE());
+  const queueAccsFor = (circuit: string, offset: BN) => ({
+    computationAccount: arcium.getComputationAccAddress(arciumEnv.arciumClusterOffset, offset),
+    clusterAccount,
+    mxeAccount,
+    mempoolAccount: arcium.getMempoolAccAddress(arciumEnv.arciumClusterOffset),
+    executingPool: arcium.getExecutingPoolAccAddress(arciumEnv.arciumClusterOffset),
+    compDefAccount: compDefAccOf(circuit),
+  });
+
+  // ---- HTTP-only send + confirm (no WebSocket on this Helius endpoint) ----
+  // `payer` is the fee-payer + sole signer for the tx; defaults to the operator `signer` for
+  // program instructions; always the operator now that no payout comes from a second wallet.
+  async function sendTxHttp(
+    tx: anchor.web3.Transaction,
+    label: string,
+    payer: anchor.web3.Keypair = signer,
+    // Co-signers beyond the fee payer. Unused now that there is no SOL prize; kept because
+    // the parameter is harmless and a future instruction may need it.
+    extraSigners: anchor.web3.Keypair[] = [],
+  ): Promise<string> {
+    for (let attempt = 1; attempt <= 6; attempt++) {
+      const bh = await conn.getLatestBlockhash({ commitment: "confirmed" });
+      tx.recentBlockhash = bh.blockhash;
+      tx.lastValidBlockHeight = bh.lastValidBlockHeight;
+      tx.feePayer = payer.publicKey;
+      tx.signatures = [];
+      tx.sign(payer, ...extraSigners);
+      let sig: string;
+      try {
+        sig = await conn.sendRawTransaction(tx.serialize(), {
+          skipPreflight: true, maxRetries: 0, preflightCommitment: "confirmed",
+        });
+      } catch (e) {
+        console.log(`    ${label} send err (attempt ${attempt}): ${(e as Error).message.slice(0, 90)}`);
+        await sleep(Math.min(6000, 500 * 2 ** (attempt - 1)));
+        continue;
+      }
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        const st = (await conn.getSignatureStatuses([sig])).value[0];
+        if (st) {
+          if (st.err) throw new Error(`${label} tx FAILED: ${JSON.stringify(st.err)} (sig ${sig})`);
+          if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") return sig;
+        }
+        const h = await conn.getBlockHeight({ commitment: "confirmed" });
+        if (h > bh.lastValidBlockHeight) break;
+        await sleep(800);
+      }
+      console.log(`    ${label} not confirmed (attempt ${attempt}); retrying`);
+    }
+    throw new Error(`${label} failed to confirm after retries`);
+  }
+
+  // Enumerate every CompetitionEntry of a round via the public RPC (Helius free tier blocks
+  // getProgramAccounts). The first field `round: pubkey` sits at offset 8 (after the
+  // 8-byte discriminator). Decoded with the program's own coder.
+  //
+  // THE DISCRIMINATOR FILTER IS LOAD-BEARING. `round` at offset 8 is NOT unique to
+  // CompetitionEntry: BracketState, Tier1State and RevealTop3V3Result all store the round
+  // pubkey in the same position, so a round that has been through a bracket reveal matches
+  // extra accounts — 103 instead of 91 for devnet round 50 — and decoding one of those as a
+  // CompetitionEntry throws "Invalid account discriminator", aborting the cycle mid-flight.
+  // Filtering server-side on the 8-byte discriminator returns only genuine entries; the
+  // defensive skip below is a second layer in case a future account type is added with the
+  // same discriminator prefix (it cannot be, but the cycle should degrade rather than die).
+  const entryDiscriminator = program.coder.accounts.memcmp("competitionEntry") as {
+    offset: number; bytes: string;
+  };
+  async function entriesForRound(round: PK): Promise<any[]> {
+    const accounts = await fetchRoundEntryAccounts(publicConn, program.programId, entryDiscriminator, round);
+    const out: any[] = [];
+    for (const a of accounts) {
+      try {
+        out.push({
+          pubkey: a.pubkey as PK,
+          ...(program.coder.accounts.decode("competitionEntry", a.account.data) as any),
+        });
+      } catch {
+        console.log(`  (skipping ${a.pubkey.toBase58()} — matched the round filter but is not a CompetitionEntry)`);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Resolve a round's top1/top2/top3 to PLAYER WALLETS.
+   *
+   * round.topN holds the winning ENTRY pubkey, never the player's — printing them raw is what
+   * made the round-50 summary list three addresses that looked like unknown winners but were
+   * actually the correct winners' entry PDAs. Every path that reports winners goes through
+   * here, so the healthy path and the skip paths can never disagree again. Unfilled ranks
+   * (fewer than three entrants) are omitted.
+   */
+  async function resolveWinnerWallets(
+    round: PK, r: any,
+  ): Promise<{ rank: number; wallet: PK; entry: PK }[]> {
+    const entries = await entriesForRound(round);
+    const byEntry = new Map<string, PK>(entries.map((e) => [(e.pubkey as PK).toBase58(), e.player as PK]));
+    // The ENTRY pubkey travels with the wallet now: both `pay_sol_prizes` and
+    // `distribute_pot` take [entry, destination] pairs as remaining accounts, because
+    // top1/2/3 name entries and only the entry knows which wallet placed it.
+    const out: { rank: number; wallet: PK; entry: PK }[] = [];
+    [r.top1, r.top2, r.top3].forEach((entryPk: PK, idx: number) => {
+      if (entryPk.equals(PublicKey.default)) return; // unfilled rank
+      const player = byEntry.get(entryPk.toBase58());
+      if (player) out.push({ rank: idx + 1, wallet: player, entry: entryPk });
+      else console.log(`  ⚠ rank ${idx + 1}: entry ${entryPk.toBase58()} has no matching entry account`);
+    });
+    return out;
+  }
+
+  // ======================================================================================
+  // STUCK-COMPUTATION RECOVERY (scoring)
+  //
+  // `queue_score_entry` carries `constraint = !entry.score_queued @ ScoreAlreadyQueued`, so an
+  // MPC call that never comes back permanently blocks that entry — and with it the whole
+  // round, because every reveal path requires scored_count == participant_count. The only way
+  // out is `cancel_stuck_score`, which clears the flag once SCORE_TIMEOUT_SECONDS has elapsed.
+  //
+  // Before this, that was a MANUAL step: devnet round 53 wedged at 47/53 on 2026-08-11 when
+  // Arcium stopped serving our MXE mid-cycle, and every subsequent run aborted on the same
+  // entry with ScoreAlreadyQueued until an operator ran the cancel by hand. An unattended cron
+  // has nobody to do that, so it is done here.
+  // ======================================================================================
+
+  /**
+   * Clear a hung scoring computation so its entry can be re-queued.
+   *
+   * Returns true if a cancel was actually sent. No-ops when the entry is already scored (a late
+   * callback landed while we waited) or was never queued. Waits out the remainder of the
+   * on-chain cancel window when needed, re-reading first so a late callback still wins.
+   */
+  async function recoverStuckScore(entryPk: PK, label: string): Promise<boolean> {
+    for (;;) {
+      const e: any = await program.account.competitionEntry.fetch(entryPk);
+      const action = stuckScoreAction(
+        { scored: e.scored, scoreQueued: e.scoreQueued, queuedAt: Number(e.queuedAt) },
+        Math.floor(Date.now() / 1000),
+      );
+      if (action.kind === "scored") {
+        console.log(`    ${label}: callback landed late — already scored, no cancel needed`);
+        return false;
+      }
+      if (action.kind === "not-queued") return false;
+      if (action.kind === "cancel") break;
+      // Re-read after sleeping, so a callback landing during the wait still wins.
+      console.log(`    ${label}: in flight; waiting ${action.seconds}s for the on-chain cancel window`);
+      await sleep(action.seconds * 1000);
+    }
+    console.log(`    ${label}: clearing the stuck computation (cancel_stuck_score)`);
+    const tx = await program.methods.cancelStuckScore()
+      .accountsPartial({ caller: signer.publicKey, entry: entryPk }).transaction();
+    await sendTxHttp(tx, `cancelStuckScore`);
+    return true;
+  }
+
+  /**
+   * Score one entry, recovering from a hung computation and retrying up to SCORE_ATTEMPTS.
+   *
+   * The first recovery call also cleans up after a PREVIOUS run: an entry left flagged
+   * in-flight by an aborted cycle is cleared here instead of throwing ScoreAlreadyQueued.
+   */
+  async function scoreEntryWithRecovery(entryPk: PK, flowerRecord: PK, label: string): Promise<ScoreOutcome> {
+    for (let attempt = 1; attempt <= SCORE_ATTEMPTS; attempt++) {
+      // Clears a leftover flag from an earlier attempt OR an earlier run.
+      await recoverStuckScore(entryPk, label);
+      if ((await program.account.competitionEntry.fetch(entryPk)).scored) return { kind: "scored" };
+
+      const offset = freshOffset();
+      const tx = await program.methods.queueScoreEntry(offset)
+        .accountsPartial({
+          authority: signer.publicKey,
+          round: roundPda(current),
+          entry: entryPk,
+          flowerRecord,
+          ...queueAccsFor("score_entry_v2", offset),
+        }).transaction();
+      await sendTxHttp(tx, `queueScoreEntry ${label}`);
+
+      // A timeout here is INFORMATION, not a fatal error — the poll below handles it. Without
+      // this catch, one hung computation aborted the entire cycle.
+      try {
+        await arcium.awaitComputationFinalization(
+          provider, offset, program.programId, "confirmed", SCORE_FINALIZE_TIMEOUT_MS);
+      } catch (e) {
+        console.log(`    ${label}: computation did not finalize on attempt ${attempt}/${SCORE_ATTEMPTS}`
+          + ` (${(e as Error).message.slice(0, 70)})`);
+      }
+
+      // Poll regardless of how the wait ended: the callback may land between the two.
+      // Detect the ACTUAL outcome (not just success) via classifyScoreState — an ABORT callback
+      // clears score_queued and sets score_error_code but leaves scored=false, so watching only
+      // `scored` (the old bug) reported every abort as "no callback".
+      for (let k = 0; k < 120; k++) {
+        const e: any = await program.account.competitionEntry.fetch(entryPk);
+        const state = classifyScoreState({
+          scored: e.scored, scoreQueued: e.scoreQueued, scoreErrorCode: e.scoreErrorCode,
+        });
+        if (state === "scored") {
+          console.log(`    ✓ scored`);
+          return { kind: "scored" };
+        }
+        if (state === "aborted") {
+          // The callback DID land; the MPC ran and returned a failure. This is deterministic on
+          // the current cluster, so retrying inside this invocation just re-aborts and burns SOL
+          // — skip the remaining attempts and let the next scheduled run retry.
+          console.error(
+            `    ${label}: callback landed but the computation ABORTED (error code ${e.scoreErrorCode}) `
+            + `on attempt ${attempt}/${SCORE_ATTEMPTS}. This is a RETURNED FAILURE, not a missing `
+            + `callback — the MPC executed and failed. Skipping this entry; the next run retries.`);
+          return { kind: "aborted", errorCode: e.scoreErrorCode as number, attempt };
+        }
+        await sleep(1000);
+      }
+      if (attempt < SCORE_ATTEMPTS) {
+        console.log(`    ${label}: no callback landed (still in flight after the wait) — recovering and retrying`);
+      }
+    }
+    // Exhausted every attempt with the computation still in flight and no callback ever landing
+    // (neither success nor an abort result). Distinct from an abort: nothing came back at all,
+    // which points at the cluster not serving this MXE rather than a computation that ran.
+    console.error(
+      `    ${label}: NO CALLBACK after ${SCORE_ATTEMPTS} attempts — the computation was queued and `
+      + `accepted but never returned any result (success or failure). Points at the Arcium cluster `
+      + `not serving this MXE, not at this round. The next run retries.`);
+    return { kind: "no-callback", attempts: SCORE_ATTEMPTS };
+  }
+
+  // The bracket reveal is built at module level (createBracketRevealer) so operator.ts's manual
+  // reveal runs exactly this code rather than a drifting copy.
+  const revealer = createBracketRevealer({
+    program, conn, authority: signer.publicKey, configPda,
+    sendTx: (tx, label) => sendTxHttp(tx, label), freshOffset, queueAccsFor,
+  });
 
   // Player-facing name for a winner whose FlowerRecord no longer exists — see operator.ts.
   const CLOSED_FLOWER_NAME = "Retired Bloom";
@@ -2059,7 +2206,9 @@ async function openRoundPotAccounts(nextRoundId: number) {
       // only warns, because the SDK's account shape has moved between versions and refusing to
       // run production over a renamed field would be a worse failure than the one prevented.
       const info = await rpcRead(`comp-def ${circuit}`, () => conn.getAccountInfo(pda, "confirmed"));
-      if (!info) {
+      // Owned by Arcium with data, or it was never registered: a SOL-only account planted at the
+      // comp-def PDA must not pass the existence check and let the cycle queue into nothing.
+      if (!accountOwnedWithData(info, arciumProgram.programId)) {
         const detail =
           `circuit "${circuit}" is known to the program but its comp def does not exist at\n` +
           `  ${pda.toBase58()} — it was never registered. Run the uploader for this circuit.`;
@@ -2369,7 +2518,7 @@ async function openRoundPotAccounts(nextRoundId: number) {
     }
 
     console.log(`\n[reveal] running the bracket for round ${current} (${scored.length} entries)`);
-    await runBracketReveal(round, scored.map((e) => e.pubkey as PK));
+    await revealer.runBracketReveal(round, scored.map((e) => e.pubkey as PK), current);
 
     const rr: any = await program.account.competitionRound.fetch(round);
     if (!rr.scoringRevealed) {
@@ -2532,6 +2681,8 @@ const isEntryPoint =
   !!process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 
 if (isEntryPoint) {
+  // First, so every exit below — including standing down on a held lock — cleans up.
+  registerExitCleanup();
   // Single-instance gate, BEFORE any chain reads or key material is written: a run that is not
   // going to proceed should touch nothing at all. Exit 0, not 1 — standing down because another
   // run holds the lock is correct behaviour, not a failure, and Railway should not flag it.
@@ -2547,8 +2698,9 @@ if (isEntryPoint) {
   }
 }
 
-// Exported for tests ONLY — the pure, chain-free partition planner. Nothing here touches the
-// network, a keypair or the program.
+// Exported for tests, and for operator.ts (createBracketRevealer, fetchRoundEntryAccounts), which
+// runs this file's reveal as its manual fallback. Most of these are pure; the readers and the
+// revealer touch the network only through a connection or program their caller passes in.
 export {
   compareEntryKeys, sortEntriesByteWise, planShardSizes, expectedTier1Winners,
   planBracket, describePlan, padNumbers, padKeys, BracketPlanError,
@@ -2556,6 +2708,8 @@ export {
   SINGLE_TIER_CAPACITY, TWO_TIER_CAPACITY, FINAL_SHARD_INDEX,
   rpcRead, rpcBackoffMs, RPC_ATTEMPTS,
   getMultipleAccountsInfoChunked, GET_MULTIPLE_ACCOUNTS_LIMIT, fetchRoundEntryAccounts,
+  accountOwnedWithData, fetchProgramAccounts, ensureTokenAccounts, SPL_TOKEN_PROGRAM_ID,
+  createBracketRevealer,
   settlementExists, settlementStateOf, owingRounds, classifyPotVaults, warnFinalizedOutsideCycle,
   SETTLEMENT_NONE, SETTLEMENT_POT_PAID, SETTLEMENT_POT_REFUNDED,
   reclaimThenOpen, reclaimFailureMessage, runNonBlocking, rpcHost,

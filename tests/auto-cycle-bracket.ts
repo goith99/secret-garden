@@ -15,7 +15,9 @@
  */
 import { assert } from "chai";
 import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 import * as anchor from "@anchor-lang/core";
+import BN from "bn.js";
 import {
   compareEntryKeys,
   sortEntriesByteWise,
@@ -48,6 +50,11 @@ import {
   reclaimThenOpen,
   reclaimFailureMessage,
   runNonBlocking,
+  accountOwnedWithData,
+  fetchProgramAccounts,
+  ensureTokenAccounts,
+  SPL_TOKEN_PROGRAM_ID,
+  createBracketRevealer,
   rpcHost,
   stuckScoreAction,
   SCORE_TIMEOUT_SECONDS,
@@ -1005,6 +1012,438 @@ describe("auto-cycle hardening (post round 101)", () => {
     });
     it("an unparseable value never echoes itself", () => {
       assert.equal(rpcHost("not a url SECRET"), "(unparseable URL)");
+    });
+  });
+});
+
+/**
+ * Audit 2026-10-01, M1: a SOL-only account planted at a reveal-result PDA made Anchor's
+ * fetchMultiple throw "Invalid account discriminator" before anything was queued, so the cycle
+ * died at REVEAL on every run. Same class at the other addresses an outsider can fund: pot-vault
+ * and player-ATA existence checks. Plus the manual fallback (operator.ts) now runs this same
+ * revealer, so its finalist order is the one tested here.
+ */
+describe("outsider-fundable addresses (audit M1) and the shared bracket revealer", () => {
+  const idl = JSON.parse(fs.readFileSync(new URL("../target/idl/secret_garden.json", import.meta.url), "utf8"));
+  const SYSTEM = anchor.web3.SystemProgram.programId;
+  const acct = (owner: PK, data: Buffer, lamports = 1_000_000): anchor.web3.AccountInfo<Buffer> =>
+    ({ owner, data, lamports, executable: false, rentEpoch: 0 });
+  /** What one System transfer of the rent-exempt minimum leaves at any address. */
+  const solOnly = () => acct(SYSTEM, Buffer.alloc(0), 650_240);
+
+  /** An in-memory chain: accounts by address, served through the Connection methods the
+   *  revealer and Anchor's account namespace call. */
+  function fakeChain() {
+    const accounts = new Map<string, anchor.web3.AccountInfo<Buffer>>();
+    const get = (k: PK) => accounts.get(k.toBase58()) ?? null;
+    const conn = {
+      async getAccountInfo(k: PK) { return get(k); },
+      async getAccountInfoAndContext(k: PK) { return { context: { slot: 1 }, value: get(k) }; },
+      async getMultipleAccountsInfo(ks: PK[]) { return ks.map(get); },
+      async getMultipleAccountsInfoAndContext(ks: PK[]) { return { context: { slot: 1 }, value: ks.map(get) }; },
+    };
+    return { accounts, get, set: (k: PK, a: anchor.web3.AccountInfo<Buffer>) => accounts.set(k.toBase58(), a),
+      conn: conn as unknown as anchor.web3.Connection };
+  }
+
+  describe("accountOwnedWithData / fetchProgramAccounts", () => {
+    const PROG = Keypair.generate().publicKey;
+    it("only an account of the given owner with data counts", () => {
+      assert.isFalse(accountOwnedWithData(null, PROG));
+      assert.isFalse(accountOwnedWithData(solOnly(), PROG));
+      assert.isFalse(accountOwnedWithData(acct(PROG, Buffer.alloc(0)), PROG));
+      assert.isFalse(accountOwnedWithData(acct(SYSTEM, Buffer.alloc(8)), PROG));
+      assert.isTrue(accountOwnedWithData(acct(PROG, Buffer.alloc(8)), PROG));
+    });
+
+    it("decodes only owned accounts with data; absent, SOL-only and foreign come back null, in order", async () => {
+      const ch = fakeChain();
+      const [a, b, c, d] = randomKeys(4);
+      ch.set(a, solOnly());
+      ch.set(b, acct(PROG, Buffer.from("real")));
+      ch.set(d, acct(SYSTEM, Buffer.from("not ours")));
+      const out = await fetchProgramAccounts(ch.conn, [a, b, c, d], PROG, (data) => data.toString(), "t");
+      assert.deepEqual(out, [null, "real", null, null]);
+    });
+
+    it("an owned account that does not decode is a layout problem, and says so", async () => {
+      const ch = fakeChain();
+      const [a] = randomKeys(1);
+      ch.set(a, acct(PROG, Buffer.from("x")));
+      try {
+        await fetchProgramAccounts(ch.conn, [a], PROG, () => { throw new Error("bad layout"); }, "reveal results");
+        assert.fail("should have thrown");
+      } catch (e) {
+        assert.match((e as Error).message, /^reveal results: .+ does not decode \(bad layout\)/);
+      }
+    });
+  });
+
+  describe("ensureTokenAccounts — the ATA existence check behind every payout", () => {
+    it("creates over a SOL-only address and a missing one, skips a real token account", async () => {
+      const ch = fakeChain();
+      const [solAta, realAta, missingAta] = randomKeys(3);
+      ch.set(solAta, solOnly());
+      ch.set(realAta, acct(SPL_TOKEN_PROGRAM_ID, Buffer.alloc(165), 2_039_280));
+      const created: PK[] = [];
+      await ensureTokenAccounts(ch.conn, [solAta, realAta, missingAta].map((ata) => ({ ata })),
+        async (t) => { created.push(t.ata); });
+      // Before: `if (await conn.getAccountInfo(ata)) continue;` skipped the SOL-only one, and the
+      // payout that needed it then failed for every co-winner.
+      assert.deepEqual(created.map(String), [solAta, missingAta].map(String));
+    });
+  });
+
+  describe("classifyPotVaults — a SOL-only account at a closed vault's address is no vault", () => {
+    it("is neither closed (a fee burnt every run) nor counted stranded", () => {
+      const PROG = Keypair.generate().publicKey;
+      const round = acct(PROG, (() => { const d = Buffer.alloc(174); d[16] = 2; return d; })());
+      const paid = acct(PROG, (() => { const d = Buffer.alloc(102); d[16] = 2; return d; })());
+      const out = classifyPotVaults([101, 102], [round, round], [paid, paid],
+        [solOnly(), acct(SPL_TOKEN_PROGRAM_ID, Buffer.alloc(165))], PROG);
+      assert.deepEqual(out, { closable: [102], stranded: [] });
+    });
+  });
+
+  describe("createBracketRevealer — the reveal auto-cycle and operator.ts both run", () => {
+    const D = PublicKey.default;
+    /** A key whose first byte is `first`: lets the test control byte order exactly. */
+    const keyWithFirstByte = (first: number, fill = 0x11) => {
+      const b = new Uint8Array(32).fill(fill);
+      b[0] = first;
+      return new PublicKey(b);
+    };
+    /** `n` distinct keys that are the same on every run, so every order below is deterministic. */
+    const fixedKeys = (tag: string, n: number) => Array.from({ length: n }, (_, i) =>
+      new PublicKey(createHash("sha256").update(`${tag}:${i}`).digest()));
+    const camel = (n: string) => n.replace(/_([a-z])/g, (_m, c) => c.toUpperCase());
+    const arg = (data: any, name: string) => data[name] ?? data[camel(name)];
+    const byBytes = (a: PK, b: PK) => Buffer.compare(a.toBuffer(), b.toBuffer());
+    /** The fake MPC's ranking of every run: its 3rd, 1st and 2nd entries, deliberately NOT the
+     *  run's byte order, so finalists are collected out of order and the final reveal has to
+     *  re-sort them (a no-op sort would otherwise pass). */
+    const RANKING = [2, 0, 1];
+
+    /**
+     * The production program, applied to the fake chain: just enough of every bracket
+     * instruction, each callback landing at once, with the program's account-run checks
+     * enforced — n entries per queue and per shard/tier-1 collect, none per semifinal collect
+     * (lib.rs:1185-1188, 1352), strict byte ascent inside the pinned bounds, finalist and
+     * semifinal-slice membership — so a run the program would reject throws here, as the
+     * transaction would, instead of passing silently.
+     */
+    async function harness(keys: PK[]) {
+      const ch = fakeChain();
+      const program = new anchor.Program(idl, new anchor.AnchorProvider(
+        ch.conn, new anchor.Wallet(Keypair.generate()), {})) as anchor.Program<any>;
+      const P = program.programId;
+      const accIndex = new Map<string, Map<string, number>>(idl.instructions.map((ix: any) =>
+        [camel(ix.name), new Map<string, number>(ix.accounts.map((a: any, i: number) => [a.name, i]))]));
+      const enc = (name: string, obj: any) => program.coder.accounts.encode(name, obj);
+      const dec = (name: string, k: PK): any => program.coder.accounts.decode(name, ch.get(k)!.data);
+      const put = async (k: PK, name: string, obj: any) => ch.set(k, acct(P, await enc(name, obj)));
+      const sent: { label: string; name: string; remaining: PK[] }[] = [];
+
+      const round = Keypair.generate().publicKey;
+      await put(round, "competitionRound", {
+        roundId: new BN(104), status: 1, startTime: new BN(0), endTime: new BN(0),
+        maxParticipants: 0, participantCount: keys.length, authority: D, bump: 255,
+        targetTraits: [0, 0, 0, 0], targetTraitCount: 0, top1: D, top2: D, top3: D,
+        scoringRevealed: false, scoredCount: keys.length,
+      });
+      const isEntry = new Set(keys.map(String));
+
+      const fail = (label: string, why: string): never => { throw new Error(`${label}: ${why}`); };
+      const exactly = (remaining: PK[], n: number, label: string) => {
+        if (remaining.length !== n) fail(label, `WrongEntryCount (${remaining.length} accounts, want ${n})`);
+      };
+      const ascending = (run: PK[], label: string) => run.forEach((k, i) => {
+        if (!isEntry.has(k.toBase58())) fail(label, `${k.toBase58()} is not an entry of this round`);
+        if (i > 0 && byBytes(run[i - 1], k) >= 0) fail(label, `ShardEntriesOutOfRange (entry ${i} does not ascend)`);
+      });
+      /** queue_shard_reveal / collect_shard_winners (and the tier-1 pair) on shard k. */
+      const inShard = (run: PK[], bounds: PK[], count: number, k: number, label: string) => {
+        ascending(run, label);
+        if (!run[0].equals(bounds[k])) fail(label, `ShardEntriesOutOfRange (not at shard_bounds[${k}])`);
+        if (k + 1 < count && byBytes(run[run.length - 1], bounds[k + 1]) >= 0) {
+          fail(label, `ShardEntriesOutOfRange (past shard_bounds[${k + 1}])`);
+        }
+      };
+
+      // Tier1State is zero-copy (bytemuck) and 2,258 bytes, past the 1,000-byte buffer Anchor's
+      // coder encodes into, so it is written by hand: every field is u8-aligned, so no padding.
+      const tier1Disc = Buffer.from(idl.accounts.find((a: any) => a.name === "Tier1State").discriminator);
+      type T1 = { bounds: PK[]; winners: PK[]; sizes: number[]; done: number[]; count: number; promoted: number; gen: number };
+      const writeTier1 = (k: PK, t: T1) => {
+        const b = Buffer.alloc(8 + 2250);
+        tier1Disc.copy(b, 0);
+        round.toBuffer().copy(b, 8);
+        for (let i = 0; i < 17; i++) (t.bounds[i] ?? D).toBuffer().copy(b, 8 + 32 + 32 * i);
+        for (let i = 0; i < 51; i++) (t.winners[i] ?? D).toBuffer().copy(b, 8 + 576 + 32 * i);
+        for (let i = 0; i < 17; i++) { b[8 + 2208 + i] = t.sizes[i] ?? 0; b[8 + 2225 + i] = t.done[i] ?? 0; }
+        b[8 + 2242] = t.count; b[8 + 2243] = t.winners.length; b[8 + 2244] = t.promoted; b[8 + 2245] = 255;
+        b.writeUInt32LE(t.gen, 8 + 2246);
+        ch.set(k, acct(P, b));
+      };
+      const readTier1 = (k: PK): T1 => {
+        const t = dec("tier1State", k);
+        return { bounds: t.shardBounds, winners: t.winners.slice(0, t.winnerCount), sizes: t.shardSizes,
+          done: t.shardDone, count: t.shardCount, promoted: t.promoted, gen: Buffer.from(t.generation).readUInt32LE(0) };
+      };
+      const newBracket = (bracket: PK, shardCount: number, shardSizes: number[], shardBounds: PK[]) => {
+        const prev = ch.get(bracket)?.data.length ? dec("bracketState", bracket) : null;
+        return put(bracket, "bracketState", {
+          round, shardCount, shardSizes, shardBounds, shardsCollected: 0,
+          finalists: Array(12).fill(D), finalistCount: 0, finalQueued: false,
+          applied: false, bump: 255, generation: (prev?.generation ?? 0) + 1,
+        });
+      };
+      /** The callback, landed: init_if_needed absorbs whatever sat at the result PDA (a planted
+       *  SOL-only account included), and the result is ready, ranked per RANKING. */
+      const land = (result: PK, generation: number, size: number) => {
+        const slots = RANKING.filter((s) => s < size).concat([0, 1, 2]).slice(0, 3);
+        return put(result, "revealTop3V3Result", {
+          round, ready: true, slot1: slots[0], slot2: slots[1], slot3: slots[2], score1: 70, score2: 70,
+          score3: 70, errorCode: 0, bump: 255, generation,
+        });
+      };
+      const slotsOf = (r: any, size: number): number[] => [r.slot1, r.slot2, r.slot3].slice(0, Math.min(3, size));
+      const appendFinalists = (b: any, won: PK[]) => {
+        const finalists = [...b.finalists];
+        won.forEach((w, i) => (finalists[b.finalistCount + i] = w));
+        return { finalists, finalistCount: b.finalistCount + won.length };
+      };
+
+      async function sendTx(tx: anchor.web3.Transaction, label: string): Promise<string> {
+        const ix = tx.instructions.find((i) => i.programId.equals(P))!;
+        const { name: raw, data } = (program.coder.instruction as any).decode(ix.data);
+        const name = camel(raw);
+        const idx = accIndex.get(name)!;
+        const keysOf = ix.keys.map((m) => m.pubkey);
+        const at = (account: string) => keysOf[idx.get(account)!];
+        const remaining = keysOf.slice(idx.size);
+        sent.push({ label, name, remaining });
+
+        if (name === "initBracket") {
+          const sizes: number[] = arg(data, "shard_sizes");
+          if (sizes.reduce((a, s) => a + s, 0) !== keys.length) fail(label, "InvalidShardLayout");
+          await newBracket(at("bracket"), arg(data, "shard_count"), sizes, arg(data, "shard_bounds"));
+        } else if (name === "queueShardReveal") {
+          const b = dec("bracketState", at("bracket"));
+          const k = arg(data, "shard_index");
+          if (k === 255) {
+            exactly(remaining, b.finalistCount, label);
+            ascending(remaining, label);
+            const recorded = b.finalists.slice(0, b.finalistCount).map(String);
+            remaining.forEach((e) => { if (!recorded.includes(e.toBase58())) fail(label, "FinalistMismatch"); });
+            await land(at("result"), b.generation, remaining.length);
+            await put(at("bracket"), "bracketState", { ...b, finalQueued: true });
+          } else {
+            exactly(remaining, b.shardSizes[k], label);
+            inShard(remaining, b.shardBounds, b.shardCount, k, label);
+            await land(at("result"), b.generation, remaining.length);
+          }
+        } else if (name === "collectShardWinners") {
+          const b = dec("bracketState", at("bracket"));
+          const r = dec("revealTop3V3Result", at("result"));
+          const k = arg(data, "shard_index");
+          if (r.generation !== b.generation) fail(label, "StaleRevealResult");
+          exactly(remaining, b.shardSizes[k], label);
+          inShard(remaining, b.shardBounds, b.shardCount, k, label);
+          const won = slotsOf(r, remaining.length).map((x) => remaining[x]);
+          await put(at("bracket"), "bracketState", {
+            ...b, ...appendFinalists(b, won), shardsCollected: b.shardsCollected | (1 << k),
+          });
+        } else if (name === "initTier1Bracket") {
+          writeTier1(at("tier1"), { bounds: arg(data, "shard_bounds"), winners: [], sizes: arg(data, "shard_sizes"),
+            done: [], count: arg(data, "shard_count"), promoted: 0, gen: 1 });
+        } else if (name === "queueTier1ShardReveal") {
+          const t = readTier1(at("tier1"));
+          const k = arg(data, "shard_index");
+          exactly(remaining, t.sizes[k], label);
+          inShard(remaining, t.bounds, t.count, k, label);
+          await land(at("result"), t.gen, remaining.length);
+        } else if (name === "collectTier1Winners") {
+          const t = readTier1(at("tier1"));
+          const r = dec("revealTop3V3Result", at("result"));
+          const k = arg(data, "shard_index");
+          if (r.generation !== t.gen) fail(label, "StaleRevealResult");
+          exactly(remaining, t.sizes[k], label);
+          inShard(remaining, t.bounds, t.count, k, label);
+          // insert_winner_sorted: Tier1State.winners stays in raw pubkey order.
+          const winners = [...t.winners];
+          for (const x of slotsOf(r, remaining.length)) {
+            if (winners.some((w) => w.equals(remaining[x]))) fail(label, "Tier1WinnerRejected");
+            winners.push(remaining[x]);
+            winners.sort(byBytes);
+          }
+          const done = [...t.done];
+          done[k] = 1;
+          writeTier1(at("tier1"), { ...t, winners, done });
+        } else if (name === "promoteTier1") {
+          const t = readTier1(at("tier1"));
+          if (t.promoted !== 0 || t.done.slice(0, t.count).some((x) => x !== 1)) fail(label, "Tier1NotReady");
+          const n = t.winners.length;
+          const count = Math.ceil(n / 13);
+          const sizes = [0, 0, 0, 0];
+          const bounds = [D, D, D, D];
+          let cursor = 0;
+          for (let i = 0; i < count; i++) {
+            sizes[i] = Math.floor(n / count) + (i < n % count ? 1 : 0);
+            bounds[i] = t.winners[cursor];
+            cursor += sizes[i];
+          }
+          await newBracket(at("bracket"), count, sizes, bounds);
+          writeTier1(at("tier1"), { ...t, promoted: 1 });
+        } else if (name === "queueSemifinalReveal") {
+          const t = readTier1(at("tier1"));
+          const b = dec("bracketState", at("bracket"));
+          const k = arg(data, "semi_index");
+          if (t.promoted !== 1) fail(label, "SemifinalNotReady");
+          exactly(remaining, b.shardSizes[k], label);
+          const start = b.shardSizes.slice(0, k).reduce((a: number, x: number) => a + x, 0);
+          remaining.forEach((e, i) => { if (!e.equals(t.winners[start + i])) fail(label, "SemifinalSliceMismatch"); });
+          await land(at("result"), b.generation, remaining.length);
+        } else if (name === "collectSemifinalWinners") {
+          const t = readTier1(at("tier1"));
+          const b = dec("bracketState", at("bracket"));
+          const r = dec("revealTop3V3Result", at("result"));
+          const k = arg(data, "semi_index");
+          if (r.generation !== b.generation) fail(label, "StaleRevealResult");
+          exactly(remaining, 0, label);
+          const start = b.shardSizes.slice(0, k).reduce((a: number, x: number) => a + x, 0);
+          const won = slotsOf(r, b.shardSizes[k]).map((x) => t.winners[start + x]);
+          await put(at("bracket"), "bracketState", {
+            ...b, ...appendFinalists(b, won), shardsCollected: b.shardsCollected | (1 << k),
+          });
+        } else if (name === "applyBracketResult") {
+          const b = dec("bracketState", at("bracket"));
+          const r = dec("revealTop3V3Result", at("result"));
+          if ((arg(data, "result_index") === 0) !== (b.shardCount === 1)) fail(label, "wrong result index for this bracket");
+          if (!r.ready || r.generation !== b.generation) fail(label, "StaleRevealResult");
+          await put(at("bracket"), "bracketState", { ...b, applied: true });
+          await put(round, "competitionRound", { ...dec("competitionRound", round), scoringRevealed: true });
+        } else {
+          fail(label, `${name} is not modelled by the fake chain`);
+        }
+        return `sig-${sent.length}`;
+      }
+
+      const revealer = createBracketRevealer({
+        program: program as any, conn: ch.conn, authority: Keypair.generate().publicKey,
+        configPda: Keypair.generate().publicKey, sendTx,
+        freshOffset: () => new BN(7),
+        queueAccsFor: () => ({
+          computationAccount: Keypair.generate().publicKey, clusterAccount: Keypair.generate().publicKey,
+          mxeAccount: Keypair.generate().publicKey, mempoolAccount: Keypair.generate().publicKey,
+          executingPool: Keypair.generate().publicKey, compDefAccount: Keypair.generate().publicKey,
+        }),
+      });
+      const pda = (...seeds: Buffer[]) => PublicKey.findProgramAddressSync(seeds, P)[0];
+      return {
+        ch, program, revealer, sent, round, dec,
+        bracketPda: pda(Buffer.from("bracket"), round.toBuffer()),
+        tier1Pda: pda(Buffer.from("tier1"), round.toBuffer()),
+        shardRes: (k: number) => pda(Buffer.from("shardres"), round.toBuffer(), Buffer.from([k])),
+        semiRes: (k: number) => pda(Buffer.from("semires"), round.toBuffer(), Buffer.from([k])),
+        revealed: () => dec("competitionRound", round).scoringRevealed as boolean,
+      };
+    }
+
+    // 14 entries -> two shards of 7. Each shard's top three are its first three entries (ranked
+    // per RANKING), so the six finalists are the keys below. Their byte order and base58 order
+    // disagree because of the 0x05 and 0x0c keys: those render as 43 base58 characters and sort
+    // late as text. The 0x00 key is NOT the trap — its base58 text begins with '1', the lowest
+    // base58 character, so it sorts first both ways; it is here because a leading zero byte is
+    // the case the old comments warned about.
+    const finalistsByBytes = [0x00, 0x05, 0x0c, 0x3a, 0x80, 0xf0].map((f) => keyWithFirstByte(f));
+    const entries = [
+      ...finalistsByBytes.slice(0, 3), ...[0x10, 0x11, 0x12, 0x13].map((f) => keyWithFirstByte(f)),
+      ...finalistsByBytes.slice(3), ...[0xf1, 0xf2, 0xf3, 0xf4].map((f) => keyWithFirstByte(f)),
+    ];
+
+    it("SOL-only accounts at both shard results, the final's and the bracket: the round still reveals", async () => {
+      const h = await harness(entries);
+      const planted = [h.shardRes(0), h.shardRes(1), h.shardRes(255), h.bracketPda];
+      planted.forEach((k) => h.ch.set(k, solOnly()));
+
+      // The bug, reproduced: Anchor's fetchMultiple decodes the planted account and throws.
+      try {
+        await (h.program.account as any).revealTop3V3Result.fetchMultiple([h.shardRes(0)]);
+        assert.fail("fetchMultiple should have thrown on the SOL-only account");
+      } catch (e) {
+        assert.match((e as Error).message, /discriminator/i);
+      }
+
+      const plan = await h.revealer.runBracketReveal(h.round, [...entries].reverse(), 104);
+      assert.equal(plan.shards.length, 2);
+      assert.deepEqual(h.sent.map((t) => t.label), [
+        "initBracket", "queueShardReveal[0]", "queueShardReveal[1]",
+        "collectShardWinners[0]", "collectShardWinners[1]",
+        "queueShardReveal[FINAL]", "applyBracketResult",
+      ]);
+      assert.isTrue(h.revealed(), "the round reveals");
+      // The planted lamports were absorbed by the (fake) init_if_needed, not left to block.
+      planted.forEach((k) => assert.isTrue(accountOwnedWithData(h.ch.get(k), h.program.programId)));
+    });
+
+    it("the final reveal's finalists go out in byte order, not collection order and not base58 text", async () => {
+      const h = await harness(entries);
+      await h.revealer.runBracketReveal(h.round, entries, 104);
+      const collected = h.dec("bracketState", h.bracketPda).finalists.slice(0, 6).map(String);
+      const final = h.sent.find((t) => t.label === "queueShardReveal[FINAL]")!;
+      const got = final.remaining.map(String);
+      assert.deepEqual(got, finalistsByBytes.map(String), "finalists must be in raw byte order");
+      assert.notDeepEqual(collected, got, "collection order differs, so the final really re-sorts");
+      const byBase58 = [...finalistsByBytes].sort((a, b) => (a.toBase58() < b.toBase58() ? -1 : 1)).map(String);
+      assert.notDeepEqual(got, byBase58, "this set must actually separate byte order from base58 order");
+      assert.equal(final.remaining[0].toBytes()[0], 0x00, "a leading zero byte sorts first");
+      // Production takes exactly n entries per reveal queue and per shard collect — not
+      // entries plus flowers, the other half of what broke operator.ts.
+      h.sent.filter((t) => t.name === "queueShardReveal").forEach((t) =>
+        assert.include([7, 6], t.remaining.length, `${t.label} passed ${t.remaining.length} accounts`));
+      h.sent.filter((t) => t.name === "collectShardWinners").forEach((t) =>
+        assert.equal(t.remaining.length, 7, `${t.label} passed ${t.remaining.length} accounts`));
+    });
+
+    it("two tiers: SOL-only accounts at tier-1, semifinal and final results and at Tier1State: the round still reveals", async () => {
+      const keys = fixedKeys("two-tier", 53);
+      const h = await harness(keys);
+      const planted = [h.shardRes(0), h.shardRes(4), h.semiRes(0), h.semiRes(1), h.shardRes(255), h.tier1Pda];
+      planted.forEach((k) => h.ch.set(k, solOnly()));
+
+      const plan = await h.revealer.runBracketReveal(h.round, keys, 104);
+      assert.equal(plan.tier, "two");
+      assert.deepEqual(plan.sizes, [11, 11, 11, 10, 10]);
+      const tier1 = [0, 1, 2, 3, 4];
+      assert.deepEqual(h.sent.map((t) => t.label), [
+        "initTier1Bracket",
+        ...tier1.map((k) => `queueTier1ShardReveal[${k}]`),
+        ...tier1.map((k) => `collectTier1Winners[${k}]`),
+        "promoteTier1",
+        "queueSemifinalReveal[0]", "queueSemifinalReveal[1]",
+        "collectSemifinalWinners[0]", "collectSemifinalWinners[1]",
+        "queueShardReveal[FINAL]", "applyBracketResult",
+      ], "no closeTier1Bracket: the planted Tier1State is absent, not 'stale'");
+      assert.isTrue(h.revealed(), "the round reveals");
+      planted.forEach((k) => assert.isTrue(accountOwnedWithData(h.ch.get(k), h.program.programId)));
+      // 15 tier-1 winners promote into semifinals of [8, 7]; every queue carries n accounts.
+      const lengths = (n: string) => h.sent.filter((t) => t.name === n).map((t) => t.remaining.length);
+      assert.deepEqual(lengths("queueTier1ShardReveal"), [11, 11, 11, 10, 10]);
+      assert.deepEqual(lengths("collectTier1Winners"), [11, 11, 11, 10, 10]);
+      assert.deepEqual(lengths("queueSemifinalReveal"), [8, 7]);
+      assert.deepEqual(lengths("collectSemifinalWinners"), [0, 0]);
+      assert.deepEqual(lengths("queueShardReveal"), [6]);
+    });
+
+    it("operator.ts reveals through this revealer and no longer carries its own copy", () => {
+      const src = fs.readFileSync(new URL("../scripts/operator.ts", import.meta.url), "utf8");
+      assert.match(src, /import \{ createBracketRevealer, fetchRoundEntryAccounts \} from "\.\/auto-cycle\.ts"/);
+      assert.include(src, "revealer.runBracketReveal(");
+      assert.notMatch(src, /toBase58\(\)\s*<\s*\w+\.toBase58\(\)/, "no base58 comparator sort");
+      assert.notInclude(src, "metasWithFlowers", "no 2n entries+flowers remaining accounts");
+      assert.notMatch(src, /\bplanShards\b|\bshardResPda\b/, "no undefined helpers");
+      assert.notInclude(src, ".getProgramAccounts(", "the entry scan goes through fetchRoundEntryAccounts");
     });
   });
 });
